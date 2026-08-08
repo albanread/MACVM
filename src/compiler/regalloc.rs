@@ -738,6 +738,14 @@ pub fn compute_intervals(
     // interval-precision rule stays untouched: a sibling-block temp's
     // slot becoming map-live at loop safepoints scans nil/older values,
     // never the uninitialized stack RC1 fixed.
+    // MAP-ONLY facts (never force a spill — "never tax the mutator for a
+    // GC-visibility fact", the head-2 rule): merged into `extra_oop_live`
+    // for the oopmap builder AFTER the spill-forcing `deopt_referenced`
+    // set is derived from `deopt_live_exact` alone. A gap-fact vreg with
+    // no organic spill slot simply has no slot to scan (build_for_position
+    // requires a Spill assignment), which is sound — no slot, no stale
+    // residue.
+    let mut map_only_facts: Vec<(u32, u32)> = Vec::new();
     {
         let mut gap_facts: std::collections::HashSet<(u32, u32)> =
             std::collections::HashSet::new();
@@ -761,7 +769,7 @@ pub fn compute_intervals(
                 }
             }
         }
-        deopt_live_exact.extend(gap_facts);
+        map_only_facts.extend(gap_facts);
     }
 
     // S13 step 7b: every deopt-referenced vreg must be SPILLED (a stable
@@ -812,6 +820,7 @@ pub fn compute_intervals(
         .collect();
     let extra_oop_live: Vec<(VReg, u32)> = deopt_live_exact
         .iter()
+        .chain(map_only_facts.iter())
         .map(|&(v, pos)| (VReg(v), pos))
         .collect();
     for &v in &deopt_referenced {

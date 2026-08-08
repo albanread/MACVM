@@ -715,9 +715,19 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
     that proof safely today. Revisit as part of a real per-position
     liveness rework (the regalloc arc).
 
-    Cost, measured (cog-bench t20, robust minima): dict +19%, alloc +4%,
-    the rest in noise — the price of scan-safe maps until the liveness
-    rework.
+    Cost: initially dict +25% same-round — traced NOT to the prologue
+    fill but to the gap-facts landing in `deopt_live_exact`, whose
+    membership FORCE-SPILLS every touched vreg (extra body-side spill
+    traffic in loop code). Re-routed as `map_only_facts`, merged into
+    `extra_oop_live` after the spill-forcing `deopt_referenced` set is
+    derived — honoring head-2's own rule ("never tax the mutator for a
+    GC-visibility fact"; a fact on a slot-less vreg scans nothing, which
+    is sound — no slot, no stale residue). After the split: dict min
+    back at its 246µs baseline, every bench at or under baseline,
+    same-round A/B vs the pre-fix revision flat. The interleaved A/B
+    also EXONERATED commit 29be0f9 and the exceptions arc for the
+    "246→275 dict regression" once suspected — that reading was
+    cross-day ambient-load noise.
 
     Gate: world+tests suite 7701/0 and byte-identical off vs
     threshold=20; MACVM_GC_STRESS=1 (previously aborting), full, and
