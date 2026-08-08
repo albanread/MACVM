@@ -1,0 +1,275 @@
+"83_string_completion.mst — the String protocol the census found missing.
+
+ Twelve selectors, in three groups.
+
+ **Text assembly** (`join:`, `splitOn:`, `format:`, `padLeftTo:`,
+ `padRightTo:`) — the ones whose absence is felt every time a message is
+ built. `format:` is the interesting one: it takes POSITIONAL arguments
+ `{1}`, `{2}` rather than printf's type-coded `%s`/`%d`, because Smalltalk
+ already knows how to print anything and a type code would be a second,
+ lying description of the argument.
+
+ **Searching** (`indexOf:startingAt:`, `occurrencesOfString:`,
+ `beginsWith:`) — `beginsWith:` is a plain alias for the existing
+ `startsWith:`; both spellings are current in the Smalltalk world and a
+ caller should not have to remember which one this image chose.
+
+ **UTF-8 awareness** (`utf8Size`, `codePointAt:`, `asByteArray`) — the
+ point of these is that a String is a BYTE VECTOR (one byte per Character,
+ Latin-1 flyweights), so `size` counts bytes and `at:` can answer half of
+ a multi-byte sequence. Until now the only way to ask a text question was
+ to convert to a CocoaString and pay a Cocoa crossing. These decode UTF-8
+ in place, so a byte-String can answer 'how many characters' and 'what
+ character starts here' without leaving the image — and, deliberately,
+ without pretending: `utf8Size` answers nil for malformed input rather
+ than guessing a length, which is the same honesty the bridge now applies
+ (1b77596)."
+
+ArrayedCollection subclass: String [
+
+    "── text assembly ────────────────────────────────────────────────────"
+
+    join: aCollection <Collection> ^ <String> [
+        "Me as the SEPARATOR between the printed elements — the receiver is
+         the glue, which is the convention every modern Smalltalk uses:
+         `', ' join: #('a' 'b')` is 'a, b'. Elements are used as-is when
+         Strings and printed otherwise, so numbers need no ceremony."
+        | out first |
+        out := WriteStream on: String new.
+        first := true.
+        aCollection do: [ :each |
+            first ifFalse: [ out nextPutAll: self ].
+            first := false.
+            out nextPutAll: (each isString ifTrue: [ each ] ifFalse: [ each printString ]) ].
+        ^out contents
+    ]
+
+    splitOn: aSeparator <Object> ^ <OrderedCollection> [
+        "Split on a Character or a String separator. EMPTY FIELDS ARE KEPT —
+         'a,,b' splitOn: ',' is three fields, and a trailing separator gives
+         a trailing empty one. That is what makes it usable for parsing
+         records, and it is where it differs from `subStrings:`, which
+         treats runs of separators as one and drops empties."
+        | sep out start idx |
+        sep := aSeparator isCharacter
+            ifTrue: [ String with: aSeparator ]
+            ifFalse: [ aSeparator ].
+        out := OrderedCollection new.
+        sep isEmpty ifTrue: [ ^out add: self; yourself ].
+        start := 1.
+        [ idx := self indexOfSubstring: sep startingAt: start.
+          idx > 0 ] whileTrue: [
+            out add: (self copyFrom: start to: idx - 1).
+            start := idx + sep size ].
+        out add: (self copyFrom: start to: self size).
+        ^out
+    ]
+
+    format: aCollection <Collection> ^ <String> [
+        "Positional substitution: `'{1} of {2}' format: #(3 7)` is '3 of 7'.
+         POSITIONAL, not printf-style: Smalltalk already knows how to print
+         any object, so a `%d` would be a second description of the argument
+         that can disagree with it. `{{` is a literal brace; an index with
+         no argument is left untouched rather than raising, so a half-built
+         template still shows what it is. `}}` is a literal brace too — the
+         escape has to be symmetric or '{{literal}}' comes out lopsided,
+         which is exactly how the first version of this method behaved."
+        | out i n j digits idx |
+        out := WriteStream on: String new.
+        i := 1. n := self size.
+        [ i <= n ] whileTrue: [
+            | ch |
+            ch := self at: i.
+            (ch = ${ and: [ i < n and: [ (self at: i + 1) = ${ ] ])
+                ifTrue: [ out nextPut: ${. i := i + 2 ]
+                ifFalse: [
+                  (ch = $} and: [ i < n and: [ (self at: i + 1) = $} ] ])
+                    ifTrue: [ out nextPut: $}. i := i + 2 ]
+                    ifFalse: [
+                    ch = ${
+                        ifTrue: [
+                            j := i + 1. digits := WriteStream on: String new.
+                            [ j <= n and: [ (self at: j) isDigit ] ]
+                                whileTrue: [ digits nextPut: (self at: j). j := j + 1 ].
+                            (j <= n and: [ (self at: j) = $} and: [ digits contents notEmpty ] ])
+                                ifTrue: [
+                                    idx := digits contents asInteger.
+                                    (idx between: 1 and: aCollection size)
+                                        ifTrue: [
+                                            | v |
+                                            v := aCollection at: idx.
+                                            out nextPutAll: (v isString
+                                                ifTrue: [ v ] ifFalse: [ v printString ]) ]
+                                        ifFalse: [ out nextPutAll: (self copyFrom: i to: j) ].
+                                    i := j + 1 ]
+                                ifFalse: [ out nextPut: ch. i := i + 1 ] ]
+                        ifFalse: [ out nextPut: ch. i := i + 1 ] ] ] ].
+        ^out contents
+    ]
+
+    padLeftTo: aWidth <Integer> ^ <String> [ ^self padLeftTo: aWidth with: $  ]
+    padRightTo: aWidth <Integer> ^ <String> [ ^self padRightTo: aWidth with: $  ]
+    padLeftTo: aWidth <Integer> with: aChar <Character> ^ <String> [
+        "Never TRUNCATES — an over-long string comes back whole. Padding is
+         for alignment, and silently losing characters to it would be a
+         worse failure than a ragged column."
+        | out |
+        self size >= aWidth ifTrue: [ ^self ].
+        out := WriteStream on: String new.
+        (aWidth - self size) timesRepeat: [ out nextPut: aChar ].
+        out nextPutAll: self.
+        ^out contents
+    ]
+    padRightTo: aWidth <Integer> with: aChar <Character> ^ <String> [
+        | out |
+        self size >= aWidth ifTrue: [ ^self ].
+        out := WriteStream on: String new.
+        out nextPutAll: self.
+        (aWidth - self size) timesRepeat: [ out nextPut: aChar ].
+        ^out contents
+    ]
+
+    "── searching ────────────────────────────────────────────────────────"
+
+    indexOf: aCharacter <Character> startingAt: start <Integer> ^ <Integer> [
+        "1-based index of aCharacter at or after start; 0 if absent."
+        | i |
+        i := start max: 1.
+        [ i <= self size ] whileTrue: [
+            (self at: i) = aCharacter ifTrue: [ ^i ].
+            i := i + 1 ].
+        ^0
+    ]
+
+    indexOfSubstring: aString <String> startingAt: start <Integer> ^ <Integer> [
+        "1-based index of the substring at or after start; 0 if absent. The
+         empty substring is found at `start`, matching the convention that
+         every string contains it."
+        | limit i j ok |
+        "Written out rather than `start max: 1`: max: is declared on
+         Magnitude and answers one, so the checker cannot see that this
+         path is an Integer — and weakening the declaration to satisfy it
+         would lose exactly the information the annotation is for."
+        aString isEmpty ifTrue: [ start < 1 ifTrue: [ ^1 ]. ^start ].
+        limit := self size - aString size + 1.
+        i := start max: 1.
+        [ i <= limit ] whileTrue: [
+            ok := true. j := 1.
+            [ ok and: [ j <= aString size ] ] whileTrue: [
+                (self at: i + j - 1) = (aString at: j) ifFalse: [ ok := false ].
+                j := j + 1 ].
+            ok ifTrue: [ ^i ].
+            i := i + 1 ].
+        ^0
+    ]
+
+    occurrencesOfString: aString <String> ^ <Integer> [
+        "NON-OVERLAPPING count: 'aaaa' occurrencesOfString: 'aa' is 2, not 3.
+         Overlapping counts are the rarer want and the surprising default."
+        | n start idx |
+        aString isEmpty ifTrue: [ ^0 ].
+        n := 0. start := 1.
+        [ idx := self indexOfSubstring: aString startingAt: start.
+          idx > 0 ] whileTrue: [
+            n := n + 1.
+            start := idx + aString size ].
+        ^n
+    ]
+
+    beginsWith: aString <String> ^ <Boolean> [
+        "A plain alias for startsWith:. Both spellings are current across
+         Smalltalks and a caller should not have to remember which one this
+         image picked."
+        ^self startsWith: aString
+    ]
+
+    isEmptyOrNil ^ <Boolean> [ ^self isEmpty ]
+
+    "── UTF-8 awareness, without leaving the image ───────────────────────
+     A String is a byte vector, so `size` counts bytes and `at:` can answer
+     half a sequence. These decode in place so a text question needs no
+     Cocoa crossing — and answer nil on malformed input rather than
+     guessing, the same honesty the bridge applies at its own boundary."
+
+    asByteArray ^ <ByteArray> [
+        | b |
+        b := ByteArray new: self size.
+        1 to: self size do: [ :i | b at: i put: (self at: i) asInteger ].
+        ^b
+    ]
+
+    utf8SequenceLengthAt: i <Integer> ^ <Object> [
+        "How many bytes the sequence starting at i occupies (1..4), or nil if
+         the byte is not a valid lead or the continuation bytes are missing
+         or malformed. Validating here is what lets everything below simply
+         trust its answer."
+        | b n |
+        (i between: 1 and: self size) ifFalse: [ ^nil ].
+        b := (self at: i) asInteger.
+        b < 16r80 ifTrue: [ ^1 ].
+        (b between: 16rC2 and: 16rDF) ifTrue: [ n := 2 ].
+        (b between: 16rE0 and: 16rEF) ifTrue: [ n := 3 ].
+        (b between: 16rF0 and: 16rF4) ifTrue: [ n := 4 ].
+        n isNil ifTrue: [ ^nil ].
+        i + n - 1 > self size ifTrue: [ ^nil ].
+        2 to: n do: [ :k |
+            | c |
+            c := (self at: i + k - 1) asInteger.
+            (c between: 16r80 and: 16rBF) ifFalse: [ ^nil ] ].
+        ^n
+    ]
+
+    utf8Size ^ <Object> [
+        "The number of Unicode scalars, or NIL if I am not valid UTF-8 —
+         which a byte-String legitimately may not be. `size` remains the
+         byte count and never lies about being anything else."
+        | n i len |
+        n := 0. i := 1.
+        [ i <= self size ] whileTrue: [
+            len := self utf8SequenceLengthAt: i.
+            len isNil ifTrue: [ ^nil ].
+            n := n + 1. i := i + len ].
+        ^n
+    ]
+
+    isValidUtf8 ^ <Boolean> [ ^self utf8Size isNil not ]
+
+    codePointAt: i <Integer> ^ <Object> [
+        "The Unicode scalar whose sequence STARTS at byte i, or nil if i is
+         not a sequence start or the sequence is malformed. Note the index is
+         a BYTE index — the receiver is bytes, and pretending otherwise is
+         what CocoaString is for."
+        | len b acc |
+        len := self utf8SequenceLengthAt: i.
+        len isNil ifTrue: [ ^nil ].
+        b := (self at: i) asInteger.
+        len = 1 ifTrue: [ ^b ].
+        acc := len = 2
+            ifTrue: [ b bitAnd: 16r1F ]
+            ifFalse: [ len = 3 ifTrue: [ b bitAnd: 16r0F ] ifFalse: [ b bitAnd: 16r07 ] ].
+        2 to: len do: [ :k |
+            acc := (acc bitShift: 6) + (((self at: i + k - 1) asInteger) bitAnd: 16r3F) ].
+        ^acc
+    ]
+
+    utf8Do: aBlock <[Object]> ^ <Self> [
+        "Evaluate aBlock with each Unicode scalar in turn. Stops silently at
+         the first malformed sequence — callers wanting to know should ask
+         isValidUtf8 first, which is cheap and explicit."
+        | i len |
+        i := 1.
+        [ i <= self size ] whileTrue: [
+            len := self utf8SequenceLengthAt: i.
+            len isNil ifTrue: [ ^self ].
+            aBlock value: (self codePointAt: i).
+            i := i + len ].
+        ^self
+    ]
+
+    codePoints ^ <OrderedCollection> [
+        | out |
+        out := OrderedCollection new.
+        self utf8Do: [ :cp | out add: cp ].
+        ^out
+    ]
+]

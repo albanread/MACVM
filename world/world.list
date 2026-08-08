@@ -188,3 +188,9 @@
 # with no on:do: behaves byte-identically. Also fixes the silent
 # out-of-bounds: a bare <primitive:> with no fallback answered the RECEIVER.
 82_vm_errors.mst
+# String completion (the census gaps): text assembly (join:, splitOn:,
+# format:, padLeftTo:/padRightTo:), searching (indexOf:startingAt:,
+# occurrencesOfString:, beginsWith:), and UTF-8 awareness in place
+# (utf8Size, codePointAt:, codePoints) so a byte-String can answer a text
+# question without a Cocoa crossing.
+83_string_completion.mst

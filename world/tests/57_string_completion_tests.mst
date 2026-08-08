@@ -1,0 +1,195 @@
+"57_string_completion_tests.mst — gates world/83_string_completion.mst.
+
+ The cases that carry weight here are the CONVENTION choices, because
+ those are what a caller gets wrong and what a later change might quietly
+ flip: that splitOn: keeps empty fields (and so differs from subStrings:),
+ that occurrencesOfString: does not count overlaps, that padding never
+ truncates, that format: escapes braces symmetrically, and that the UTF-8
+ helpers answer nil for malformed input rather than guessing.
+
+ The UTF-8 group is also asserted AGAINST `size`, because the whole point
+ is that the two answer different questions about the same object."
+
+TestCase subclass: StringCompletionTests [
+    runAll [
+        self runTest: #testJoin do: [ self testJoin ].
+        self runTest: #testSplitOnKeepsEmptyFields
+             do: [ self testSplitOnKeepsEmptyFields ].
+        self runTest: #testFormat do: [ self testFormat ].
+        self runTest: #testFormatEscapesBracesSymmetrically
+             do: [ self testFormatEscapesBracesSymmetrically ].
+        self runTest: #testPaddingNeverTruncates
+             do: [ self testPaddingNeverTruncates ].
+        self runTest: #testIndexOfStartingAt do: [ self testIndexOfStartingAt ].
+        self runTest: #testOccurrencesDoNotOverlap
+             do: [ self testOccurrencesDoNotOverlap ].
+        self runTest: #testBeginsWithIsAnAlias do: [ self testBeginsWithIsAnAlias ].
+        self runTest: #testAsByteArray do: [ self testAsByteArray ].
+        self runTest: #testUtf8SizeVersusByteSize do: [ self testUtf8SizeVersusByteSize ].
+        self runTest: #testCodePointDecoding do: [ self testCodePointDecoding ].
+        self runTest: #testMalformedUtf8AnswersNil
+             do: [ self testMalformedUtf8AnswersNil ].
+    ]
+
+    testJoin [
+        "The RECEIVER is the separator — the modern convention, and the one
+         that reads correctly at the call site."
+        self assert: (', ' join: #('a' 'b' 'c')) equals: 'a, b, c'.
+        self assert: ('' join: #('a' 'b')) equals: 'ab'.
+        self assert: (', ' join: #()) equals: ''.
+        self assert: (', ' join: #('solo')) equals: 'solo'.
+        "non-Strings are printed, so numbers need no ceremony"
+        self assert: (' + ' join: #(1 2 3)) equals: '1 + 2 + 3'.
+        self assert: ('-' join: (OrderedCollection new add: 'x'; add: 'y'; yourself))
+                     equals: 'x-y'
+    ]
+
+    "Empty fields are KEPT. This is the difference from subStrings:, and it
+     is what makes splitOn: usable for records — a CSV line with a missing
+     column must keep its shape."
+    testSplitOnKeepsEmptyFields [
+        self assert: ('a,,b' splitOn: ',') asArray equals: #('a' '' 'b').
+        self assert: ('a,b,' splitOn: ',') asArray equals: #('a' 'b' '').
+        self assert: (',a' splitOn: ',') asArray equals: #('' 'a').
+        self assert: ('abc' splitOn: ',') asArray equals: #('abc').
+        self assert: ('' splitOn: ',') asArray equals: #('').
+        "contrast: subStrings: collapses runs and drops empties"
+        self assert: ('a,,b' subStrings: ',') asArray equals: #('a' 'b').
+        "a String separator, not just a Character"
+        self assert: ('a::b::c' splitOn: '::') asArray equals: #('a' 'b' 'c').
+        self assert: ('axxb' splitOn: 'xx') asArray equals: #('a' 'b').
+        "a Character separator works too"
+        self assert: ('a b' splitOn: $ ) asArray equals: #('a' 'b')
+    ]
+
+    testFormat [
+        self assert: ('{1} of {2}' format: #(3 7)) equals: '3 of 7'.
+        self assert: ('{2} then {1}' format: #('a' 'b')) equals: 'b then a'.
+        self assert: ('{1}{1}' format: #('x')) equals: 'xx'.
+        self assert: ('no slots' format: #(1)) equals: 'no slots'.
+        "Strings go in as-is; anything else is printed — no type codes to
+         disagree with the argument"
+        self assert: ('{1}' format: (Array with: 'raw')) equals: 'raw'.
+        self assert: ('{1}' format: #(42)) equals: '42'.
+        "A Symbol inserts its CHARACTERS, not its printString: Symbol is a
+         String here (12_string.mst pins that from String's side), so it
+         takes the isString branch — and 'sym' is what you want in a
+         message anyway. join: agrees, which is the point of checking."
+        self assert: ('{1}' format: (Array with: #sym)) equals: 'sym'.
+        self assert: ('-' join: (Array with: #a with: #b)) equals: 'a-b'.
+        "an index with no argument is left alone rather than raising, so a
+         half-built template still shows what it is"
+        self assert: ('{1} {9}' format: #('a')) equals: 'a {9}'.
+        self assert: ('{0}' format: #('a')) equals: '{0}'
+    ]
+
+    "The escape must be symmetric or '{{literal}}' comes out lopsided —
+     which is exactly how the first version of this method behaved."
+    testFormatEscapesBracesSymmetrically [
+        self assert: ('{{literal}}' format: #()) equals: '{literal}'.
+        self assert: ('{{}}' format: #()) equals: '{}'.
+        self assert: ('{{literal}} {1}' format: #('x')) equals: '{literal} x'.
+        self assert: ('{{{1}}}' format: #('v')) equals: '{v}'
+    ]
+
+    "Padding is for alignment; silently losing characters to it would be a
+     worse failure than a ragged column."
+    testPaddingNeverTruncates [
+        self assert: ('7' padLeftTo: 4) equals: '   7'.
+        self assert: ('ab' padRightTo: 5 with: $.) equals: 'ab...'.
+        self assert: ('abcdef' padLeftTo: 3) equals: 'abcdef'.
+        self assert: ('abcdef' padRightTo: 3) equals: 'abcdef'.
+        self assert: ('x' padLeftTo: 1) equals: 'x'.
+        self assert: ('' padRightTo: 2 with: $-) equals: '--'.
+        self assert: ('5' padLeftTo: 3 with: $0) equals: '005'
+    ]
+
+    testIndexOfStartingAt [
+        self assert: ('abcabc' indexOf: $b startingAt: 1) equals: 2.
+        self assert: ('abcabc' indexOf: $b startingAt: 3) equals: 5.
+        self assert: ('abcabc' indexOf: $z startingAt: 1) equals: 0.
+        self assert: ('abc' indexOf: $a startingAt: 99) equals: 0.
+        self assert: ('abcabc' indexOfSubstring: 'bc' startingAt: 1) equals: 2.
+        self assert: ('abcabc' indexOfSubstring: 'bc' startingAt: 3) equals: 5.
+        self assert: ('abc' indexOfSubstring: 'zz' startingAt: 1) equals: 0.
+        "every string contains the empty substring, at the start index"
+        self assert: ('abc' indexOfSubstring: '' startingAt: 2) equals: 2
+    ]
+
+    "Non-overlapping: 'aaaa' contains 'aa' twice, not three times.
+     Overlapping counts are the rarer want and the more surprising default."
+    testOccurrencesDoNotOverlap [
+        self assert: ('aaaa' occurrencesOfString: 'aa') equals: 2.
+        self assert: ('aaa' occurrencesOfString: 'aa') equals: 1.
+        self assert: ('abcabc' occurrencesOfString: 'abc') equals: 2.
+        self assert: ('abc' occurrencesOfString: 'z') equals: 0.
+        self assert: ('' occurrencesOfString: 'a') equals: 0.
+        self assert: ('abc' occurrencesOfString: '') equals: 0
+    ]
+
+    testBeginsWithIsAnAlias [
+        self assert: ('abc' beginsWith: 'ab').
+        self deny: ('abc' beginsWith: 'bc').
+        self assert: ('abc' beginsWith: '').
+        "same answer as the spelling that already existed, always"
+        self assert: ('abc' beginsWith: 'ab') equals: ('abc' startsWith: 'ab').
+        self assert: ('abc' beginsWith: 'zz') equals: ('abc' startsWith: 'zz').
+        self assert: 'x' isEmptyOrNil equals: false.
+        self assert: '' isEmptyOrNil equals: true
+    ]
+
+    testAsByteArray [
+        self assert: 'hi' asByteArray equals: #[104 105].
+        self assert: '' asByteArray equals: #[].
+        "multi-byte text gives its BYTES, which is the honest answer for a
+         byte vector"
+        self assert: 'é' asByteArray equals: #[195 169].
+        self assert: 'é' asByteArray size equals: 2
+    ]
+
+    "size counts BYTES, utf8Size counts SCALARS — the two answer different
+     questions about the same object, and that is the point."
+    testUtf8SizeVersusByteSize [
+        self assert: 'abc' size equals: 3.
+        self assert: 'abc' utf8Size equals: 3.
+        self assert: 'café' size equals: 5.
+        self assert: 'café' utf8Size equals: 4.
+        self assert: '🎩ab' size equals: 6.
+        self assert: '🎩ab' utf8Size equals: 3.
+        self assert: '' utf8Size equals: 0.
+        self assert: 'abc' isValidUtf8.
+        self assert: 'café' isValidUtf8
+    ]
+
+    testCodePointDecoding [
+        self assert: ('abc' codePointAt: 1) equals: 97.
+        self assert: ('café' codePointAt: 4) equals: 233.       "é, 2-byte"
+        self assert: ('🎩ab' codePointAt: 1) equals: 16r1F3A9.  "4-byte"
+        self assert: ('€' codePointAt: 1) equals: 16r20AC.      "3-byte"
+        self assert: 'café' codePoints asArray equals: #(99 97 102 233).
+        self assert: '🎩ab' codePoints asArray equals: (Array with: 16r1F3A9 with: 97 with: 98).
+        self assert: '' codePoints asArray equals: #().
+        "a byte index INSIDE a sequence is not a start, and says so"
+        self assert: ('café' codePointAt: 5) equals: nil
+    ]
+
+    "Malformed input answers nil rather than guessing a length — the same
+     honesty the bridge applies at its own boundary (1b77596). A byte-String
+     legitimately may not be UTF-8, so this is a normal case, not an error."
+    testMalformedUtf8AnswersNil [
+        | lone truncated |
+        lone := String new: 2.
+        lone at: 1 put: (Character value: 200).   "a lead byte..."
+        lone at: 2 put: $x.                        "...with no continuation"
+        self assert: lone size equals: 2.
+        self assert: lone utf8Size equals: nil.
+        self deny: lone isValidUtf8.
+        self assert: (lone codePointAt: 1) equals: nil.
+        "a truncated multi-byte sequence at the end"
+        truncated := String new: 1.
+        truncated at: 1 put: (Character value: 226).  "lead of a 3-byte seq"
+        self assert: truncated utf8Size equals: nil.
+        "a bare continuation byte is not a valid start"
+        self assert: (('é' copyFrom: 2 to: 2) codePointAt: 1) equals: nil
+    ]
+]
