@@ -181,7 +181,12 @@ Object subclass: CocoaUI [
         self installMenu.
         "After installMenu, so the checkmark lands on a live menu item."
         self applyTheme: self loadTheme.
-        self switchToView: #workspace.
+        "Open on the Documentation view (the Welcome topic) — a first launch
+         that greets the user beats a blank Workspace. Falls back to the
+         Workspace in a world without 71_cocoahelp.mst."
+        (Worker classNamed: #CocoaHelp)
+            isNil ifTrue: [ self switchToView: #workspace ]
+                  ifFalse: [ self switchToView: #help ].
         "Apple Event surface (docs/applescript_design.md): replaces the
          minimal cocoa_gui-side app delegate with one that has a door into
          the world. After switchToView:, so a script reading `current view`

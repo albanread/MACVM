@@ -1,44 +1,49 @@
-"71_cocoahelp.mst — CocoaHelp: a read-only Markdown documentation tab for
- the native Cocoa GUI (docs/macvm_help.md, a digested copy of the WKWebView
- GUI's own macvm-help pages — this window has no HTML renderer, so Markdown
- is the plain-text-friendly middle ground). Loaded ONLY via
- world/cocoaui.list, after 64_cocoaui.mst; self-registers by name, the CG7+
- pattern (CocoaBrowser/CocoaFind/CocoaEditor/CocoaOutliner/CocoaCanvas).
+"71_cocoahelp.mst — CocoaHelp v2: the Documentation browser for the native
+ Cocoa GUI. A CocoaDocCrate-style reader: a topic SIDEBAR (NSTableView) on
+ the left, a find-in-page field top right, and a styled document view whose
+ markdown gets REAL typography — coloured headings with hairline rules,
+ monospaced code blocks, callout quotes — not the flattened bold-only
+ rendering v1 shipped. All documentation lives IN THIS FILE as Smalltalk
+ methods, so the app documents itself from any working directory (v1 read
+ docs/macvm_help.md relative to the process cwd, which broke under any
+ launcher that was not run-cocoa.sh).
 
- Rendering path: AppKit already ships a pure Objective-C Markdown parser —
- NSAttributedString >> initWithMarkdownString:options:baseURL:error:
- (macOS 12+; confirmed via the cocoa-data runtime database to be ordinary
- Objective-C, NOT a Swift-only API, so the existing bridge reaches it with
- zero new Rust code). Its trailing NSError** out-argument is outside C2's
- auto-shape vocabulary (classify_arg has no `^` pointer case, by design —
- docs/cocoa_gui_implementation.md §4.1), so the call goes through the
- explicit send:args:ret: door (primitive 240) instead of plain
- doesNotUnderstand: dispatch; a Smalltalk nil argument there marshals to a
- literal NULL GPR word, which is exactly the legal 'I don't want the error
- detail' argument Cocoa's own convention expects (prim_cocoa_send_general,
- src/runtime/primitives.rs). Every piece of this path — the file read, the
- options object, the parser itself — is an existing Cocoa-bridge send; there
- is no hand-rolled Markdown-to-attributes conversion anywhere here."
-"I am the Help tab: a read-only, scrollable viewer for the system's
- Markdown documentation. I load the help file from disk and render it with
- AppKit's own Markdown parser, so headings, emphasis, lists and code
- arrive as styled text with no HTML anywhere. A missing or unreadable file
- fails quietly. I run in the UI worker VM."
+ Rendering: block-structural markdown is parsed HERE (headings, fenced
+ code, quotes, rules — a small line-based splitter that keeps fences
+ intact), and each block is styled through the two legacy attributed-string
+ keys this bridge has already proven end to end: 'NSColor' (v1 used it to
+ force labelColor) and 'NSFont' (the same legacy key family — the modern
+ NSFontAttributeName IS the string 'NSFont'). Body paragraphs and lists
+ still go through AppKit's own CommonMark parser (NSAttributedString
+ initWithMarkdownString:..., the v1 pipeline), so **bold**, *italic*,
+ `code spans` and bullet lists arrive styled for free; each parsed run is
+ then forced to labelColor so dark mode reads (the v1 fix, kept per-block).
+
+ Find: a plain NSTextField (Enter = find next, wraps). Matching is a
+ case-insensitive scan done in Smalltalk over the RENDERED text (read back
+ from the text storage once per topic, so offsets match what is displayed);
+ every match gets a translucent systemYellow background attribute, and the
+ current one is selected + scrolled visible. Content stays in the Basic
+ Multilingual Plane so Smalltalk character indices equal NSString UTF-16
+ offsets (the range math depends on it — no emoji in the docs).
+
+ Self-registers by name like every CG7+ view; CocoaUI startup now OPENS on
+ this view (the Welcome topic) instead of an empty Workspace."
+"I am the Documentation tab: a sidebar of topics, a find field, and a
+ styled markdown reader. My topics — the manifesto, history and credits,
+ a Smalltalk language primer, tours of the environment and the world, and
+ build-your-own guides — are written in me as methods, so the system
+ documents itself wherever it runs. I run in the UI worker VM."
 Object subclass: CocoaHelp [
-    <classVars: Container Scroll TextView>
+    <classVars: Topics Container Sidebar SidebarScroll SidebarFace SidebarDelegate
+                DocView DocScroll FindField ActionDelegates
+                CurrentTopic DocText FindTerm Matches MatchCursor>
 
-    CocoaHelp class >> helpFile [
-        "Relative to the process's working directory — the SAME assumption
-         CocoaUI iconDir already makes (run-cocoa.sh launches from the repo
-         root); a missing/unreadable file fails closed, not loudly, via
-         loadMarkdown's own nil check."
-        ^'docs/macvm_help.md'
-    ]
-
+    "── registration (CG7+ pattern; CocoaUI startup calls this by name) ──"
     CocoaHelp class >> register [
-        CocoaUI registerViewNamed: #help title: 'Help' icon: 'documentation'
+        CocoaUI registerViewNamed: #help title: 'Docs' icon: 'documentation'
                 container: [ self containerView ]
-                onShow: [ ]
+                onShow: [ self ensureSelection ]
     ]
 
     CocoaHelp class >> containerView [
@@ -46,241 +51,1119 @@ Object subclass: CocoaHelp [
         ^Container
     ]
 
-    CocoaHelp class >> scrollToChar: loc [
-        "Test/debug: jump the view to a character offset (scrollRangeToVisible:,
-         the same call appendTranscript: uses)."
-        TextView onMain scrollRangeToVisible: (Array with: loc with: 0)
+    "── the topic registry: (title, content selector) pairs, sidebar order ──"
+    CocoaHelp class >> topics [
+        "Built with add:, NOT `Array with:...` — that family tops out at four
+         arguments in this world, and the fifth silently becomes a DNU. Cached
+         in a class var: this is asked once per table-callback row."
+        | t |
+        Topics isNil ifFalse: [ ^Topics ].
+        t := OrderedCollection new.
+        t add: (Array with: 'Welcome'                with: #welcomeText).
+        t add: (Array with: 'The Manifesto'          with: #manifestoText).
+        t add: (Array with: 'History and Credits'    with: #historyText).
+        t add: (Array with: 'The Smalltalk Language' with: #languageText).
+        t add: (Array with: 'The Environment'        with: #environmentText).
+        t add: (Array with: 'The Strongtalk World'   with: #worldText).
+        t add: (Array with: 'Guide: Build an App'    with: #appGuideText).
+        t add: (Array with: 'Guide: Build a Game'    with: #gameGuideText).
+        t add: (Array with: 'Under the Hood'         with: #internalsText).
+        Topics := t asArray.
+        ^Topics
+    ]
+    CocoaHelp class >> topicCount [ ^self topics size ]
+    CocoaHelp class >> nl [ ^String with: Character nl ]
+    CocoaHelp class >> topicTitleAt: i [ ^(self topics at: i) at: 1 ]
+
+    "── build ─────────────────────────────────────────────────────────────"
+    CocoaHelp class >> sidebarWidth [ ^222.0 ]
+    CocoaHelp class >> findBarHeight [ ^40.0 ]
+
+    CocoaHelp class >> buildView [
+        | frame w h |
+        frame := CocoaUI contentHost onMain frame.
+        w := frame at: 3. h := frame at: 4.
+        ActionDelegates := OrderedCollection new.
+        Container := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        Container onMain setAutoresizesSubviews: true.
+        self buildSidebar: h.
+        self buildFindField: w height: h.
+        self buildDocView: w height: h.
+        self showTopic: 1.
+        self selectSidebarRow: 0.
     ]
 
-    "── build ──"
-    CocoaHelp class >> buildView [
-        | frame |
-        frame := CocoaUI contentHost onMain frame.
-        TextView := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0
-                                  with: (frame at: 3) with: (frame at: 4)).
-        TextView onMain setEditable: false.
-        TextView onMain setSelectable: true.
-        TextView onMain setVerticallyResizable: true.
-        TextView onMain setHorizontallyResizable: false.
-        TextView onMain setAutoresizingMask: CocoaUI maskWidthSizable.
-        (TextView onMain textContainer) ifNotNil: [ :tc |
+    CocoaHelp class >> buildSidebar: h [
+        | col |
+        SidebarScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: self sidebarWidth with: h).
+        SidebarScroll onMain setHasVerticalScroller: true.
+        SidebarScroll onMain setAutoresizingMask: CocoaUI maskHeightSizable.
+        SidebarScroll onMain setBorderType: 0.
+        Sidebar := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: self sidebarWidth with: h).
+        col := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain
+            initWithIdentifier: 'topic'.
+        col onMain setWidth: 600.0.
+        Sidebar onMain addTableColumn: col.
+        col release.
+        Sidebar onMain setHeaderView: nil.
+        Sidebar onMain setRowHeight: 28.0.
+        "Rounded source-list style selection, the modern sidebar look
+         (NSTableViewStyleSourceList = 2; harmlessly ignored pre-Big Sur)."
+        Sidebar onMain setStyle: 2.
+        Sidebar onMain setColumnAutoresizingStyle: 1.
+        "underPageBackgroundColor is the adaptive 'behind the content' tone —
+         the standard sidebar fill, and it tracks light/dark by itself."
+        Sidebar onMain setBackgroundColor:
+            ((Cocoa classNamed: 'NSColor') onMain underPageBackgroundColor).
+        SidebarScroll onMain setDrawsBackground: false.
+        SidebarFace := (Worker classNamed: #CocoaHelpTopicFace) new.
+        SidebarDelegate := MacvmDelegate tableSourceOn: SidebarFace.
+        Sidebar onMain setDataSource: SidebarDelegate.
+        Sidebar onMain setDelegate: SidebarDelegate.
+        SidebarScroll onMain setDocumentView: Sidebar.
+        Container onMain addSubview: SidebarScroll.
+    ]
+
+    CocoaHelp class >> buildFindField: w height: h [
+        | x |
+        x := self sidebarWidth + 8.
+        FindField := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: x with: h - 32.0
+                                  with: w - x - 10.0 with: 24.0).
+        FindField onMain setPlaceholderString: 'Find in page  (press Return; wraps)'.
+        FindField onMain setBezelStyle: 1. "rounded — search-field look"
+        FindField onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        self wireAction: FindField to: [ self runFind ].
+        Container onMain addSubview: FindField.
+    ]
+
+    CocoaHelp class >> buildDocView: w height: h [
+        | x dw tc |
+        x := self sidebarWidth + 1.
+        dw := w - x.
+        DocView := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: dw with: h - self findBarHeight).
+        DocView onMain setEditable: false.
+        DocView onMain setSelectable: true.
+        DocView onMain setVerticallyResizable: true.
+        DocView onMain setHorizontallyResizable: false.
+        DocView onMain setAutoresizingMask: CocoaUI maskWidthSizable.
+        "Generous margins — the single cheapest 'this is a document, not a
+         terminal' signal (NSSize as a 2-array, the same 16-byte-struct
+         marshal scrollRangeToVisible:'s NSRange already uses)."
+        DocView onMain setTextContainerInset: (Array with: 26.0 with: 20.0).
+        tc := DocView onMain textContainer.
+        tc isNil ifFalse: [
             tc onMain setWidthTracksTextView: true.
             tc release ].
-        "Scroll-wrapped like every other text surface in this shell — a bare
-         NSTextView draws past its frame and its stale pixels bleed through
-         the next view after a tab switch."
-        Scroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0
-                                  with: (frame at: 3) with: (frame at: 4)).
-        Scroll onMain setHasVerticalScroller: true.
-        Scroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
-        Scroll onMain setBorderType: 1. "NSLineBorder — matches the Transcript fix"
-        Scroll onMain setDocumentView: TextView.
-        Container := Scroll.
-        self loadAndRender.
+        DocScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: x with: 0.0 with: dw with: h - self findBarHeight).
+        DocScroll onMain setHasVerticalScroller: true.
+        DocScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        DocScroll onMain setBorderType: 0.
+        DocScroll onMain setDocumentView: DocView.
+        Container onMain addSubview: DocScroll.
     ]
 
-    "── content ──"
-    CocoaHelp class >> loadMarkdown [
-        "NSString's own synchronous whole-file reader, EXPLICIT UTF-8 (encoding
-         4 = NSUTF8StringEncoding) — the deprecated one-arg stringWithContentsOfFile:
-         guesses the encoding and got it wrong on this exact file (round-tripped
-         16,890 real Unicode characters as 17,314 — the em-dashes/arrows/× signs
-         misread as a single-byte encoding, then re-inflated on the way back out).
-         The trailing NSError** puts this outside the auto-shape vocabulary
-         (docs/cocoa_gui_implementation.md §4.1), same as the markdown parser
-         below — nil for 'don't care'. A missing/unreadable file answers Cocoa
-         nil, which wrap_result marshals to Smalltalk nil (not a primitive
-         failure) — the ifTrue: below is the real check."
-        | ns argv text |
-        argv := Array with: (Cocoa nsString: self helpFile) with: 4 with: nil.
-        ns := (Cocoa classNamed: 'NSString')
-            send: 'stringWithContentsOfFile:encoding:error:' args: argv ret: #id.
-        ns isNil ifTrue: [
-            ^'# MACVM Help
+    CocoaHelp class >> wireAction: aControl to: aBlock [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+    ]
 
-Could not load **', self helpFile, '**.
+    "── sidebar plumbing ─────────────────────────────────────────────────"
+    CocoaHelp class >> ensureSelection [
+        Container isNil ifTrue: [ ^self ].
+        CurrentTopic isNil ifTrue: [ self showTopic: 1. self selectSidebarRow: 0 ]
+    ]
 
-Run `macvm-cocoa` from the repository root (see `run-cocoa.sh`) — this tab
-reads the file relative to the process''s working directory, the same
-assumption the toolbar icons already make.' ].
-        text := ns asString.
+    CocoaHelp class >> selectSidebarRow: zeroBased [
+        Sidebar isNil ifTrue: [ ^self ].
+        Sidebar onMain selectRowIndexes: ((Cocoa classNamed: 'NSIndexSet') onMain
+                                              indexSetWithIndex: zeroBased)
+                byExtendingSelection: false
+    ]
+
+    CocoaHelp class >> topicSelected [
+        | row |
+        Sidebar isNil ifTrue: [ ^self ].
+        row := Sidebar onMain selectedRow.
+        (row >= 0 and: [ row < self topicCount ]) ifTrue: [
+            (CurrentTopic isNil or: [ CurrentTopic ~= (row + 1) ])
+                ifTrue: [ self showTopic: row + 1 ] ]
+    ]
+
+    "── rendering ────────────────────────────────────────────────────────"
+    CocoaHelp class >> showTopic: i [
+        | md storage empty ns |
+        CurrentTopic := i.
+        FindTerm := nil. Matches := nil. MatchCursor := 0.
+        md := self perform: ((self topics at: i) at: 2).
+        storage := DocView onMain textStorage.
+        empty := ((Cocoa classNamed: 'NSAttributedString') onMain alloc) onMain init.
+        storage onMain setAttributedString: empty.
+        empty release.
+        storage onMain beginEditing.
+        (self blocksOf: md) do: [ :b | self renderBlock: b into: storage ].
+        storage onMain endEditing.
+        "One read-back so find offsets match exactly what is displayed."
+        ns := storage onMain string.
+        DocText := ns asString.
         ns release.
-        ^text
+        storage release.
+        DocView onMain scrollRangeToVisible: (Array with: 0 with: 0).
+        self selectSidebarRow: i - 1.
+    ]
+
+    "A block is (tag, text): #h1/#h2/#h3 (heading text), #code (verbatim
+     lines), #quote (bar-stripped lines), #rule, or #body (markdown source
+     for AppKit's parser — paragraphs and bullet lists ride together so the
+     parser lays the list out itself)."
+    CocoaHelp class >> blocksOf: md [
+        | lines blocks buf mode lf flushBody |
+        lf := Character value: 10.
+        lines := self linesOf: md.
+        blocks := OrderedCollection new.
+        buf := WriteStream on: String new.
+        mode := #none.
+        flushBody := [
+            buf contents isEmpty ifFalse: [
+                blocks add: (Array with: #body with: buf contents) ].
+            buf := WriteStream on: String new.
+            mode := #none ].
+        lines do: [ :line |
+            (mode = #code)
+                ifTrue: [
+                    (self isFence: line)
+                        ifTrue: [
+                            blocks add: (Array with: #code with: buf contents).
+                            buf := WriteStream on: String new.
+                            mode := #none ]
+                        ifFalse: [
+                            buf contents isEmpty ifFalse: [ buf nextPut: lf ].
+                            buf nextPutAll: line ] ]
+                ifFalse: [
+                    (self isFence: line) ifTrue: [
+                        flushBody value. mode := #code ]
+                    ifFalse: [ (self headingLevel: line) > 0 ifTrue: [
+                        flushBody value.
+                        blocks add: (Array
+                            with: (self headingTagFor: (self headingLevel: line))
+                            with: (self headingTextOf: line)) ]
+                    ifFalse: [ (self isRule: line) ifTrue: [
+                        flushBody value.
+                        blocks add: (Array with: #rule with: '') ]
+                    ifFalse: [ (self isBullet: line) ifTrue: [
+                        flushBody value.
+                        blocks add: (Array with: #bullet with: (self bulletTextOf: line)) ]
+                    ifFalse: [ (self isQuote: line) ifTrue: [
+                        mode = #quote ifFalse: [ flushBody value. mode := #quote ].
+                        buf contents isEmpty ifFalse: [ buf nextPut: lf ].
+                        buf nextPutAll: (self quoteTextOf: line) ]
+                    ifFalse: [ line isEmpty
+                        ifTrue: [
+                            mode = #quote
+                                ifTrue: [
+                                    blocks add: (Array with: #quote with: buf contents).
+                                    buf := WriteStream on: String new.
+                                    mode := #none ]
+                                ifFalse: [ flushBody value ] ]
+                        ifFalse: [
+                            mode = #quote ifTrue: [
+                                blocks add: (Array with: #quote with: buf contents).
+                                buf := WriteStream on: String new.
+                                mode := #none ].
+                            buf contents isEmpty ifFalse: [ buf nextPut: lf ].
+                            buf nextPutAll: line.
+                            mode := #body ] ] ] ] ] ] ] ].
+        mode = #code ifTrue: [ blocks add: (Array with: #code with: buf contents) ].
+        mode = #quote ifTrue: [ blocks add: (Array with: #quote with: buf contents) ].
+        mode = #body ifTrue: [ flushBody value ].
+        ^blocks
+    ]
+
+    CocoaHelp class >> linesOf: aString [
+        | lf out buf |
+        lf := Character value: 10.
+        out := OrderedCollection new.
+        buf := WriteStream on: String new.
+        aString do: [ :ch |
+            ch = lf
+                ifTrue: [ out add: buf contents. buf := WriteStream on: String new ]
+                ifFalse: [ buf nextPut: ch ] ].
+        out add: buf contents.
+        ^out
+    ]
+
+    CocoaHelp class >> isFence: line [
+        ^line size >= 3 and: [ (line at: 1) = $` and: [ (line at: 2) = $` and: [ (line at: 3) = $` ] ] ]
+    ]
+    CocoaHelp class >> isRule: line [
+        "Three or more dashes and NOTHING else — otherwise a '--- thought'
+         aside, or worse a '- item' bullet, would vanish into a rule."
+        | ok |
+        line size < 3 ifTrue: [ ^false ].
+        ok := true.
+        line do: [ :ch | ch = $- ifFalse: [ ok := false ] ].
+        ^ok
+    ]
+    CocoaHelp class >> isBullet: line [
+        "A '- ' or '* ' list item. Handled as its OWN block: AppKit's markdown
+         parser drops every inter-block separator, so several bullets inside
+         one parsed string arrive as one run-on paragraph (the same finding
+         v1 recorded for headings). Owning the line breaks here is the fix."
+        | sp |
+        sp := Character value: 32.
+        ^line size >= 2
+            and: [ ((line at: 1) = $- or: [ (line at: 1) = $* ])
+            and: [ (line at: 2) = sp ] ]
+    ]
+    CocoaHelp class >> bulletTextOf: line [
+        ^line copyFrom: 3 to: line size
+    ]
+    CocoaHelp class >> isQuote: line [
+        ^line size >= 1 and: [ (line at: 1) = $> ]
+    ]
+    CocoaHelp class >> quoteTextOf: line [
+        | i |
+        i := 2.
+        (line size >= 2 and: [ (line at: 2) = (Character value: 32) ]) ifTrue: [ i := 3 ].
+        ^line size < i ifTrue: [ '' ] ifFalse: [ line copyFrom: i to: line size ]
+    ]
+    CocoaHelp class >> headingLevel: line [
+        | i sp |
+        sp := Character value: 32.
+        i := 1.
+        [ i <= line size and: [ (line at: i) = $# ] ] whileTrue: [ i := i + 1 ].
+        (i - 1 between: 1 and: 3) ifFalse: [ ^0 ].
+        (i <= line size and: [ (line at: i) = sp ]) ifFalse: [ ^0 ].
+        ^i - 1
+    ]
+    CocoaHelp class >> headingTagFor: lvl [
+        lvl = 1 ifTrue: [ ^#h1 ].
+        lvl = 2 ifTrue: [ ^#h2 ].
+        ^#h3
+    ]
+    CocoaHelp class >> headingTextOf: line [
+        | lvl |
+        lvl := self headingLevel: line.
+        ^line copyFrom: lvl + 2 to: line size
+    ]
+
+    CocoaHelp class >> renderBlock: pair into: storage [
+        | tag text |
+        tag := pair at: 1. text := pair at: 2.
+        tag = #h1 ifTrue: [
+            self append: text , self nl
+                 font: ((Cocoa classNamed: 'NSFont') onMain boldSystemFontOfSize: 27.0)
+                 color: ((Cocoa classNamed: 'NSColor') onMain systemGreenColor)
+                 into: storage.
+            ^self appendRuleInto: storage ].
+        tag = #h2 ifTrue: [
+            self append: self nl , text , self nl
+                 font: ((Cocoa classNamed: 'NSFont') onMain boldSystemFontOfSize: 19.0)
+                 color: ((Cocoa classNamed: 'NSColor') onMain systemBlueColor)
+                 into: storage.
+            ^self appendRuleInto: storage ].
+        tag = #h3 ifTrue: [
+            ^self append: self nl , text , self nl , self nl
+                 font: ((Cocoa classNamed: 'NSFont') onMain boldSystemFontOfSize: 15.0)
+                 color: ((Cocoa classNamed: 'NSColor') onMain systemTealColor)
+                 into: storage ].
+        tag = #bullet ifTrue: [
+            | start |
+            start := storage onMain length.
+            self append: '-   '
+                 font: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 13.0)
+                 color: ((Cocoa classNamed: 'NSColor') onMain systemBlueColor)
+                 into: storage.
+            self appendInline: text into: storage.
+            self append: self nl font: nil color: nil into: storage.
+            ^self indentFrom: start in: storage first: 22.0 head: 42.0 ].
+        tag = #rule ifTrue: [ ^self appendRuleInto: storage ].
+        tag = #code ifTrue: [
+            | start |
+            start := storage onMain length.
+            self append: (self padded: text) , self nl
+                 font: (CocoaUI fixedFontOfSize: 12.0)
+                 color: ((Cocoa classNamed: 'NSColor') onMain systemPurpleColor)
+                 into: storage.
+            self indentFrom: start in: storage first: 22.0 head: 22.0.
+            "A faint panel behind the listing — the strongest 'this is code'
+             signal after the monospace itself. quaternaryLabelColor is the
+             lightest adaptive fill AppKit ships, so it stays subtle in both
+             appearances."
+            self tintFrom: start in: storage
+                 color: ((Cocoa classNamed: 'NSColor') onMain quaternaryLabelColor).
+            ^self append: self nl font: nil color: nil into: storage ].
+        tag = #quote ifTrue: [
+            | start |
+            self append: self nl font: nil color: nil into: storage.
+            start := storage onMain length.
+            self append: (self barPrefixed: text) , self nl
+                 font: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 13.0)
+                 color: ((Cocoa classNamed: 'NSColor') onMain systemOrangeColor)
+                 into: storage.
+            self indentFrom: start in: storage first: 18.0 head: 40.0.
+            ^self append: self nl font: nil color: nil into: storage ].
+        self appendMarkdown: text into: storage.
+    ]
+
+    CocoaHelp class >> indentFrom: start in: storage first: fi head: hi [
+        "Hanging indent over the range appended since `start`. Without it a
+         wrapped bullet or quote line falls back to the left margin and the
+         list stops reading as a list. 'NSParagraphStyle' is the legacy
+         attribute key, the same family as 'NSFont'/'NSColor' this file
+         already relies on."
+        | ps len |
+        len := storage onMain length.
+        len <= start ifTrue: [ ^self ].
+        ps := ((Cocoa classNamed: 'NSMutableParagraphStyle') onMain alloc) onMain init.
+        ps onMain setFirstLineHeadIndent: fi.
+        ps onMain setHeadIndent: hi.
+        ps onMain setParagraphSpacing: 4.0.
+        storage onMain addAttribute: 'NSParagraphStyle' value: ps
+                range: (Array with: start with: len - start).
+        ps release.
+    ]
+
+    CocoaHelp class >> tintFrom: start in: storage color: aColor [
+        | len |
+        len := storage onMain length.
+        len <= start ifTrue: [ ^self ].
+        storage onMain addAttribute: 'NSBackgroundColor' value: aColor
+                range: (Array with: start with: len - start).
+    ]
+
+    CocoaHelp class >> padded: text [
+        "Pad every code line to the block's longest, so the tint behind it is
+         a RECTANGLE. A background attribute only paints the characters it
+         covers, so unpadded lines leave a ragged right edge that reads as
+         damage rather than as a panel."
+        | lines w out first |
+        lines := self linesOf: text.
+        w := 0.
+        lines do: [ :ln | w := w max: ln size ].
+        w := w + 2.
+        out := WriteStream on: String new.
+        first := true.
+        lines do: [ :ln | | pad |
+            first ifTrue: [ first := false ] ifFalse: [ out nextPut: Character nl ].
+            out nextPutAll: ln.
+            pad := w - ln size.
+            1 to: pad do: [ :i | out nextPut: (Character value: 32) ] ].
+        ^out contents
+    ]
+
+    CocoaHelp class >> barPrefixed: text [
+        "Each quote line gets a leading bar, the callout look."
+        | out lf |
+        lf := Character value: 10.
+        out := WriteStream on: String new.
+        (self linesOf: text) do: [ :ln |
+            out contents isEmpty ifFalse: [ out nextPut: lf ].
+            out nextPutAll: '|   ' , ln ].
+        ^out contents
+    ]
+
+    CocoaHelp class >> appendRuleInto: storage [
+        "A hairline: a run of BOX DRAWINGS LIGHT HORIZONTAL in the adaptive
+         separator colour, small type so it stays thin."
+        | rule |
+        rule := WriteStream on: String new.
+        "96 underscores (~480pt at 9pt) — a deliberate SHORT rule. A
+         full-width one wraps to a second line the moment the window
+         narrows, and two stacked bars read as a rendering fault."
+        1 to: 96 do: [ :i | rule nextPut: $_ ].
+        "Underscores draw a continuous baseline stroke. tertiaryLabelColor
+         (not separatorColor — that is so light it read as nothing at all on
+         the light theme) at 9pt: present, never loud, and it adapts."
+        self append: rule contents , self nl
+             font: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 9.0)
+             color: ((Cocoa classNamed: 'NSColor') onMain tertiaryLabelColor)
+             into: storage.
+    ]
+
+    "Append plain text and style THE WHOLE RUN with a font and/or colour.
+     Range math uses storage lengths (UTF-16 units), never Smalltalk size —
+     robust for every BMP character the docs use."
+    CocoaHelp class >> append: aString font: aFont color: aColor into: storage [
+        | start after ms |
+        start := storage onMain length.
+        ms := storage onMain mutableString.
+        ms onMain appendString: aString.
+        ms release.
+        after := storage onMain length.
+        after > start ifTrue: [
+            | r |
+            r := Array with: start with: after - start.
+            "CLEAR the inheritable block attributes first. NSTextStorage gives
+             freshly appended characters the attributes of the character
+             before them, so a code block's tint and a bullet's hanging
+             indent would otherwise bleed forward into every following
+             heading and paragraph (seen exactly that way: a grey wash over
+             the next heading and its rule). Each block therefore starts
+             clean and opts back in — tintFrom:/indentFrom: run AFTER this."
+            storage onMain removeAttribute: 'NSBackgroundColor' range: r.
+            storage onMain removeAttribute: 'NSParagraphStyle' range: r.
+            aFont isNil ifFalse: [
+                storage onMain addAttribute: 'NSFont' value: aFont range: r ].
+            aColor isNil ifFalse: [
+                storage onMain addAttribute: 'NSColor' value: aColor range: r ] ].
+    ]
+
+    "Body block: AppKit's own CommonMark parser (bold/italic/code spans and
+     bullet lists for free), then force labelColor over JUST this block so
+     dark mode reads without disturbing the styled blocks around it."
+    CocoaHelp class >> appendMarkdown: aString into: storage [
+        | attr start after ms color |
+        start := storage onMain length.
+        attr := self attributedFor: aString.
+        attr isNil
+            ifTrue: [
+                ms := storage onMain mutableString.
+                ms onMain appendString: aString.
+                ms release ]
+            ifFalse: [
+                storage onMain appendAttributedString: attr.
+                attr release ].
+        after := storage onMain length.
+        after > start ifTrue: [
+            | r |
+            r := Array with: start with: after - start.
+            storage onMain removeAttribute: 'NSBackgroundColor' range: r.
+            storage onMain removeAttribute: 'NSParagraphStyle' range: r.
+            color := (Cocoa classNamed: 'NSColor') onMain labelColor.
+            storage onMain addAttribute: 'NSColor' value: color range: r ].
+        ms := storage onMain mutableString.
+        ms onMain appendString: self nl , self nl.
+        ms release.
+    ]
+
+    CocoaHelp class >> appendInline: aString into: storage [
+        "appendMarkdown:'s sibling for a block whose line breaks WE own (a
+         bullet): parse for inline styling, force labelColor, add nothing."
+        | attr start after ms color |
+        start := storage onMain length.
+        attr := self attributedFor: aString.
+        attr isNil
+            ifTrue: [
+                ms := storage onMain mutableString.
+                ms onMain appendString: aString.
+                ms release ]
+            ifFalse: [
+                storage onMain appendAttributedString: attr.
+                attr release ].
+        after := storage onMain length.
+        after > start ifTrue: [
+            | r |
+            r := Array with: start with: after - start.
+            storage onMain removeAttribute: 'NSBackgroundColor' range: r.
+            storage onMain removeAttribute: 'NSParagraphStyle' range: r.
+            color := (Cocoa classNamed: 'NSColor') onMain labelColor.
+            storage onMain addAttribute: 'NSColor' value: color range: r ].
     ]
 
     CocoaHelp class >> markdownOptions [
         | opts |
         opts := (Cocoa classNamed: 'NSAttributedStringMarkdownParsingOptions') alloc init.
-        opts setInterpretedSyntax: 0. "NSAttributedStringMarkdownInterpretedSyntaxFull — headers/lists/code"
-        opts setFailurePolicy: 1.     "ReturnPartiallyParsedIfPossible — degrade, don't just nil"
+        opts setInterpretedSyntax: 0. "Full — emphasis, code spans, lists"
+        opts setFailurePolicy: 1.     "ReturnPartiallyParsedIfPossible"
         ^opts
     ]
 
     CocoaHelp class >> attributedFor: aString [
-        "AppKit's OWN CommonMark-ish parser does the whole conversion; args
-         are (text. options. baseURL. error) — nil baseURL (no relative
-         links to resolve, a single self-contained page) and nil error (see
-         the file header: a Smalltalk nil marshals to NULL, the legal
-         'don't care' form of this argument)."
         | opts attr |
         opts := self markdownOptions.
         attr := (Cocoa classNamed: 'NSAttributedString') alloc
             send: 'initWithMarkdownString:options:baseURL:error:'
             args: (Array with: (Cocoa nsString: aString) with: opts with: nil with: nil)
             ret: #id.
-        "The options object is ours (alloc init) — the parser doesn't keep it."
         opts release.
         ^attr
     ]
 
-    CocoaHelp class >> blockSeparator [
-        "A visible paragraph gap between reassembled blocks."
-        ^(String with: (Character value: 10)) , (String with: (Character value: 10))
+    "── find in page ─────────────────────────────────────────────────────"
+    CocoaHelp class >> runFind [
+        | ns term |
+        (FindField isNil or: [ DocText isNil ]) ifTrue: [ ^self ].
+        ns := FindField onMain stringValue.
+        term := ns asString.
+        ns release.
+        term isEmpty ifTrue: [ ^self clearFind ].
+        (FindTerm isNil or: [ FindTerm ~= term ])
+            ifTrue: [
+                FindTerm := term.
+                Matches := self matchesOf: term in: DocText.
+                MatchCursor := 0.
+                self highlightMatches: term size ].
+        Matches isEmpty ifTrue: [ ^self ].
+        MatchCursor := MatchCursor \\ Matches size + 1.
+        self jumpToMatch: (Matches at: MatchCursor) length: term size.
     ]
 
-    CocoaHelp class >> splitBlocks: aString [
-        "AppKit's markdown parser recognizes headers/lists/code fences fine,
-         but its resulting -string DROPS every inter-block separator entirely
-         (verified empirically: 'Header' , (2 newlines) , 'Body' parses to
-         the plain string 'HeaderBody', zero characters between them —
-         block structure survives only as NSPresentationIntent attribute
-         runs, which this bridge cannot introspect: attribute:atIndex:
-         effectiveRange: wants an NSRangePointer OUT-arg, outside C2's
-         vocabulary same as the error-arg problem this file's header
-         documents). So split on blank lines HERE, parse each block on its
-         own (a header alone in its own string still parses as a header),
-         and reassemble with an explicit separator — sidesteps the gap
-         without introspecting anything.
-         A single newline stays INSIDE a block (soft wrap / the block's own
-         internal line break); a run of 2+ blank lines ends it. A newline is
-         held PENDING, not written immediately — flushed only if a
-         non-newline character follows (one soft break) or dropped entirely
-         at block end / end of string. Writing it eagerly on the first sight
-         (an earlier version of this method did) leaves every block ending
-         in a trailing '\n', which silently breaks a **bold**-wrapped header
-         (boldedIfHeader:): CommonMark's closing ** must be immediately
-         preceded by non-whitespace, and a newline counts as whitespace."
-        | lf blocks buf i n blankRun ch |
-        lf := Character value: 10.
-        blocks := OrderedCollection new.
-        buf := WriteStream on: String new.
-        blankRun := 0.
-        i := 1. n := aString size.
-        [ i <= n ] whileTrue: [
-            ch := aString at: i.
-            ch = lf
-                ifTrue: [
-                    blankRun := blankRun + 1.
-                    blankRun >= 2 ifTrue: [
-                        buf contents isEmpty ifFalse: [
-                            blocks add: buf contents.
-                            buf := WriteStream on: String new ].
-                        blankRun := 0 ] ]
-                ifFalse: [
-                    blankRun = 1 ifTrue: [ buf nextPut: lf ].
-                    blankRun := 0.
-                    buf nextPut: ch ].
-            i := i + 1 ].
-        buf contents isEmpty ifFalse: [ blocks add: buf contents ].
-        ^blocks
+    CocoaHelp class >> find: aString [
+        "Scripting/automation door (the CocoaFind typeTerm: precedent): fill
+         the field and run a find, as pressing Return would."
+        FindField isNil ifFalse: [ FindField onMain setStringValue: aString ].
+        self runFind
     ]
+    CocoaHelp class >> matchCount [ ^Matches isNil ifTrue: [ 0 ] ifFalse: [ Matches size ] ]
 
-    CocoaHelp class >> trimTrailingWhitespace: aString [
-        "CommonMark's closing ** must be immediately preceded by
-         non-whitespace (a bare '**foo **' does not parse as bold — the
-         trailing space breaks it); trim before wrapping rather than trust
-         the caller's text has none. Belt-and-braces alongside splitBlocks:'s
-         own no-trailing-newline fix, not a substitute for it — this guards
-         against genuine trailing spaces in the source text too, not just
-         the splitter's own newline handling."
-        | j sp lf tab |
-        sp := Character value: 32. lf := Character value: 10. tab := Character value: 9.
-        j := aString size.
-        [ j >= 1 and: [ (aString at: j) = sp or: [ (aString at: j) = lf or: [ (aString at: j) = tab ] ] ] ]
-            whileTrue: [ j := j - 1 ].
-        ^aString copyFrom: 1 to: j
-    ]
-
-    CocoaHelp class >> boldedIfHeader: block [
-        "An ATX header (1-6 #s, a space, then text) rendered via markdown's
-         OWN bold syntax instead of a real heading: this bridge cannot apply
-         an NSFont size/weight attribute without resolving Foundation's
-         exact NSFontAttributeName symbol value (a real risk of guessing a
-         plausible-looking string and silently no-opping — attribute keys
-         are NOT always their own name, e.g. legacy NSAttributedString keys
-         diverge from the modern ones). **bold** is already proven correct
-         through this exact pipeline (the screenshot verification), so
-         headers ride that instead — real heading typography is a follow-up,
-         not a blocker."
-        | i n hashes sp rest |
-        n := block size.
-        sp := Character value: 32.
-        i := 1.
-        [ i <= n and: [ (block at: i) = $# ] ] whileTrue: [ i := i + 1 ].
-        hashes := i - 1.
-        (hashes >= 1 and: [ hashes <= 6 and: [ i <= n and: [ (block at: i) = sp ] ] ])
-            ifFalse: [ ^block ].
-        rest := self trimTrailingWhitespace: (block copyFrom: i + 1 to: n).
-        ^'**' , rest , '**'
-    ]
-
-    CocoaHelp class >> loadAndRender [
-        "Reassemble block by block (splitBlocks:'s doc comment explains why).
-         A single block's parse failure (rare even under the
-         ReturnPartiallyParsedIfPossible policy) falls back to that block's
-         raw text via the live NSMutableString proxy, never a second parse
-         attempt on error text — and never a blank pane."
-        | md blocks storage first empty len color |
-        md := self loadMarkdown.
-        blocks := self splitBlocks: md.
-        storage := TextView onMain textStorage.
-        "Release every fresh wrapper this build path mints (the review's
-         CocoaHelp-leaks finding): the empty seed string, each block's
-         mutableString proxy + parsed NSAttributedString, and the textStorage
-         wrapper itself — the storage/text objects live on in the view; only
-         our +1 handles are dropped."
-        empty := ((Cocoa classNamed: 'NSAttributedString') onMain alloc) onMain init.
-        storage onMain setAttributedString: empty.
-        empty release.
-        first := true.
-        blocks do: [ :block | | attr ms |
-            first
-                ifTrue: [ first := false ]
-                ifFalse: [
-                    ms := storage onMain mutableString.
-                    ms onMain appendString: self blockSeparator.
-                    ms release ].
-            attr := self attributedFor: (self boldedIfHeader: block).
-            attr isNil
-                ifTrue: [
-                    ms := storage onMain mutableString.
-                    ms onMain appendString: block.
-                    ms release ]
-                ifFalse: [
-                    storage onMain appendAttributedString: attr.
-                    attr release ] ].
-        "NSAttributedString markdown parsing bakes in a FIXED black text colour
-         (no appearance-adaptive NSColor involved) — invisible against the
-         dark-theme window background (applyTheme:'s NSAppearance swap changes
-         the WINDOW, not the parsed run colours). Force every run's foreground
-         to labelColor, which itself adapts, so light/dark/system all read.
-         Attribute-only, after the whole build so it composes over the
-         markdown's own bold/heading runs rather than fighting them."
+    CocoaHelp class >> clearFind [
+        | storage len |
+        FindTerm := nil. Matches := nil. MatchCursor := 0.
+        DocView isNil ifTrue: [ ^self ].
+        storage := DocView onMain textStorage.
         len := storage onMain length.
         len > 0 ifTrue: [
-            color := (Cocoa classNamed: 'NSColor') onMain labelColor.
-            storage onMain beginEditing.
-            storage onMain addAttribute: 'NSColor' value: color range: (Array with: 0 with: len).
-            storage onMain endEditing ].
+            storage onMain removeAttribute: 'NSBackgroundColor'
+                    range: (Array with: 0 with: len) ].
         storage release.
     ]
 
-    "── teardown (UI-worker rebuild — CG9; CocoaUI class >> teardown calls this by name) ──"
-    CocoaHelp class >> teardown [
-        TextView isNil ifFalse: [ TextView isValid ifTrue: [ TextView release ] ].
-        Scroll isNil ifFalse: [ Scroll isValid ifTrue: [ Scroll release ] ].
-        Container := nil. Scroll := nil. TextView := nil.
+    CocoaHelp class >> highlightMatches: termLen [
+        | storage len bg |
+        storage := DocView onMain textStorage.
+        len := storage onMain length.
+        len > 0 ifTrue: [
+            storage onMain removeAttribute: 'NSBackgroundColor'
+                    range: (Array with: 0 with: len) ].
+        bg := ((Cocoa classNamed: 'NSColor') onMain systemYellowColor) onMain
+                  colorWithAlphaComponent: 0.35.
+        Matches do: [ :pos |
+            storage onMain addAttribute: 'NSBackgroundColor' value: bg
+                    range: (Array with: pos - 1 with: termLen) ].
+        storage release.
     ]
+
+    CocoaHelp class >> jumpToMatch: pos length: termLen [
+        DocView onMain setSelectedRange: (Array with: pos - 1 with: termLen).
+        DocView onMain scrollRangeToVisible: (Array with: pos - 1 with: termLen).
+    ]
+
+    "Case-insensitive substring scan, ASCII fold — answers 1-based starts."
+    CocoaHelp class >> lowered: ch [
+        | v |
+        v := ch value.
+        ^(v >= 65 and: [ v <= 90 ]) ifTrue: [ Character value: v + 32 ] ifFalse: [ ch ]
+    ]
+    CocoaHelp class >> matchesOf: term in: text [
+        | out tn n i j ok |
+        out := OrderedCollection new.
+        tn := term size. n := text size.
+        tn = 0 ifTrue: [ ^out ].
+        i := 1.
+        [ i <= (n - tn + 1) ] whileTrue: [
+            j := 1. ok := true.
+            [ ok and: [ j <= tn ] ] whileTrue: [
+                (self lowered: (text at: i + j - 1)) = (self lowered: (term at: j))
+                    ifFalse: [ ok := false ].
+                j := j + 1 ].
+            ok ifTrue: [ out add: i ].
+            i := i + 1 ].
+        ^out
+    ]
+
+    "── teardown (CG9 rebuild; CocoaUI class >> teardown calls by name) ──"
+    CocoaHelp class >> teardown [
+        DocView isNil ifFalse: [ DocView isValid ifTrue: [ DocView release ] ].
+        DocScroll isNil ifFalse: [ DocScroll isValid ifTrue: [ DocScroll release ] ].
+        Sidebar isNil ifFalse: [ Sidebar isValid ifTrue: [ Sidebar release ] ].
+        SidebarScroll isNil ifFalse: [ SidebarScroll isValid ifTrue: [ SidebarScroll release ] ].
+        FindField isNil ifFalse: [ FindField isValid ifTrue: [ FindField release ] ].
+        Container isNil ifFalse: [ Container isValid ifTrue: [ Container release ] ].
+        Container := nil. Sidebar := nil. SidebarScroll := nil. SidebarFace := nil.
+        SidebarDelegate := nil. DocView := nil. DocScroll := nil. FindField := nil.
+        ActionDelegates := nil. CurrentTopic := nil. DocText := nil.
+        FindTerm := nil. Matches := nil. MatchCursor := 0.
+    ]
+]
+
+"The sidebar's table data source / delegate receiver — the CocoaTableFace
+ pattern: AppKit asks the minted MacvmDelegate, which performs these here."
+Object subclass: CocoaHelpTopicFace [
+    numberOfRowsInTableView: aTable [ ^CocoaHelp topicCount ]
+    tableView: aTable objectValueForTableColumn: aCol row: aRow [
+        ^CocoaHelp topicTitleAt: aRow + 1 ]
+    tableViewSelectionDidChange: aNote [ CocoaHelp topicSelected ]
+]
+
+"── the documentation itself ──────────────────────────────────────────────
+ Each topic is one markdown string. The renderer above understands: #/##/###
+ headings (green/blue/teal, hairline rules), ``` fenced code (monospaced,
+ purple), > callout quotes (orange bar), --- rules, and body text through
+ AppKit's CommonMark parser (**bold**, *italic*, `code spans`, - bullets).
+ House rules: apostrophes doubled for Smalltalk, BMP characters only."
+Object subclass: CocoaHelp [
+
+    CocoaHelp class >> welcomeText [ ^'# Welcome to MACVM
+
+MACVM is a **Smalltalk system**: a live world of objects you can inspect, change and extend while it runs — carried by a fast virtual machine written from scratch in Rust for Apple Silicon, in the spirit of *Strongtalk*.
+
+Everything you see in this window is written in Smalltalk, running on that VM, including this documentation browser.
+
+## Where to start
+
+- Pick a topic from the **sidebar** on the left. *The Manifesto* says why this exists; *History and Credits* honours the shoulders this stands on.
+- New to the language? Read **The Smalltalk Language** — twenty minutes, and the whole system opens up.
+- Impatient? Open the **Workspace** from the toolbar, type `3 + 4 * 2`, and press **Cmd-P** (Print It). Then type `Breakout launch` and press **Cmd-D** (Do It).
+- The field above this text **finds in the page** — type a word and press Return.
+
+> Nothing here is read-only. Every tool in the toolbar — the Browser, the Editor, the games in the Demos menu — is Smalltalk source you can open, read, and change while it runs.
+
+## The one-minute tour
+
+The toolbar switches between views: the **Workspace** (a scratchpad for running code), two **Browsers** (the class library), the **Editor**, the **Outliner**, **Find**, the **Canvas**, this **Docs** view, and the **Debugger**. The **Transcript** — the system''s log — docks at the bottom of the window. The metrics at the right of the toolbar are the VM''s own live vital signs.
+
+Welcome aboard. The system is yours.
+' ]
+
+    CocoaHelp class >> manifestoText [ ^'# The Manifesto
+
+**Build a new Strongtalk for modern systems.**
+
+In 1994 a small team built the fastest Smalltalk that has ever existed, and one of the most advanced virtual machines of any kind: Strongtalk. Type-feedback inlining, on-stack replacement, deoptimization — the ideas that later powered Java''s HotSpot and every serious JavaScript engine were proven *first* in a Smalltalk. Then the team was acquired, the work was shelved, and the world mostly forgot.
+
+MACVM exists to continue that line, not merely to preserve it.
+
+## What we believe
+
+- **A live system beats a dead one.** You should be able to open any object, read any method, and change the running world — including the tools themselves. The system must never make you leave it to understand it.
+- **Speed is respect.** A dynamic language does not have to be slow, and Strongtalk proved it three decades ago. MACVM measures itself honestly against the fastest Smalltalk VMs in existence, on the same benchmarks, on the same machine — and it holds its own.
+- **Small enough to understand.** One person should be able to read the whole VM. No hundred-megabyte runtime, no build farm — a single Rust crate, a folder of Smalltalk source, and a Mac.
+- **Correctness is a discipline, not a hope.** Every change to the compiler must produce *byte-identical* output between the interpreter and the JIT across the entire test suite, survive garbage-collection stress that scavenges at every allocation, and pay its way on the benchmarks. The gates are not optional.
+- **Native, not hosted.** This is a real Mac app: AppKit windows, Metal graphics, AppleScript automation. The platform is embraced, not abstracted away.
+
+## What this is not
+
+Not a museum piece, not an emulator, and not a toy. It is a working system for building things — games, tools, experiments — that happens to carry one of computing''s great unfinished ideas forward on the hardware of today.
+
+---
+
+> The dream was always a system that is *alive all the way down*, and fast enough that you never have to apologise for it. That dream now runs on the machine in front of you.
+' ]
+
+    CocoaHelp class >> historyText [ ^'# History and Credits
+
+MACVM stands on fifty years of work by people who believed computing could be personal, live, and beautiful. This page is their credit line.
+
+## Smalltalk — Xerox PARC, 1972-1980
+
+Smalltalk was born in Alan Kay''s Learning Research Group at Xerox PARC: **Alan Kay**''s vision of the Dynabook and of *objects all the way down*; **Dan Ingalls**, who implemented Smalltalk-72 through Smalltalk-80 and made the impossible look easy, over and over; **Adele Goldberg**, who led the books and the release that taught the world. Around them: Ted Kaehler, Diana Merry, Scott Wallace, Peter Deutsch and many others.
+
+**L. Peter Deutsch** and **Allan Schiffman**''s 1984 paper on efficient Smalltalk implementation — dynamic translation, inline caches — is the founding document of every fast dynamic-language VM since, this one included.
+
+## Self — the radical middle child
+
+**David Ungar** and **Randall Smith**''s Self (1987-1995) pushed pure message passing to its limit and forced the VM breakthroughs that made it fast: **Craig Chambers**''s customization and maps, **Urs Hoelzle**''s polymorphic inline caches, type feedback and *dynamic deoptimization*. MACVM''s architecture — per-class compiled methods, PICs, deopt with frame materialization — is Self''s lineage, straight down.
+
+## Strongtalk — Animorphic Systems, 1994-1997
+
+The namesake. A tiny company — **David Griswold**, **Lars Bak**, **Gilad Bracha**, **Urs Hoelzle**, **Steffen Grarup**, **Robert Griesemer** and colleagues — built the fastest Smalltalk ever: a type-feedback inlining JIT over a clean blue-book image, plus (Bracha and Griswold) an *optional* static type system that never slowed the dynamic heart. Sun acquired the team in 1997; their VM became the **HotSpot** Java VM. Strongtalk itself was open-sourced in 2006, a gift to everyone who came after.
+
+## The living lineage
+
+- **Squeak** (1996) — Kay, Ingalls and team brought Smalltalk back as open source.
+- **OpenSmalltalk / Cog** — **Eliot Miranda**''s JIT VM carries Squeak and **Pharo** today. Cog is one of the two reference points MACVM benchmarks against, with respect.
+- **The Dart VM** — **Lars Bak** and **Kasper Lund**''s engine (2011). Its recognized-methods and intrinsics design directly informed MACVM''s primitive-fusion work; a sibling project runs this same Smalltalk dialect on a preserved Dart 1.24 VM.
+
+## MACVM
+
+Designed and built in 2026 by **Alban Read**, in daily collaboration with **Claude** (Anthropic) as pair programmer — a from-scratch Rust VM for Apple Silicon, its Smalltalk world written file by file, its every optimization gated by tests and honest benchmarks. A long-held dream, made real together.
+
+> To all the builders above: thank you. May your work stay interesting, and may it never be forgotten.
+' ]
+
+    CocoaHelp class >> languageText [ ^'# The Smalltalk Language
+
+Smalltalk fits on a postcard: **everything is an object, and all you can do is send messages**. Even `3 + 4` is a message. Even `ifTrue:` is a message. There is no other mechanism.
+
+## Literals
+
+```
+42  -17  3.14159          "numbers (integers of any size)"
+$a  $?                    "characters"
+''hello world''             "strings (double the quote to escape)"
+#name  #at:put:           "symbols — interned names"
+#(1 2 3)                  "a literal array"
+true  false  nil          "the usual suspects"
+```
+
+## Three kinds of message
+
+**Unary** — just a name, tightest binding:
+
+```
+5 factorial          "120"
+''macvm'' size          "5"
+3.7 rounded          "4"
+```
+
+**Binary** — operator-shaped, middle binding:
+
+```
+3 + 4 * 2            "14 — strictly left to right! (3+4)*2"
+10 // 3              "3, integer division"
+''mac'' , ''vm''         ", concatenates: ''macvm''"
+```
+
+**Keyword** — the colons carry the arguments, loosest binding:
+
+```
+d at: #speed put: 88.
+7 between: 1 and: 10.
+array copyFrom: 2 to: 5.
+```
+
+So `d at: 1 + 2 put: 3 factorial` means `d at: 3 put: 6`. Parentheses do the rest.
+
+## Blocks — code as objects
+
+A block is a closure in square brackets. Blocks make Smalltalk''s control flow *library code*, not syntax:
+
+```
+[ :x | x * x ] value: 9.                       "81"
+count > 0 ifTrue: [ Transcript showCr: ''go'' ].
+1 to: 5 do: [ :i | total := total + i ].
+[ n < limit ] whileTrue: [ n := n * 2 ].
+#(3 1 2) collect: [ :e | e * 10 ].             "(30 10 20)"
+```
+
+## Cascades and statements
+
+Statements end with a period. A semicolon **cascades** — more messages to the same receiver:
+
+```
+Transcript showCr: ''one''; showCr: ''two''; showCr: ''three''.
+```
+
+## Defining a class
+
+This world uses a compact file syntax — here is a real, complete class:
+
+```
+Object subclass: Counter [
+    | count |
+    Counter class >> new [ ^super new setZero ]
+    setZero [ count := 0 ]
+    increment [ count := count + 1. ^count ]
+    count [ ^count ]
+]
+```
+
+`| count |` declares instance variables; `Counter class >> new` defines a class-side method; `^` returns. Class variables are declared with a pragma: `<classVars: Registry NextId>`.
+
+## Exceptions
+
+Full ANSI-style exceptions, implemented in the world itself:
+
+```
+[ 10 / 0 ] on: ZeroDivide do: [ :e | Transcript showCr: e messageText ].
+
+[ risky value ] ensure: [ file close ].
+
+[ n := n + 1. n < 3 ifTrue: [ Error signal ]. n ]
+    on: Error do: [ :e | e retry ].
+```
+
+Handlers can `return:`, `retry`, `pass`, and `resume:` — the whole protocol.
+
+> Try every one of these **right now**: copy a line into the Workspace and press Cmd-P. The best way to learn Smalltalk is to ask the system.
+' ]
+
+    CocoaHelp class >> environmentText [ ^'# The Environment
+
+One window, many views — the toolbar switches between them, and everything shares the live world underneath.
+
+## Workspace
+
+The scratchpad. Type any expression, then:
+
+- **Cmd-D** — *Do It*: run the selection (or the whole workspace).
+- **Cmd-P** — *Print It*: run it and print the result right there.
+
+The Workspace is where every experiment starts: `Breakout launch`, `TestRunner start`, `1000 factorial`.
+
+## Transcript
+
+The system log, docked at the bottom of the window (drag the divider; it remembers). `Transcript showCr: ''hello''` writes to it from anywhere — worker output is forwarded here too.
+
+## The Browsers
+
+Two ways into the class library. **Browser** is the direct pane: classes, variables, selectors, source. **Browser V2** is the classic Smalltalk-80 four-pane category browser — categories, classes, protocols, methods — with full write access: accept a method edit and it compiles into the running world *and* persists.
+
+## Editor, Outliner, Find
+
+The **Editor** is a plain class-text editor with live recompile on save. The **Outliner** is the Strongtalk-style unfolding tree over live class reflection. **Find** searches selectors and source across the whole world.
+
+## Canvas, Sprite Editor, Sound Editor
+
+The **Canvas** is an RGBA drawing surface driven from Smalltalk. Under the **Tools** menu: the **Sprite Editor** (draw GamePane sprites, save them as sheet classes) and the **Sound Editor** (the ADSR panel over the parametric synthesizer).
+
+## Debugger
+
+When code halts — a breakpoint, an error with halt-on-error enabled, an explicit `halt` — the **Debugger** fronts itself with the stack, the source, and the frame; Step Into, Step Over, Finish, Continue, Abort.
+
+## Appearance and type
+
+**View - Appearance**: System, Light or Dark. **A-** and **A+** in the toolbar scale every code surface together.
+
+## Demos
+
+The **Demos** menu carries the show-offs: Breakout, MandelZoom, ParallelMandel, Worms, Galaxigans and friends — each one an ordinary Smalltalk class you can read in the Browser while it runs.
+
+## Automation
+
+The app speaks **AppleScript**:
+
+```
+tell application id "com.macvm.cocoa"
+    evaluate "6 * 7"
+end tell
+```
+
+Scripts can run code, switch views, and read state — the full dictionary is in Script Editor''s library window.
+
+> The metrics cluster at the toolbar''s right edge is the VM itself: memory in use, GC activity, compiled-code counts — live, always on.
+' ]
+
+    CocoaHelp class >> worldText [ ^'# The Strongtalk World
+
+The *world* is the Smalltalk side of MACVM: a folder of plain text files, loaded in order at startup, that build everything from `Object` up to this documentation browser.
+
+## Files, in order
+
+`world/world.list` names the files and the order. Numbering tells the story: kernel classes first (`01_object.mst`, `04a_blockclosure.mst`, `06_smallinteger.mst`...), then collections, streams, numbers — then the fun (`43_gamepane.mst`, `44_breakout.mst`) — then the tools. The Cocoa GUI layer has its own list (`world/cocoaui.list`) so headless runs never load AppKit code.
+
+A `.mst` file is just class definitions and expressions. Top-level expressions run *at load time* — the world literally executes itself into existence.
+
+## The library
+
+Everything you expect from a Smalltalk-80 image, implemented in readable source: `Collection` protocols over `Array`, `OrderedCollection`, `Dictionary`, `Set`, `Bag`, `SortedCollection`; `Stream`s; arbitrary-precision `LargeInteger` arithmetic; `Date` and `Time`; exceptions; and the reflection the browsers are built on.
+
+## Tests
+
+The world tests itself:
+
+```
+TestRunner start.
+TestRunner run: IntegerTests.
+```
+
+The full suite — over **7,700 assertions** — runs in both the interpreter and the JIT, and the two transcripts must match *byte for byte*. That differential gate is the project''s spine: the JIT is not allowed to disagree with the interpreter, ever.
+
+## The image
+
+Source files are the truth, but edits made in the browsers persist to a versioned SQLite image (`image.sqlite3`) alongside the world — accept a method in the Browser and it is compiled into the running system *and* recorded durably.
+
+## Benchmarks
+
+`BenchmarkDashboard` drives the classic suite — richards, deltablue, and the micro set — with the same workloads and the same clocks used to compare against Cog and the Dart VM. The numbers on the project''s wall came from here.
+
+> Read the world the way you would read a good book: start at `01_object.mst` and just keep going. There is no magic underneath — it is Smalltalk all the way down until you hit the VM.
+' ]
+
+    CocoaHelp class >> appGuideText [ ^'# Guide: Build an App
+
+Let us add a real view to this window — a click counter — live, without restarting anything. Ten minutes.
+
+## 1. Define the model
+
+In the **Workspace**, select this and press Cmd-D:
+
+```
+Object subclass: ClickCounter [
+    <classVars: Count Label>
+    ClickCounter class >> count [ ^Count isNil ifTrue: [ 0 ] ifFalse: [ Count ] ]
+    ClickCounter class >> increment [
+        Count := self count + 1.
+        Label isNil ifFalse: [
+            Label onMain setStringValue: ''Clicks: '' , Count printString ]
+    ]
+]
+```
+
+## 2. Build a view
+
+Views are ordinary AppKit objects driven from Smalltalk through the Cocoa bridge — `Cocoa classNamed:` fetches a class, `onMain` runs the send on the UI thread:
+
+```
+Object subclass: ClickCounter [
+    ClickCounter class >> containerView [
+        | v btn holder delegate |
+        v := ((Cocoa classNamed: ''NSView'') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: 400.0 with: 300.0).
+        Label := ((Cocoa classNamed: ''NSTextField'') onMain alloc) onMain
+            initWithFrame: (Array with: 20.0 with: 200.0 with: 300.0 with: 30.0).
+        Label onMain setEditable: false.
+        Label onMain setBordered: false.
+        Label onMain setDrawsBackground: false.
+        Label onMain setStringValue: ''Clicks: 0''.
+        v onMain addSubview: Label.
+        btn := ((Cocoa classNamed: ''NSButton'') onMain alloc) onMain
+            initWithFrame: (Array with: 20.0 with: 150.0 with: 140.0 with: 32.0).
+        btn onMain setTitle: ''Click me''.
+        btn onMain setBezelStyle: 1.
+        holder := CocoaToolbarAction on: [ self increment ].
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: ''macvmAction:''.
+        v onMain addSubview: btn.
+        ^v
+    ]
+]
+```
+
+The `MacvmDelegate` line is the whole event story: AppKit calls the minted delegate, the delegate performs your block. Tables, text fields and menus all wire the same way.
+
+## 3. Register it as a toolbar view
+
+```
+CocoaUI registerViewNamed: #clicks title: ''Clicks'' icon: nil
+        container: [ ClickCounter containerView ]
+        onShow: [ ].
+CocoaUI switchToView: #clicks.
+```
+
+Your view is now a first-class citizen of the window.
+
+## 4. Make it permanent
+
+Happy with it? Put the class in a file (say `world/85_clickcounter.mst`), add the registration to the startup path, and add the file to `world/cocoaui.list`. The Docs view you are reading followed exactly this path.
+
+> Every view in this window — Browser, Debugger, this one — is built with precisely these ingredients and nothing more. Read `world/71_cocoahelp.mst` for a complete worked example.
+' ]
+
+    CocoaHelp class >> gameGuideText [ ^'# Guide: Build a Game
+
+The **GamePane** is a Metal-backed 320x240 game surface with a palette, sprites, sound effects and a 60fps frame loop — all driven from Smalltalk. `Breakout launch` is the reference game; here is the skeleton of your own.
+
+## 1. Open a pane and paint
+
+Run in the Workspace:
+
+```
+| p |
+p := GamePane new.
+p paletteAt: 1 r: 30 g: 144 b: 255.
+p cls: 0.
+p fill: 40 y: 60 width: 240 height: 20 color: 1.
+p disc: 160 y: 160 radius: 24 color: 1.
+p text: ''HELLO'' x: 120 y: 30 r: 255 g: 255 b: 255.
+p present.
+```
+
+`cls:` clears to a palette colour; `point:`, `line:`, `fill:`, `disc:` and `text:` draw; `present` flips the frame to the screen.
+
+## 2. The frame loop
+
+Give the pane a step block and run it — the engine calls you at 60fps:
+
+```
+Object subclass: MyGame [
+    | pane x dx |
+    MyGame class >> launch [ ^self new start ]
+    start [
+        pane := GamePane new.
+        pane paletteAt: 1 r: 255 g: 200 b: 0.
+        x := 20. dx := 3.
+        pane onStep: [ self step ].
+        pane run
+    ]
+    step [
+        x := x + dx.
+        (x < 8 or: [ x > 300 ]) ifTrue: [ dx := 0 - dx ].
+        pane cls: 0.
+        pane disc: x y: 120 radius: 10 color: 1.
+        pane present
+    ]
+]
+MyGame launch.
+```
+
+## 3. Input
+
+Ask the pane which keys are held, by key constant:
+
+```
+(pane keyHeld: GamePane keyLeft)  ifTrue: [ x := x - 4 ].
+(pane keyHeld: GamePane keyRight) ifTrue: [ x := x + 4 ].
+```
+
+Arrows, plus `keyA` and `keyB` for action buttons.
+
+## 4. Sprites
+
+Sprites are little indexed-colour bitmaps defined as hex rows — draw them by hand, or in **Tools - Sprite Editor**, which saves sheet classes for you:
+
+```
+| id |
+id := pane defineSprite: #(''00111100'' ''01222210'' ''12222221'' ''01222210'' ''00111100'').
+(Sprite pane: pane id: id) moveTo: 100 y: 80.
+```
+
+Sprites move without repainting the background — the engine composites them each frame.
+
+## 5. Sound
+
+```
+Sound coin play.
+Sound jump play.
+Sound zap play.
+```
+
+Three arcade presets to start; design your own instruments in **Tools - Sound Editor** (a full ADSR parametric synth).
+
+## 6. Study the masters
+
+Open these in the Browser — each is one readable class:
+
+- `Breakout` — collision, lives, HUD, the complete loop.
+- `MandelZoom` — per-pixel compute, the JIT flexing.
+- `Worms`, `Galaxigans` — sprites and swarms.
+
+> Deterministic integer physics, like Breakout''s, makes games easier to reason about *and* faster: SmallInteger arithmetic sits on the VM''s hottest, most-optimized path.
+' ]
+
+    CocoaHelp class >> internalsText [ ^'# Under the Hood
+
+A short tour of the machine, for the curious. The deep versions live in `docs/` in the repository.
+
+## Two engines, one truth
+
+Code starts in a fast **bytecode interpreter**. Methods that prove hot are compiled by the **tier-1 JIT** to native arm64, *customized* to the receiver class — the Self trick — with inline caches that graduate mono to polymorphic to megamorphic as call sites get promiscuous.
+
+The two engines are held to one law: across the entire 7,700-assertion world suite, interpreter output and JIT output must be **byte-identical**. Every compiler change runs that differential gate, plus GC stress (a scavenge before *every* allocation), plus deoptimization stress, plus the benchmark suite. What does not pay, does not land.
+
+## Speculation and the way back
+
+Compiled code speculates: it inlines the primitives the profile saw, fuses SmallInteger arithmetic, elides allocations. When a speculation fails, an **uncommon trap** fires and the VM *deoptimizes* — it rebuilds honest interpreter frames from compiler-recorded metadata, mid-execution, and carries on as if nothing happened. Loops can also enter compiled code mid-flight (**on-stack replacement**).
+
+## Memory
+
+A generational collector: new objects are born in **eden** and scavenged copying-style through survivor space; the old generation is compacted by a mark-slide **full GC**. Compiled frames carry oop maps so the collector can walk native stacks precisely — an area guarded by some of the project''s most paranoid stress gates.
+
+## The worker model
+
+The UI runs a **supervisor beat** over worker VMs: your code runs in a worker, and if it dies mid-request the supervisor recovers the in-flight state and reports the error — the window never goes down with the experiment. Scripted evaluation (AppleScript, the control channel) rides the same rails with explicit error replies.
+
+## The Cocoa bridge
+
+Smalltalk drives AppKit directly: `Cocoa classNamed:` plus ordinary message sends, marshalled to Objective-C; delegates and data sources come back through a ticket registry (`MacvmDelegate`) so native callbacks land as Smalltalk sends. The whole GUI — this browser included — is world code using that one door.
+
+## Pedigree, honestly measured
+
+The benchmark protocol is fixed: identical workloads, microsecond clocks, interleaved runs on a quiet machine, medians reported. Against the fastest open Smalltalk VMs, MACVM wins the classic suite; against its other ancestor, the Dart VM, it trades blows and closes the gap release by release. The dashboards in this app run the very same code.
+
+---
+
+> Full designs: `docs/intrinsics_design.md`, `docs/exceptions_design.md`, `docs/cocoa_gui_design.md`, `docs/applescript_design.md`, and the sprint logs. The repository *is* the book.
+' ]
 ]
