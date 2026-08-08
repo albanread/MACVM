@@ -434,6 +434,48 @@ Object subclass: CocoaUI [
             idx > 0 ifTrue: [ group onMain setSelectedIndex: idx - 1 ] ].
     ]
 
+    "── runtime tab insertion (a view registered AFTER startup) ───────────
+     registerViewNamed: appends to Views/ViewItemSpecs, but the view-switcher
+     is ONE segmented NSToolbarItemGroup built once at startup — so a view
+     registered later (e.g. the Build-an-App guide''s `registerViewNamed:`
+     step) never gained a clickable segment. The group cannot simply grow: it
+     must be rebuilt through the convenience constructor (a hand-grown one
+     refuses setSelectedIndex:), so we drop the cached group and have the
+     delegate re-vend it from the now-larger specs by removing and re-inserting
+     the group item in the live toolbar at the same index."
+    CocoaUI class >> indexOfToolbarItem: ident [
+        "0-based index of the live toolbar item whose identifier = `ident`, nil
+         if absent. Releases the array and each probed item."
+        | items n i result |
+        WinToolbar isNil ifTrue: [ ^nil ].
+        items := WinToolbar onMain items.
+        n := items sendI64: 'count'.
+        result := nil. i := 0.
+        [ result isNil and: [ i < n ] ] whileTrue: [
+            | it |
+            it := items onMain objectAtIndex: i.
+            (it sendString: 'itemIdentifier') = ident ifTrue: [ result := i ].
+            it release.
+            i := i + 1 ].
+        items release.
+        ^result
+    ]
+
+    CocoaUI class >> insertViewSwitcherTab [
+        "Rebuild the segmented view group in place so the newest ViewItemSpecs
+         entry becomes a clickable segment. No-op before the toolbar exists —
+         startup registrations build the group once from the full specs."
+        | idx |
+        (WinToolbar isNil or: [ ToolbarItems isNil ]) ifTrue: [ ^self ].
+        idx := self indexOfToolbarItem: self viewGroupIdentifier.
+        idx isNil ifTrue: [ ^self ].
+        ToolbarItems removeKey: self viewGroupIdentifier ifAbsent: [ nil ].
+        WinToolbar onMain removeItemAtIndex: idx.
+        WinToolbar onMain insertItemWithItemIdentifier: self viewGroupIdentifier
+                          atIndex: idx.
+        self syncToolbarEnablement.
+    ]
+
     "The identifier array, built once and KEPT — see buildWindowToolbar."
     CocoaUI class >> toolbarIdentifierArray [
         ToolbarIdentArray isNil ifTrue: [
@@ -696,6 +738,10 @@ Object subclass: CocoaUI [
             with: 'macvm.view.' , aSymbol
             with: aTitle
             with: (self toolbarIconNamed: iconBaseName)).
+        "If the toolbar is already live, this is a runtime registration (a
+         guide/script adding a view) — splice its segment in now. At startup
+         WinToolbar is still nil, so the group builds once from the full specs."
+        WinToolbar isNil ifFalse: [ self insertViewSwitcherTab ].
     ]
 
     "── code font size (the A- / A+ toolbar buttons) ──────────────────────
