@@ -1327,6 +1327,52 @@ impl<'a> Parser<'a> {
 /// Parses one whole `.mst` file into its top-level items (SPEC §1's
 /// `file` production), in source order. `do_it` statements are NOT
 /// executed here — `frontend::classdef`/`world` drive execution.
+/// A doit chunk that OPENS with a `| a b c |` temp declaration — what every
+/// Smalltalk workspace accepts, and what most textbook snippets start with:
+///
+/// ```text
+/// | p |
+/// p := GamePane new.
+/// p cls: 0.
+/// ```
+///
+/// Without this the chunk failed to parse at 1:1 ("expected an expression"),
+/// and even with the bars deleted each statement became its OWN doit —
+/// separate methods, no shared scope — so the second line answered
+/// "undeclared variable 'p'". (Reported against the Docs viewer's GamePane
+/// walkthrough; it bit every copied multi-line example.)
+///
+/// Desugared to `[ | a b c | stmts ] value`, built as AST rather than by
+/// rewriting source text: one doit, one shared scope, and the block's value
+/// IS the last statement's value — exactly what Print It should show. `^`
+/// still works: inside a block it is a non-local return from the enclosing
+/// doit method, which is the top level here.
+fn parse_temp_chunk(p: &mut Parser) -> Result<TopItem, CompileError> {
+    let span = p.cur.1;
+    let (temps, _temp_types) = p.parse_optional_temps()?;
+    let mut body = Vec::new();
+    while !matches!(p.cur.0, Tok::Eof) {
+        body.push(p.parse_statement()?);
+        if !matches!(p.cur.0, Tok::Eof) {
+            p.expect(&Tok::Period, "expected '.' after statement")?;
+        }
+    }
+    let block = Expr::Block(Box::new(BlockNode {
+        params: Vec::new(),
+        temps,
+        body,
+        span,
+        scope_id: 0,
+    }));
+    Ok(TopItem::DoIt(Expr::Send {
+        receiver: Box::new(block),
+        selector: "value".to_string(),
+        args: Vec::new(),
+        is_super: false,
+        span,
+    }))
+}
+
 pub fn parse_file(input: &str) -> Result<Vec<TopItem>, CompileError> {
     let mut p = Parser::new(input)?;
     let mut items = Vec::new();
@@ -1351,6 +1397,9 @@ pub fn parse_one_top_item(input: &str) -> Result<Option<TopItem>, CompileError> 
     let mut p = Parser::new(input)?;
     if matches!(p.cur.0, Tok::Eof) {
         return Ok(None);
+    }
+    if matches!(p.cur.0, Tok::VBar) {
+        return Ok(Some(parse_temp_chunk(&mut p)?));
     }
     let is_class_def = matches!(&p.cur.0, Tok::Ident(_))
         && matches!(p.peek2()?, Tok::Keyword(k) if k == "subclass:");
@@ -1380,6 +1429,13 @@ pub fn parse_one_top_item(input: &str) -> Result<Option<TopItem>, CompileError> 
 pub fn parse_top_items(input: &str) -> Result<Vec<TopItem>, CompileError> {
     let mut p = Parser::new(input)?;
     let mut items = Vec::new();
+
+    // A leading `| a b c |` declaration makes the whole chunk one doit —
+    // see `parse_temp_chunk`.
+    if matches!(p.cur.0, Tok::VBar) {
+        return Ok(vec![parse_temp_chunk(&mut p)?]);
+    }
+
     while !matches!(p.cur.0, Tok::Eof) {
         let is_class_def = matches!(&p.cur.0, Tok::Ident(_))
             && matches!(p.peek2()?, Tok::Keyword(k) if k == "subclass:");

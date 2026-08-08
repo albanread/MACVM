@@ -35,8 +35,8 @@
  build-your-own guides — are written in me as methods, so the system
  documents itself wherever it runs. I run in the UI worker VM."
 Object subclass: CocoaHelp [
-    <classVars: Topics Container Sidebar SidebarScroll SidebarFace SidebarDelegate
-                DocView DocScroll FindField ActionDelegates
+    <classVars: Topics CodeBlocks Container Sidebar SidebarScroll SidebarFace SidebarDelegate
+                DocView DocScroll FindField RunButton RunButtons RunDelegates ActionDelegates
                 CurrentTopic DocText FindTerm Matches MatchCursor>
 
     "── registration (CG7+ pattern; CocoaUI startup calls this by name) ──"
@@ -133,12 +133,146 @@ Object subclass: CocoaHelp [
         x := self sidebarWidth + 8.
         FindField := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
             initWithFrame: (Array with: x with: h - 32.0
-                                  with: w - x - 10.0 with: 24.0).
+                                  with: w - x - self runButtonWidth - 24.0 with: 24.0).
         FindField onMain setPlaceholderString: 'Find in page  (press Return; wraps)'.
         FindField onMain setBezelStyle: 1. "rounded — search-field look"
         FindField onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
         self wireAction: FindField to: [ self runFind ].
         Container onMain addSubview: FindField.
+        self buildRunButton: w height: h.
+    ]
+
+    CocoaHelp class >> runButtonWidth [ ^168.0 ]
+
+    CocoaHelp class >> buildRunButton: w height: h [
+        "Every guide here is code you are meant to RUN. This lifts the
+         listing your caret is sitting in straight into the Workspace and
+         does it — no select, no copy, no tab hunting."
+        | btn |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain
+            initWithFrame: (Array with: w - self runButtonWidth - 10.0
+                                  with: h - 32.0
+                                  with: self runButtonWidth with: 24.0).
+        btn onMain setTitle: 'Run in Workspace'.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: CocoaUI maskMinXMargin + CocoaUI maskMinYMargin.
+        self wireAction: btn to: [ self runInWorkspace ].
+        RunButton := btn.
+        Container onMain addSubview: btn.
+    ]
+
+    CocoaHelp class >> clearRunButtons [
+        RunButtons isNil ifFalse: [
+            RunButtons do: [ :b |
+                b isValid ifTrue: [ b onMain removeFromSuperview. b release ] ] ].
+        RunButtons := OrderedCollection new.
+        RunDelegates := OrderedCollection new.
+    ]
+
+    CocoaHelp class >> placeRunButtons [
+        "A Run button beside EVERY listing: these guides exist to be tried,
+         and 'select, copy, find the Workspace, paste' is four steps too
+         many. Positioned from the real text layout — the layout manager's
+         bounding rect for the block's rendered range, offset by the text
+         container origin — and added as subviews of the TEXT VIEW, so they
+         scroll with the code they belong to."
+        | lm tc origin ox oy vw |
+        self clearRunButtons.
+        (CodeBlocks isNil or: [ CodeBlocks isEmpty ]) ifTrue: [ ^self ].
+        lm := DocView onMain layoutManager.
+        tc := DocView onMain textContainer.
+        "Text layout is LAZY — without this the rects come back empty for
+         anything below the first screenful."
+        lm onMain ensureLayoutForTextContainer: tc.
+        origin := DocView onMain textContainerOrigin.
+        ox := origin at: 1. oy := origin at: 2.
+        vw := (DocView onMain frame) at: 3.
+        CodeBlocks do: [ :entry |
+            | start len src rect x y btn |
+            start := entry at: 1. len := entry at: 2. src := entry at: 3.
+            len > 0 ifTrue: [
+                rect := lm onMain
+                    boundingRectForGlyphRange: (Array with: start with: len)
+                    inTextContainer: tc.
+                x := ox + (rect at: 1) + (rect at: 3) + 12.
+                x := x min: vw - 46.0.
+                y := oy + (rect at: 2).
+                btn := self runButtonFor: src at: x y: y.
+                DocView onMain addSubview: btn.
+                RunButtons add: btn ] ].
+        lm release. tc release.
+    ]
+
+    CocoaHelp class >> runButtonFor: src at: x y: y [
+        | btn holder delegate img |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain
+            initWithFrame: (Array with: x with: y with: 34.0 with: 20.0).
+        img := (Cocoa classNamed: 'NSImage') onMain
+            imageWithSystemSymbolName: 'play.fill'
+            accessibilityDescription: 'Run this example'.
+        img isNil
+            ifTrue: [ btn onMain setTitle: 'Run' ]
+            ifFalse: [ btn onMain setImage: img. btn onMain setTitle: '' ].
+        btn onMain setBezelStyle: 1.
+        btn onMain setToolTip: 'Run this example in the Workspace'.
+        btn onMain setAutoresizingMask: 0.
+        holder := CocoaToolbarAction on: [ self run: src ].
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        RunDelegates add: delegate.
+        ^btn
+    ]
+
+    CocoaHelp class >> run: src [
+        "SWITCH FIRST — views build lazily on first visit and the app opens
+         on Docs, so on a fresh launch the Workspace does not exist yet and
+         setWorkspaceText: (which guards on a nil Workspace) would silently
+         drop the code."
+        CocoaUI switchToView: #workspace.
+        CocoaUI setWorkspaceText: src.
+        CocoaUI doIt.
+    ]
+
+    CocoaHelp class >> probeRectFor: start len: len [
+        "Geometry probe: the on-screen rect of a character range."
+        | lm tc |
+        lm := DocView onMain layoutManager.
+        tc := DocView onMain textContainer.
+        ^lm onMain boundingRectForGlyphRange: (Array with: start with: len)
+                   inTextContainer: tc
+    ]
+    CocoaHelp class >> probeOrigin [ ^DocView onMain textContainerOrigin ]
+    CocoaHelp class >> codeBlockCount [ ^CodeBlocks isNil ifTrue: [ 0 ] ifFalse: [ CodeBlocks size ] ]
+    CocoaHelp class >> codeBlockAt: i [ ^CodeBlocks at: i ]
+
+    CocoaHelp class >> codeAtCaret [
+        "The listing the caret sits in, else the one just above it, else the
+         topic's first — so the button always has something to run on a page
+         that has any code at all. nil when the topic has none."
+        | caret best |
+        (CodeBlocks isNil or: [ CodeBlocks isEmpty ]) ifTrue: [ ^nil ].
+        caret := (DocView onMain selectedRange) at: 1.
+        best := nil.
+        CodeBlocks do: [ :pair |
+            (pair at: 1) <= caret ifTrue: [ best := pair ] ].
+        best isNil ifTrue: [ best := CodeBlocks first ].
+        ^best at: 3
+    ]
+
+    CocoaHelp class >> runInWorkspace [
+        "Selection wins if there is one (you can run a single line of a
+         listing); otherwise the whole block at the caret."
+        | sel src range |
+        range := DocView onMain selectedRange.
+        src := nil.
+        (range at: 2) > 0 ifTrue: [
+            sel := (DocView onMain string) onMain
+                       substringWithRange: range.
+            sel isNil ifFalse: [ src := sel asString. sel release ] ].
+        src isNil ifTrue: [ src := self codeAtCaret ].
+        src isNil ifTrue: [ ^CocoaUI appendTranscript: 'Docs: no code on this page to run.' ].
+        self run: src.
     ]
 
     CocoaHelp class >> buildDocView: w height: h [
@@ -225,6 +359,7 @@ Object subclass: CocoaHelp [
         empty := ((Cocoa classNamed: 'NSAttributedString') onMain alloc) onMain init.
         storage onMain setAttributedString: empty.
         empty release.
+        CodeBlocks := OrderedCollection new.
         storage onMain beginEditing.
         (self blocksOf: md) do: [ :b | self renderBlock: b into: storage ].
         storage onMain endEditing.
@@ -240,6 +375,7 @@ Object subclass: CocoaHelp [
          top edge. Same deferral rule as the table reloads."
         DocView onMain performSelector: 'scrollToBeginningOfDocument:'
                 withObject: nil afterDelay: 0.0.
+        self placeRunButtons.
         self selectSidebarRow: i - 1.
     ]
 
@@ -412,6 +548,9 @@ Object subclass: CocoaHelp [
         tag = #code ifTrue: [
             | start |
             start := storage onMain length.
+            "Remember where this listing landed and what it says, so the
+             Run in Workspace button can find the block the caret is in."
+            CodeBlocks add: (Array with: start with: 0 with: text).
             self append: (self padded: text) , self nl
                  font: (CocoaUI fixedFontOfSize: 12.0)
                  color: ((Cocoa classNamed: 'NSColor') onMain systemPurpleColor)
@@ -423,6 +562,9 @@ Object subclass: CocoaHelp [
              appearances."
             self tintFrom: start in: storage
                  color: ((Cocoa classNamed: 'NSColor') onMain quaternaryLabelColor).
+            "Rendered length — padding makes it longer than the raw source,
+             and the run-button geometry measures the RENDERED range."
+            CodeBlocks last at: 2 put: (storage onMain length) - start.
             ^self append: self nl font: nil color: nil into: storage ].
         tag = #quote ifTrue: [
             | start |
@@ -704,10 +846,13 @@ Object subclass: CocoaHelp [
         Sidebar isNil ifFalse: [ Sidebar isValid ifTrue: [ Sidebar release ] ].
         SidebarScroll isNil ifFalse: [ SidebarScroll isValid ifTrue: [ SidebarScroll release ] ].
         FindField isNil ifFalse: [ FindField isValid ifTrue: [ FindField release ] ].
+        RunButton isNil ifFalse: [ RunButton isValid ifTrue: [ RunButton release ] ].
         Container isNil ifFalse: [ Container isValid ifTrue: [ Container release ] ].
         Container := nil. Sidebar := nil. SidebarScroll := nil. SidebarFace := nil.
         SidebarDelegate := nil. DocView := nil. DocScroll := nil. FindField := nil.
         ActionDelegates := nil. CurrentTopic := nil. DocText := nil.
+        RunButton := nil. CodeBlocks := nil.
+        RunButtons := nil. RunDelegates := nil.
         FindTerm := nil. Matches := nil. MatchCursor := 0.
     ]
 ]
@@ -739,7 +884,7 @@ Everything you see in this window is written in Smalltalk, running on that VM, i
 
 - Pick a topic from the **sidebar** on the left. *The Manifesto* says why this exists; *History and Credits* honours the shoulders this stands on.
 - New to the language? Read **The Smalltalk Language** — twenty minutes, and the whole system opens up.
-- Impatient? Open the **Workspace** from the toolbar, type `3 + 4 * 2`, and press **Cmd-P** (Print It). Then type `Breakout launch` and press **Cmd-D** (Do It).
+- Impatient? Open the **Workspace** from the toolbar, type `3 + 4 * 2`, and press **Cmd-P** (Print It). For a game, use the **Demos** menu — Breakout is a good first look.
 - The field above this text **finds in the page** — type a word and press Return.
 
 > Nothing here is read-only. Every tool in the toolbar — the Browser, the Editor, the games in the Demos menu — is Smalltalk source you can open, read, and change while it runs.
@@ -915,7 +1060,7 @@ The scratchpad. Type any expression, then:
 - **Cmd-D** — *Do It*: run the selection (or the whole workspace).
 - **Cmd-P** — *Print It*: run it and print the result right there.
 
-The Workspace is where every experiment starts: `Breakout launch`, `TestRunner start`, `1000 factorial`.
+The Workspace is where every experiment starts: `TestRunner start`, `1000 factorial`, `Object subclass: ...`. (Games are the exception — they need a top-level launch, see *Guide: Build a Game*.)
 
 ## Transcript
 
@@ -943,7 +1088,7 @@ When code halts — a breakpoint, an error with halt-on-error enabled, an explic
 
 ## Demos
 
-The **Demos** menu carries the show-offs: Breakout, MandelZoom, ParallelMandel, Worms, Galaxigans and friends — each one an ordinary Smalltalk class you can read in the Browser while it runs.
+The **Demos** menu carries the show-offs: Breakout, MandelZoom, ParallelMandel, Worms, Galaxigans and friends — each one an ordinary Smalltalk class you can read in the Browser while it runs. The menu launches them **top-level on the primary** (`CocoaBrowser hostService onMain launchDemo:`), which is what a frame loop needs; **Escape** ends one.
 
 ## Automation
 
@@ -1069,28 +1214,59 @@ Happy with it? Put the class in a file (say `world/85_clickcounter.mst`), add th
 
     CocoaHelp class >> gameGuideText [ ^'# Guide: Build a Game
 
-The **GamePane** is a Metal-backed 320x240 game surface with a palette, sprites, sound effects and a 60fps frame loop — all driven from Smalltalk. `Breakout launch` is the reference game; here is the skeleton of your own.
+You are going to draw a picture, then make it move. No setup, no files — type into the **Workspace** and press the little play button beside any example on this page.
 
-## 1. Open a pane and paint
+The **GamePane** is a game screen: **320 dots across, 240 down**, with position (0, 0) at the **top-left**. It can draw shapes and text, play sounds, read the arrow keys, and run a game loop 60 times a second.
 
-Run in the Workspace:
+## 1. Your first picture
+
+Press play on this. A window opens with a yellow sun over a blue sky:
 
 ```
-| p |
-p := GamePane new.
-p paletteAt: 1 r: 30 g: 144 b: 255.
-p cls: 0.
-p fill: 40 y: 60 width: 240 height: 20 color: 1.
-p disc: 160 y: 160 radius: 24 color: 1.
-p text: ''HELLO'' x: 120 y: 30 r: 255 g: 255 b: 255.
-p present.
+| pane |
+pane := GamePane new.
+pane paletteAt: 16 r: 30  g: 60  b: 140.
+pane paletteAt: 17 r: 255 g: 220 b: 60.
+pane paletteAt: 18 r: 90  g: 190 b: 90.
+pane cls: 16.
+pane disc: 250 y: 50 radius: 30 color: 17.
+pane fill: 0 y: 180 width: 320 height: 60 color: 18.
+pane text: ''HELLO'' x: 120 y: 110 r: 255 g: 255 b: 255.
+pane present.
 ```
 
-`cls:` clears to a palette colour; `point:`, `line:`, `fill:`, `disc:` and `text:` draw; `present` flips the frame to the screen.
+Change a number and press play again. That is the whole loop of learning here: change, run, look.
 
-## 2. The frame loop
+## 2. The three rules
 
-Give the pane a step block and run it — the engine calls you at 60fps:
+Almost everything that goes wrong is one of these.
+
+**Rule 1 — colours live in a numbered paint box, and your colours start at 16.**
+`paletteAt: 16 r: 30 g: 60 b: 140` means *put this colour in slot 16*. Red, green and blue each go from 0 to 255. Then you draw with `color: 16`. Slots below 16 belong to the system — slot **0 is see-through**. **If you paint with a number under 16 you get a black screen**, which is the single most common surprise.
+
+**Rule 2 — draw, then `present`.**
+Drawing happens on a hidden page. `present` is the moment it becomes visible, like taking the photo. Inside a game loop you must `present` at the end of *every* frame, or the screen freezes or flickers.
+
+**Rule 3 — a moving game must be *launched*, not just run in the Workspace.**
+A picture is fine from the Workspace. A **game loop** needs to own itself, so hand it to the launcher (section 4). If you skip this you get a black window — and, confusingly, the sound still works.
+
+## 3. Things you can draw
+
+```
+pane cls: 16.
+pane point: 10 y: 10 color: 17.
+pane line: 0 y: 0 to: 319 y: 239 color: 17.
+pane fill: 40 y: 60 width: 240 height: 20 color: 17.
+pane disc: 160 y: 120 radius: 24 color: 17.
+pane text: ''SCORE 10'' x: 8 y: 8 r: 255 g: 255 b: 255.
+pane present.
+```
+
+`cls:` paints the whole screen one colour — start each frame with it. `fill:` is a rectangle: x, y, width, height. `text:` takes real red/green/blue numbers rather than a palette slot.
+
+## 4. Making it move
+
+A game is one class. `onStep:` says *do this every frame*; `run` starts the clock. Press play to define it:
 
 ```
 Object subclass: MyGame [
@@ -1098,46 +1274,45 @@ Object subclass: MyGame [
     MyGame class >> launch [ ^self new start ]
     start [
         pane := GamePane new.
-        pane paletteAt: 1 r: 255 g: 200 b: 0.
+        pane paletteAt: 16 r: 20  g: 20  b: 40.
+        pane paletteAt: 17 r: 255 g: 200 b: 0.
         x := 20. dx := 3.
         pane onStep: [ self step ].
         pane run
     ]
     step [
         x := x + dx.
-        (x < 8 or: [ x > 300 ]) ifTrue: [ dx := 0 - dx ].
-        pane cls: 0.
-        pane disc: x y: 120 radius: 10 color: 1.
+        (x < 12 or: [ x > 308 ]) ifTrue: [ dx := 0 - dx ].
+        pane cls: 16.
+        pane disc: x y: 120 radius: 12 color: 17.
         pane present
     ]
 ]
-MyGame launch.
 ```
 
-## 3. Input
+Now launch it — this is Rule 3, and it is one line:
 
-Ask the pane which keys are held, by key constant:
+```
+CocoaBrowser hostService onMain launchDemo: ''MyGame launch''
+```
+
+A ball bounces across the window. Press **Escape** to stop it.
+
+> Why the extra line? Your game runs on the main VM and the window belongs to the app; the launcher starts your game as a program in its own right, so the loop keeps living between frames. Code typed in the Workspace is a one-off errand — fine for a picture, not a home for a game. The **Demos** menu uses this exact line.
+
+## 5. Reading the keys
+
+Ask inside `step` — this is how you steer:
 
 ```
 (pane keyHeld: GamePane keyLeft)  ifTrue: [ x := x - 4 ].
 (pane keyHeld: GamePane keyRight) ifTrue: [ x := x + 4 ].
+(pane keyHeld: GamePane keyA)     ifTrue: [ Sound zap play ].
 ```
 
-Arrows, plus `keyA` and `keyB` for action buttons.
+There is `keyLeft`, `keyRight`, `keyUp`, `keyDown`, `keyA` and `keyB`.
 
-## 4. Sprites
-
-Sprites are little indexed-colour bitmaps defined as hex rows — draw them by hand, or in **Tools - Sprite Editor**, which saves sheet classes for you:
-
-```
-| id |
-id := pane defineSprite: #(''00111100'' ''01222210'' ''12222221'' ''01222210'' ''00111100'').
-(Sprite pane: pane id: id) moveTo: 100 y: 80.
-```
-
-Sprites move without repainting the background — the engine composites them each frame.
-
-## 5. Sound
+## 6. Sound
 
 ```
 Sound coin play.
@@ -1145,17 +1320,34 @@ Sound jump play.
 Sound zap play.
 ```
 
-Three arcade presets to start; design your own instruments in **Tools - Sound Editor** (a full ADSR parametric synth).
+Three arcade sounds to start. **Tools - Sound Editor** lets you design your own.
 
-## 6. Study the masters
+## 7. Sprites
 
-Open these in the Browser — each is one readable class:
+A sprite is a little picture that moves without you redrawing the background. Each row is one line of pixels, each digit a colour slot of the sprite:
 
-- `Breakout` — collision, lives, HUD, the complete loop.
-- `MandelZoom` — per-pixel compute, the JIT flexing.
+```
+| id |
+id := pane defineSprite: #(''00111100'' ''01222210'' ''12222221'' ''01222210'' ''00111100'').
+(Sprite pane: pane id: id) moveTo: 100 y: 80.
+```
+
+Draw them by hand, or in **Tools - Sprite Editor**, which saves them for you.
+
+## If nothing shows up
+
+- Is your colour number **16 or higher**? (Rule 1 — this is nearly always it.)
+- Did you `present` at the end?
+- Is it a *game* rather than a picture? Then launch it with the `launchDemo:` line (Rule 3).
+- Still stuck? Open `Breakout` in the Browser and compare — it is one readable class that does all of this.
+
+## Read the masters
+
+- `Breakout` — bouncing, bricks, lives, score. The best first read.
 - `Worms`, `Galaxigans` — sprites and swarms.
+- `MandelZoom` — heavy arithmetic, the JIT at full stretch.
 
-> Deterministic integer physics, like Breakout''s, makes games easier to reason about *and* faster: SmallInteger arithmetic sits on the VM''s hottest, most-optimized path.
+> Whole numbers are your friend: they behave predictably *and* run on the VM''s fastest path. Breakout''s physics is nothing but integer addition.
 ' ]
 
     CocoaHelp class >> internalsText [ ^'# Under the Hood
