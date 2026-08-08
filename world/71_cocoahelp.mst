@@ -1409,7 +1409,23 @@ Sound coin play.
 
 A whole working program. Try `Sound jump play` and `Sound zap play` — change the word, press play again.
 
-## 2. See what the engine can do
+## 2. Draw a picture
+
+```
+| pane |
+pane := GamePane new.
+pane cls: GamePane midnight.
+pane disc: 250 y: 60 radius: 30 color: GamePane yellow.
+pane fill: 0 y: 180 width: 320 height: 60 color: GamePane forest.
+pane text: ''HELLO'' x: 120 y: 110 r: 255 g: 255 b: 255.
+pane present.
+```
+
+A window opens with a sun over a night sky. **Escape** closes it. Change a number, press play again — the picture redraws.
+
+The pane is **320 dots across and 240 down**, and (0, 0) is the **top-left** corner.
+
+## 3. See what the engine can do
 
 ```launch
 Breakout launch
@@ -1417,7 +1433,7 @@ Breakout launch
 
 A window opens and Breakout runs: bricks, a ball, a paddle on the arrow keys. **Escape** closes it. It is one ordinary class you can read in the Browser.
 
-## 3. How a game really works
+## 4. How a game really works
 
 Two minutes, and it explains the thing that trips everyone up.
 
@@ -1430,9 +1446,9 @@ Every game has the same two halves:
 
 `run` does not loop and does not block; it says *this program is live* and returns. The app owns the clock.
 
-> **The trap:** drawing commands typed loose in the Workspace do **nothing at all** — no window, no picture, no error. There is no session for them to reach. A game always lives in a class, and you **launch** it.
+> A single **picture**, like section 2, can be drawn straight from the Workspace — the first drawing command opens a window around itself. A **game** cannot: a frame loop has to keep running between frames, and a Workspace instruction is a one-off errand that finishes. So games live in a class and get **launched**.
 
-## 4. A ball that moves
+## 5. A ball that moves
 
 Press play to teach the system this program:
 
@@ -1442,8 +1458,6 @@ Object subclass: MyGame [
     MyGame class >> launch [ ^self new start ]
     start [
         pane := GamePane new.
-        pane paletteAt: 16 r: 20  g: 20  b: 40.
-        pane paletteAt: 17 r: 255 g: 200 b: 0.
         x := 20. dx := 3.
         pane onStep: [ self step ].
         pane run
@@ -1451,8 +1465,8 @@ Object subclass: MyGame [
     step [
         x := x + dx.
         (x < 12 or: [ x > 308 ]) ifTrue: [ dx := 0 - dx ].
-        pane cls: 16.
-        pane disc: x y: 120 radius: 12 color: 17.
+        pane cls: GamePane midnight.
+        pane disc: x y: 120 radius: 12 color: GamePane yellow.
         pane present
     ]
 ]
@@ -1466,15 +1480,28 @@ MyGame launch
 
 A yellow ball bounces across the window. **Escape** stops it.
 
-## 5. Three rules that save an hour
+## 6. Two rules that save an hour
 
-**Colours start at 16.** `paletteAt: 16 r: 20 g: 20 b: 40` puts a colour in slot 16, and you draw with `color: 16`. Red, green and blue run 0 to 255. Slots below 16 belong to the system and slot 0 is see-through, so **painting with a number under 16 gives a black screen** — the most common surprise there is.
+**Colours come ready.** A new pane already holds sixteen colours, and each has a name: `GamePane black`, `midnight`, `plum`, `forest`, `brown`, `darkGrey`, `lightGrey`, `white`, `red`, `orange`, `yellow`, `green`, `blue`, `lavender`, `pink`, `peach`. Write `pane cls: GamePane midnight` and it just works.
+
+Want a different look? Take a whole retro palette:
+
+```ref
+pane palette: #c64.        "Commodore 64"
+pane palette: #cga.        "IBM CGA — early PC games"
+pane palette: #spectrum.   "ZX Spectrum"
+pane palette: #msx.        "MSX"
+pane palette: #gameboy.    "four shades of green"
+pane palette: #mono.       "sixteen greys"
+```
+
+Or mix your own: `pane paletteAt: 16 r: 20 g: 20 b: 40` sets slot 16 to a colour of your choosing (red, green and blue each 0 to 255). The slots you can set run **16 to 255** — below that belongs to the system, and slot 0 is see-through.
 
 **Draw, then `present`.** Drawing happens on a hidden page; `present` is the moment it appears, like taking the photo. End every `step` with it.
 
-**Teach, then launch.** Defining a class does not start it.
+**Teach, then launch.** Defining a class does not start it — that is what the launch block is for. (A one-off picture needs no launch; a running game always does.)
 
-## 6. Add a paddle you can steer
+## 7. Add a paddle you can steer
 
 The whole program again, with two new things: it remembers `paddle`, and it asks which arrow keys are held. Press play, then launch it below.
 
@@ -1484,9 +1511,6 @@ Object subclass: MyGame [
     MyGame class >> launch [ ^self new start ]
     start [
         pane := GamePane new.
-        pane paletteAt: 16 r: 20  g: 20  b: 40.
-        pane paletteAt: 17 r: 255 g: 200 b: 0.
-        pane paletteAt: 18 r: 90  g: 200 b: 255.
         x := 160. y := 60. dx := 3. dy := 3. paddle := 140.
         pane onStep: [ self step ].
         pane run
@@ -1500,9 +1524,9 @@ Object subclass: MyGame [
         (y > 210 and: [ y < 224 and: [ x > paddle and: [ x < (paddle + 40) ] ] ])
             ifTrue: [ dy := 0 - dy ].
         y > 240 ifTrue: [ x := 160. y := 60 ].
-        pane cls: 16.
-        pane fill: paddle y: 216 width: 40 height: 6 color: 18.
-        pane disc: x y: y radius: 6 color: 17.
+        pane cls: GamePane midnight.
+        pane fill: paddle y: 216 width: 40 height: 6 color: GamePane blue.
+        pane disc: x y: y radius: 6 color: GamePane yellow.
         pane present
     ]
 ]
@@ -1514,7 +1538,7 @@ MyGame launch
 
 Left and right arrows move the paddle. Miss, and the ball starts again from the top.
 
-## 7. Add sound and a score
+## 8. Add sound and a score
 
 Once more, whole. Two more lines in `step` — a `coin` when the paddle connects, and the score drawn on screen.
 
@@ -1524,9 +1548,6 @@ Object subclass: MyGame [
     MyGame class >> launch [ ^self new start ]
     start [
         pane := GamePane new.
-        pane paletteAt: 16 r: 20  g: 20  b: 40.
-        pane paletteAt: 17 r: 255 g: 200 b: 0.
-        pane paletteAt: 18 r: 90  g: 200 b: 255.
         x := 160. y := 60. dx := 3. dy := 3. paddle := 140. score := 0.
         pane onStep: [ self step ].
         pane run
@@ -1540,9 +1561,9 @@ Object subclass: MyGame [
         (y > 210 and: [ y < 224 and: [ x > paddle and: [ x < (paddle + 40) ] ] ])
             ifTrue: [ dy := 0 - dy. score := score + 1. Sound coin play ].
         y > 240 ifTrue: [ x := 160. y := 60. score := 0. Sound zap play ].
-        pane cls: 16.
-        pane fill: paddle y: 216 width: 40 height: 6 color: 18.
-        pane disc: x y: y radius: 6 color: 17.
+        pane cls: GamePane midnight.
+        pane fill: paddle y: 216 width: 40 height: 6 color: GamePane blue.
+        pane disc: x y: y radius: 6 color: GamePane yellow.
         pane text: ''SCORE '' , score printString x: 8 y: 8 r: 255 g: 255 b: 255.
         pane present
     ]
@@ -1555,16 +1576,16 @@ MyGame launch
 
 That is a real little game: input, physics, collision, sound and a score. Everything after this is more of the same.
 
-## 8. The screen, and what you can draw
+## 9. The screen, and what you can draw
 
 The pane is **320 dots across and 240 down**, with (0, 0) at the **top-left**. These are the messages you send inside `start` and `step` — a vocabulary to borrow from, not a program to run:
 
 ```ref
-pane cls: 16.
-pane point: 10 y: 10 color: 17.
-pane line: 0 y: 0 to: 319 y: 239 color: 17.
-pane fill: 40 y: 60 width: 240 height: 20 color: 17.
-pane disc: 160 y: 120 radius: 24 color: 17.
+pane cls: GamePane midnight.
+pane point: 10 y: 10 color: GamePane white.
+pane line: 0 y: 0 to: 319 y: 239 color: GamePane red.
+pane fill: 40 y: 60 width: 240 height: 20 color: GamePane green.
+pane disc: 160 y: 120 radius: 24 color: GamePane yellow.
 pane text: ''SCORE 10'' x: 8 y: 8 r: 255 g: 255 b: 255.
 pane present.
 ```
@@ -1606,8 +1627,8 @@ pane onReset: [ ''stopped'' ]
 
 ## If nothing shows up
 
-- Did you **launch** it? Teaching the class is not starting it.
-- Is your colour number **16 or higher**?
+- Writing a **game**? Teaching the class is not starting it — press the launch block. (A single picture needs no launch.)
+- Using a colour the pane knows? `GamePane red` and friends always work; raw numbers must be **16 or higher**.
 - Did you `present` at the end of `step`?
 - Did you press play on the **newest** whole program? Each block here replaces the last — nothing carries over between presses.
 - Is another game still running? Escape closes it; only one runs at a time.

@@ -435,6 +435,30 @@ pub fn drain() {
             // Only while a session is open — a stray frame arriving AFTER a stop
             // must not resurrect the window (SESSION_OPEN gates the create).
             _ => {
+                // FRIENDLY IMPLICIT SESSION. Before this, a game command with
+                // no session open was silently dropped: someone typing
+                // `GamePane new … cls: … present` in the Workspace got no
+                // window, no picture and no error — the most disappointing
+                // failure in the system, and the first one a beginner meets.
+                // Now the first command opens a session and a window around
+                // it, so drawing just draws. The frame timer starts too, so
+                // Escape closes it exactly like a launched game (Escape is
+                // read in the timer callback; without it the window would be
+                // unclosable). A launch still owns the frame-loop path — this
+                // only rescues drawing that would otherwise vanish.
+                //
+                // Guarded on STOP_DUE/RESET_DUE so the older hazard stays
+                // fixed: a stray frame from a demo that was just stopped must
+                // NOT resurrect the window it was closing.
+                if !SESSION_OPEN.load(Ordering::Acquire)
+                    && !STOP_DUE.load(Ordering::Acquire)
+                    && !RESET_DUE.load(Ordering::Acquire)
+                {
+                    SESSION_OPEN.store(true, Ordering::Release);
+                    GAME_ACTIVE.store(true, Ordering::Release);
+                    ensure_pane();
+                    start_frame_timer();
+                }
                 if SESSION_OPEN.load(Ordering::Acquire) {
                     ensure_pane();
                 }

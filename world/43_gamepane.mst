@@ -71,6 +71,183 @@ Object subclass: Sprite [
 Object subclass: GamePane [
     <classVars: StepBlock Keys NextId ResetBlock>
 
+    "── palettes ─────────────────────────────────────────────────────────
+     A fresh pane arrives with COLOURS ALREADY IN IT. Before this, a new
+     pane had an empty user palette, so the first thing anyone drew came
+     out invisible — `color: 1` (the obvious guess) is below the user range
+     and silently draws nothing, and even `color: 16` was unset until you
+     said `paletteAt:`. A black window with no error is the least friendly
+     thing this engine did, and it was the first thing a beginner met.
+     Now slots 16..31 hold a general-purpose 16-colour set from the moment
+     you say `GamePane new`; override any entry with `paletteAt:r:g:b:` as
+     before, or swap the whole set with `palette:` below."
+
+    GamePane class >> new [
+        ^super new installPalette: #default
+    ]
+
+    installPalette: aSymbol [
+        "Load a named 16-colour set into slots 16 upward. Answers self so
+         `GamePane new` can chain it."
+        | rgbs i |
+        rgbs := GamePane paletteNamed: aSymbol.
+        i := 16.
+        rgbs do: [ :c |
+            self paletteAt: i r: (c at: 1) g: (c at: 2) b: (c at: 3).
+            i := i + 1 ].
+        ^self
+    ]
+
+    palette: aSymbol [
+        "Swap the whole palette for a named set — `pane palette: #c64`.
+         See `GamePane paletteNames`."
+        ^self installPalette: aSymbol
+    ]
+
+    GamePane class >> paletteNames [
+        ^#(#default #cga #c64 #spectrum #msx #gameboy #mono)
+    ]
+
+    GamePane class >> rgb: r g: g b: b [ ^Array with: r with: g with: b ]
+
+    GamePane class >> paletteNamed: aSymbol [
+        "The colour sets, each an Array of (r g b) triples loaded from slot
+         16 up. The retro sets are the real hardware palettes — a C64 game
+         looks like a C64 game because these are the only colours it had."
+        aSymbol == #cga ifTrue: [ ^self cgaPalette ].
+        aSymbol == #c64 ifTrue: [ ^self c64Palette ].
+        aSymbol == #spectrum ifTrue: [ ^self spectrumPalette ].
+        aSymbol == #msx ifTrue: [ ^self msxPalette ].
+        aSymbol == #gameboy ifTrue: [ ^self gameboyPalette ].
+        aSymbol == #mono ifTrue: [ ^self monoPalette ].
+        ^self defaultPalette
+    ]
+
+    "A modern, friendly 16 — dark tones first, then the brights, so a
+     gradient of indices reads as a gradient of colour."
+    GamePane class >> defaultPalette [
+        | p |
+        p := OrderedCollection new.
+        p add: (self rgb: 0   g: 0   b: 0).      "16 black"
+        p add: (self rgb: 29  g: 43  b: 83).     "17 midnight"
+        p add: (self rgb: 126 g: 37  b: 83).     "18 plum"
+        p add: (self rgb: 0   g: 135 b: 81).     "19 forest"
+        p add: (self rgb: 171 g: 82  b: 54).     "20 brown"
+        p add: (self rgb: 95  g: 87  b: 79).     "21 dark grey"
+        p add: (self rgb: 194 g: 195 b: 199).    "22 light grey"
+        p add: (self rgb: 255 g: 241 b: 232).    "23 white"
+        p add: (self rgb: 255 g: 0   b: 77).     "24 red"
+        p add: (self rgb: 255 g: 163 b: 0).      "25 orange"
+        p add: (self rgb: 255 g: 236 b: 39).     "26 yellow"
+        p add: (self rgb: 0   g: 228 b: 54).     "27 green"
+        p add: (self rgb: 41  g: 173 b: 255).    "28 blue"
+        p add: (self rgb: 131 g: 118 b: 156).    "29 lavender"
+        p add: (self rgb: 255 g: 119 b: 168).    "30 pink"
+        p add: (self rgb: 255 g: 204 b: 170).    "31 peach"
+        ^p asArray
+    ]
+
+    "IBM CGA/EGA — the 16 colours of early PC games."
+    GamePane class >> cgaPalette [
+        | p |
+        p := OrderedCollection new.
+        p add: (self rgb: 0   g: 0   b: 0).    p add: (self rgb: 0   g: 0   b: 170).
+        p add: (self rgb: 0   g: 170 b: 0).    p add: (self rgb: 0   g: 170 b: 170).
+        p add: (self rgb: 170 g: 0   b: 0).    p add: (self rgb: 170 g: 0   b: 170).
+        p add: (self rgb: 170 g: 85  b: 0).    p add: (self rgb: 170 g: 170 b: 170).
+        p add: (self rgb: 85  g: 85  b: 85).   p add: (self rgb: 85  g: 85  b: 255).
+        p add: (self rgb: 85  g: 255 b: 85).   p add: (self rgb: 85  g: 255 b: 255).
+        p add: (self rgb: 255 g: 85  b: 85).   p add: (self rgb: 255 g: 85  b: 255).
+        p add: (self rgb: 255 g: 255 b: 85).   p add: (self rgb: 255 g: 255 b: 255).
+        ^p asArray
+    ]
+
+    "Commodore 64 — VIC-II."
+    GamePane class >> c64Palette [
+        | p |
+        p := OrderedCollection new.
+        p add: (self rgb: 0   g: 0   b: 0).    p add: (self rgb: 255 g: 255 b: 255).
+        p add: (self rgb: 136 g: 57  b: 50).   p add: (self rgb: 103 g: 182 b: 189).
+        p add: (self rgb: 139 g: 63  b: 150).  p add: (self rgb: 85  g: 160 b: 73).
+        p add: (self rgb: 64  g: 49  b: 141).  p add: (self rgb: 191 g: 206 b: 114).
+        p add: (self rgb: 139 g: 84  b: 41).   p add: (self rgb: 87  g: 66  b: 0).
+        p add: (self rgb: 184 g: 105 b: 98).   p add: (self rgb: 80  g: 80  b: 80).
+        p add: (self rgb: 120 g: 120 b: 120).  p add: (self rgb: 148 g: 224 b: 137).
+        p add: (self rgb: 120 g: 105 b: 196).  p add: (self rgb: 159 g: 159 b: 159).
+        ^p asArray
+    ]
+
+    "ZX Spectrum — eight colours, twice, normal then bright."
+    GamePane class >> spectrumPalette [
+        | p |
+        p := OrderedCollection new.
+        p add: (self rgb: 0   g: 0   b: 0).    p add: (self rgb: 0   g: 0   b: 215).
+        p add: (self rgb: 215 g: 0   b: 0).    p add: (self rgb: 215 g: 0   b: 215).
+        p add: (self rgb: 0   g: 215 b: 0).    p add: (self rgb: 0   g: 215 b: 215).
+        p add: (self rgb: 215 g: 215 b: 0).    p add: (self rgb: 215 g: 215 b: 215).
+        p add: (self rgb: 0   g: 0   b: 0).    p add: (self rgb: 0   g: 0   b: 255).
+        p add: (self rgb: 255 g: 0   b: 0).    p add: (self rgb: 255 g: 0   b: 255).
+        p add: (self rgb: 0   g: 255 b: 0).    p add: (self rgb: 0   g: 255 b: 255).
+        p add: (self rgb: 255 g: 255 b: 0).    p add: (self rgb: 255 g: 255 b: 255).
+        ^p asArray
+    ]
+
+    "MSX / TMS9918 — the colours of a generation of Japanese home computers."
+    GamePane class >> msxPalette [
+        | p |
+        p := OrderedCollection new.
+        p add: (self rgb: 0   g: 0   b: 0).    p add: (self rgb: 33  g: 200 b: 66).
+        p add: (self rgb: 94  g: 220 b: 120).  p add: (self rgb: 84  g: 85  b: 237).
+        p add: (self rgb: 125 g: 118 b: 252).  p add: (self rgb: 212 g: 82  b: 77).
+        p add: (self rgb: 66  g: 235 b: 245).  p add: (self rgb: 252 g: 85  b: 84).
+        p add: (self rgb: 255 g: 121 b: 120).  p add: (self rgb: 212 g: 193 b: 84).
+        p add: (self rgb: 230 g: 206 b: 128).  p add: (self rgb: 33  g: 176 b: 59).
+        p add: (self rgb: 201 g: 91  b: 186).  p add: (self rgb: 204 g: 204 b: 204).
+        p add: (self rgb: 255 g: 255 b: 255).  p add: (self rgb: 128 g: 128 b: 128).
+        ^p asArray
+    ]
+
+    "Game Boy — four shades of green, repeated so any index reads."
+    GamePane class >> gameboyPalette [
+        | p |
+        p := OrderedCollection new.
+        1 to: 4 do: [ :i |
+            p add: (self rgb: 15  g: 56  b: 15).
+            p add: (self rgb: 48  g: 98  b: 48).
+            p add: (self rgb: 139 g: 172 b: 15).
+            p add: (self rgb: 155 g: 188 b: 15) ].
+        ^p asArray
+    ]
+
+    "Sixteen greys, black to white — good for shading experiments."
+    GamePane class >> monoPalette [
+        | p v |
+        p := OrderedCollection new.
+        0 to: 15 do: [ :i | v := i * 17. p add: (self rgb: v g: v b: v) ].
+        ^p asArray
+    ]
+
+    "Names for the default palette's slots, so a beginner can write
+     `color: GamePane red` instead of remembering a number. These are
+     indices into the DEFAULT set; after `palette: #c64` the numbers still
+     work but the colours are the C64's."
+    GamePane class >> black     [ ^16 ]
+    GamePane class >> midnight  [ ^17 ]
+    GamePane class >> plum      [ ^18 ]
+    GamePane class >> forest    [ ^19 ]
+    GamePane class >> brown     [ ^20 ]
+    GamePane class >> darkGrey  [ ^21 ]
+    GamePane class >> lightGrey [ ^22 ]
+    GamePane class >> white     [ ^23 ]
+    GamePane class >> red       [ ^24 ]
+    GamePane class >> orange    [ ^25 ]
+    GamePane class >> yellow    [ ^26 ]
+    GamePane class >> green     [ ^27 ]
+    GamePane class >> blue      [ ^28 ]
+    GamePane class >> lavender  [ ^29 ]
+    GamePane class >> pink      [ ^30 ]
+    GamePane class >> peach     [ ^31 ]
+
     clearR: r g: g b: b [
         "Clear the pane to an opaque RGB colour (each 0..255) and present it."
         <primitive: 200>

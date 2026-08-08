@@ -2054,7 +2054,7 @@ mod tests {
         vm.eval("GamePane new clearR: 200 g: 40 b: 40.")
             .expect("GamePane>>clearR:g:b: must evaluate cleanly");
         assert_eq!(
-            *captured.lock().unwrap(),
+            after_defaults(&captured.lock().unwrap()),
             vec![GameCommand::ClearTo {
                 r: 200,
                 g: 40,
@@ -2364,7 +2364,7 @@ mod tests {
         vm.eval("GamePane new clearR: 300 g: 0 b: 0.")
             .expect("an out-of-range colour must not crash — the primitive just fails");
         assert!(
-            captured.lock().unwrap().is_empty(),
+            after_defaults(&captured.lock().unwrap()).is_empty(),
             "an out-of-range colour must emit no game command"
         );
     }
@@ -2395,7 +2395,7 @@ mod tests {
         )
         .expect("the drawing doit must evaluate cleanly");
         assert_eq!(
-            *captured.lock().unwrap(),
+            after_defaults(&captured.lock().unwrap()),
             vec![
                 GameCommand::PaletteAt {
                     index: 16,
@@ -2435,6 +2435,29 @@ mod tests {
         );
     }
 
+
+    /// Every `GamePane new` installs the default 16-colour palette
+    /// (world/43_gamepane.mst — a fresh pane arrives with usable colours, so
+    /// a beginner's first `cls:`/`disc:` is visible instead of silently
+    /// black). A sink therefore sees that 16-command prefix before anything
+    /// these tests are about.
+    ///
+    /// Skips exactly those 16 and keeps everything after, so a test that
+    /// asserts on its OWN `paletteAt:` still covers it — a blanket "drop all
+    /// palette commands" filter silently deleted that coverage.
+    fn after_defaults(v: &[GameCommand]) -> Vec<GameCommand> {
+        let mut skipped = 0usize;
+        let mut out = Vec::new();
+        for c in v {
+            if skipped < 16 && matches!(c, GameCommand::PaletteAt { .. }) {
+                skipped += 1;
+                continue;
+            }
+            out.push(c.clone());
+        }
+        out
+    }
+
     #[test]
     fn frame_loop_run_registers_a_step_block_the_gui_can_pull() {
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
@@ -2452,7 +2475,10 @@ mod tests {
         // returns immediately (no blocking loop).
         vm.eval("GamePane new onStep: [ GamePane new cls: 3 ]; run.")
             .expect("onStep:/run must evaluate cleanly");
-        assert_eq!(*captured.lock().unwrap(), vec![GameCommand::StartLoop]);
+        assert_eq!(
+            after_defaults(&captured.lock().unwrap()),
+            vec![GameCommand::StartLoop]
+        );
 
         // A GUI frame tick (`GamePane stepWithKeys:`) runs the step block, so
         // its drawing reaches the sink — the pull the GUI timer performs.
@@ -2460,7 +2486,7 @@ mod tests {
         vm.eval("GamePane stepWithKeys: 0.")
             .expect("stepWithKeys: must run the step block");
         assert_eq!(
-            *captured.lock().unwrap(),
+            after_defaults(&captured.lock().unwrap()),
             vec![GameCommand::Cls { index: 3 }]
         );
     }
@@ -2487,10 +2513,13 @@ mod tests {
                (GamePane keyHeld: GamePane keyRight) ifTrue: [ GamePane new cls: 8 ] ].",
         )
         .expect("onStep: must evaluate cleanly");
+        // Drop the setup pane's own default-palette prefix; the tick below
+        // creates a second pane whose prefix `after_defaults` then skips.
+        captured.lock().unwrap().clear();
         vm.eval("GamePane stepWithKeys: 5.")
             .expect("stepWithKeys: must run");
         assert_eq!(
-            *captured.lock().unwrap(),
+            after_defaults(&captured.lock().unwrap()),
             vec![GameCommand::Cls { index: 7 }],
             "Left held -> cls:7 only; Right not held -> no cls:8"
         );
@@ -2518,7 +2547,7 @@ mod tests {
         )
         .expect("the sprite doit must evaluate cleanly");
         assert_eq!(
-            *captured.lock().unwrap(),
+            after_defaults(&captured.lock().unwrap()),
             vec![
                 GameCommand::DefineSprite {
                     id: 1,
@@ -2561,7 +2590,7 @@ mod tests {
         vm.eval("Sound bang play.")
             .expect("Sound bang play must evaluate cleanly");
         assert_eq!(
-            *captured.lock().unwrap(),
+            after_defaults(&captured.lock().unwrap()),
             vec![
                 GameCommand::PlaySound { preset: 0 }, // coin
                 GameCommand::PlaySound { preset: 8 }, // bang
@@ -2585,7 +2614,7 @@ mod tests {
         vm.eval("(Tune fromAbc: 'C D E') playOnce.")
             .expect("Tune playOnce must evaluate cleanly");
         assert_eq!(
-            *captured.lock().unwrap(),
+            after_defaults(&captured.lock().unwrap()),
             vec![GameCommand::PlayTune {
                 abc: "C D E".to_string()
             }]
