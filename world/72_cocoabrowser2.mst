@@ -55,7 +55,7 @@ Object subclass: CocoaBrowser2 [
                 CatScroll CatOutline CatCol CatDelegate
                 ClassScroll ClassTable ClassCol ClassFace ClassDelegate
                 NewClassBtn RemoveClassBtn NewMethodBtn RemoveMethodBtn
-                SideSeg ProtoScroll ProtoTable ProtoCol ProtoFace ProtoDelegate
+                SideSeg ProtoScroll ProtoTable ProtoCol ProtoFace ProtoDelegate RevealGuard
                 MethScroll MethTable MethCol MethFace MethDelegate
                 SourcePane ModeSeg EditBar AcceptBtn CancelBtn ModeLabel SourceScroll SourceView>
 
@@ -272,6 +272,12 @@ Object subclass: CocoaBrowser2 [
     CocoaBrowser2 class >> outlineViewSelectionDidChange: aNote [
         | row item parts |
         CatOutline isNil ifTrue: [ ^self ].
+        "revealClass: selected this row itself and has ALREADY set the package
+         and the class. Cocoa callbacks are queued and run BETWEEN doits, so
+         this notification arrives AFTER that work — without the guard its
+         clearClassSelection would wipe the very class we were revealing.
+         One-shot: consumed here, so a real user click still clears."
+        RevealGuard == true ifTrue: [ RevealGuard := false. ^self ].
         row := CatOutline onMain selectedRow.
         row < 0 ifTrue: [ ^self ].
         item := CatOutline onMain itemAtRow: row.
@@ -375,6 +381,22 @@ Object subclass: CocoaBrowser2 [
     "── method selection core (shared by the table click and scripting;
        scripting/DBG4 selects a method without a click) ──"
     CocoaBrowser2 class >> selectMethod: aName [
+        "If the selector lives on the OTHER side (Find can land on a class-side
+         method while the toggle says instance), follow it there first — else
+         the source pane renders nothing and the method list never shows it."
+        (aName isNil or: [ (self currentSideSelectors includes: aName) ]) ifFalse: [
+            | other |
+            other := Side == #class ifTrue: [ #instance ] ifFalse: [ #class ].
+            Side := other.
+            (self currentSideSelectors includes: aName)
+                ifTrue: [
+                    SideSeg isNil ifFalse: [
+                        SideSeg onMain setSelectedSegment:
+                            (Side == #class ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+                    self deriveProtocols. SelectedProtocol := nil.
+                    Methods := self methodsForProtocol.
+                    self deferReload: ProtoTable. self deferReload: MethTable ]
+                ifFalse: [ Side := other == #class ifTrue: [ #instance ] ifFalse: [ #class ] ] ].
         SelectedMethod := aName.
         SourceMode := #source. self syncModeSeg. self renderSource.
     ]
@@ -963,16 +985,25 @@ Object subclass: CocoaBrowser2 [
      already in the right package, and reloading a table from inside its own
      selection callback fights the click."
     CocoaBrowser2 class >> revealClass: aName [
-        | idx |
+        | idx li pi |
         aName isNil ifTrue: [ ^self ].
+        li := 0. pi := 0.
         Tree isNil ifFalse: [
-            Tree do: [ :ln |
-                (ln at: 2) do: [ :pkg |
+            Tree doWithIndex: [ :ln :lx |
+                (ln at: 2) doWithIndex: [ :pkg :px |
                     ((pkg at: 2) includes: aName) ifTrue: [
                         SelectedPackage := pkg.
                         SelectedPackageName := pkg at: 1.
-                        Classes := pkg at: 2 ] ] ] ].
+                        Classes := pkg at: 2.
+                        li := lx. pi := px ] ] ] ].
+        li > 0 ifTrue: [ RevealGuard := true. self revealCategoryList: li pkg: pi ].
         self selectClass: aName.
+        "The side toggle is a MODE, and arriving from Find it is whatever it
+         was last. A class whose methods are ALL class-side (CocoaFile, most
+         of the Cocoa wrappers) then shows an empty method list under
+         `instance`, which reads as ''this class has nothing in it''. If the
+         current side is empty and the other side is not, follow the methods."
+        self followNonEmptySide.
         idx := 0.
         Classes isNil ifFalse: [
             1 to: Classes size do: [ :k | (Classes at: k) = aName ifTrue: [ idx := k ] ] ].
@@ -987,6 +1018,68 @@ Object subclass: CocoaBrowser2 [
                    byExtendingSelection: false.
         ClassTable onMain scrollRowToVisible: idx - 1
     ]
+
+    "Light the package's row in the category outline. The model half of the
+     selection already happened in revealClass:; this is the VISIBLE half,
+     which used to be left behind — the tree stayed wherever it was, so the
+     browser showed a class from a package the tree said you were not in.
+     Items are dotted-path handles ('2' = list 2, '2.5' = its 5th package),
+     so the parent list must be expanded before its child owns a row."
+    CocoaBrowser2 class >> revealCategoryList: listIx pkg: pkgIx [
+        | parent child row |
+        CatOutline isNil ifTrue: [ ^self ].
+        "Paths are 0-BASED: outlineView:child:ofItem: builds them from AppKit's
+         own child index, while doWithIndex: counts from 1."
+        parent := self catHandleFor: (listIx - 1) printString.
+        CatOutline onMain expandItem: parent.
+        "Find the row by WALKING it, not by `rowForItem:` — that needs an
+         argument-taking integer send (`sendI64:` is arity-0), and this reuses
+         exactly the itemAtRow:/catPathOf: pair the selection handler proves."
+        child := (listIx - 1) printString , '.' , (pkgIx - 1) printString.
+        row := -1.
+        0 to: (CatOutline sendI64: 'numberOfRows') - 1 do: [ :r |
+            | it |
+            row < 0 ifTrue: [
+                it := CatOutline onMain itemAtRow: r.
+                it isNil ifFalse: [
+                    (self catPathOf: it) = child ifTrue: [ row := r ].
+                    it release ] ] ].
+        row < 0 ifTrue: [ ^self ].
+        CatOutline onMain selectRowIndexes: ((Cocoa classNamed: 'NSIndexSet') onMain
+                                                 indexSetWithIndex: row)
+                  byExtendingSelection: false.
+        CatOutline onMain scrollRowToVisible: row
+    ]
+
+    "Follow the methods when the current side has none and the other does."
+    CocoaBrowser2 class >> followNonEmptySide [
+        | here |
+        SelectedClass isNil ifTrue: [ ^self ].
+        here := self currentSideSelectors.
+        here isEmpty ifFalse: [ ^self ].
+        Side := Side == #class ifTrue: [ #instance ] ifFalse: [ #class ].
+        self currentSideSelectors isEmpty ifTrue: [
+            "Neither side has anything — put the toggle back, do not lie."
+            Side := Side == #class ifTrue: [ #instance ] ifFalse: [ #class ].
+            ^self ].
+        SideSeg isNil ifFalse: [
+            SideSeg onMain setSelectedSegment: (Side == #class ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+        self deriveProtocols.
+        SelectedProtocol := nil.
+        Methods := self methodsForProtocol.
+        self deferReload: ProtoTable. self deferReload: MethTable.
+    ]
+
+    "── read-back accessors (scripting, tests, and my own verification) ──
+     The browser had no way to say what it was showing, so a script could
+     drive it but never confirm where it landed."
+    CocoaBrowser2 class >> selectedPackageName [ ^SelectedPackageName ]
+    CocoaBrowser2 class >> selectedClassName [ ^SelectedClass ]
+    CocoaBrowser2 class >> selectedProtocolName [ ^SelectedProtocol ]
+    CocoaBrowser2 class >> selectedMethodName [ ^SelectedMethod ]
+    CocoaBrowser2 class >> selectedSide [ ^Side ]
+    CocoaBrowser2 class >> classNames [ ^Classes isNil ifTrue: [ Array new: 0 ] ifFalse: [ Classes ] ]
+    CocoaBrowser2 class >> methodNames [ ^Methods isNil ifTrue: [ Array new: 0 ] ifFalse: [ Methods ] ]
     CocoaBrowser2 class >> scriptSelectProtocol: aName [
         | i |
         Protocols isNil ifTrue: [ ^self ].

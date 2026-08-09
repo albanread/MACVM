@@ -38,7 +38,8 @@ Object subclass: CocoaScript [
      name here — no third place to forget."
     CocoaScript class >> scriptKeys [
         ^#('scriptCurrentView' 'scriptAppearance' 'scriptTranscript'
-           'scriptWorkspaceText' 'scriptTranscriptCollapsed' 'scriptBusy')
+           'scriptWorkspaceText' 'scriptTranscriptCollapsed' 'scriptBusy'
+           'scriptSelectedClass' 'scriptSelectedMethod' 'scriptSelectedPackage')
     ]
 
     "Called by AppKit (through the #app role) for every `application` property
@@ -163,6 +164,27 @@ Object subclass: CocoaScript [
      direction: nothing is pending exactly when nothing was sent."
     CocoaScript class >> scriptBusy [
         ^self numberWith: (Worker pendingReplyCount > 0 ifTrue: [ 1 ] ifFalse: [ 0 ])
+    ]
+
+    "── what the browser is showing (read-only) ─────────────────────────
+     A script could drive the browser but never confirm where it landed.
+     Each answers a String, or empty when nothing is selected — never nil,
+     because an AppleScript `text` property that vanishes reads as an error
+     rather than as 'nothing selected'."
+    CocoaScript class >> browserOr: aBlock [
+        | b |
+        b := Worker classNamed: #CocoaBrowser2.
+        b isNil ifTrue: [ ^'' ].
+        ^(aBlock value: b) ifNil: [ '' ]
+    ]
+    CocoaScript class >> scriptSelectedClass [
+        ^self browserOr: [ :b | b selectedClassName ]
+    ]
+    CocoaScript class >> scriptSelectedMethod [
+        ^self browserOr: [ :b | b selectedMethodName ]
+    ]
+    CocoaScript class >> scriptSelectedPackage [
+        ^self browserOr: [ :b | b selectedPackageName ]
     ]
 
     CocoaScript class >> sweepTicks [ ^SweepTicks isNil ifTrue: [ 0 ] ifFalse: [ SweepTicks ] ]

@@ -78,6 +78,18 @@
         <cocoa key="scriptTranscriptCollapsed"/>
       </property>
 
+      <property name="selected class" code="MvSc" type="text" access="r"
+                description="The class the browser is showing, or empty.">
+        <cocoa key="scriptSelectedClass"/>
+      </property>
+      <property name="selected method" code="MvSm" type="text" access="r"
+                description="The method the browser is showing, or empty.">
+        <cocoa key="scriptSelectedMethod"/>
+      </property>
+      <property name="selected package" code="MvSp" type="text" access="r"
+                description="The package the browser is showing, or empty.">
+        <cocoa key="scriptSelectedPackage"/>
+      </property>
       <property name="busy" code="MvBs" type="boolean" access="r"
                 description="True while the Smalltalk image is evaluating something.">
         <cocoa key="scriptBusy"/>
