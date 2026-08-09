@@ -173,7 +173,33 @@ Signed but not notarized. That is §4.
 
 ## 4. Notarizing
 
-### 4a. One-time per machine — the human runs this
+### 4a. FIRST: does a profile already exist?
+
+**Check before creating.** `notarytool` has no "list profiles" command, which is
+exactly how an existing credential hides — and hunting for the wrong *name* looks
+identical to having no credential at all. On 2026-08-09 this cost an afternoon
+and a locked Apple ID: the notes said `AC_NOTARY`, the machine actually had a
+working profile called **`macvm`**, and every retry of `store-credentials`
+re-authenticated against Apple until the account tripped its failed-auth
+threshold.
+
+Probe the likely names — each takes a second, and a hit means you are done:
+
+```sh
+for p in macvm AC_NOTARY notary; do
+  echo "--- $p"; xcrun notarytool history --keychain-profile "$p" 2>&1 | head -2
+done
+```
+
+`Successfully received submission history.` = that profile works; use that name
+in §4b and skip the rest of this section. Also grep your shell history, which is
+where the real answer was hiding:
+
+```sh
+grep -a "store-credentials" ~/.zsh_history | sed 's/^: [0-9]*:[0-9]*;//'
+```
+
+### 4b. Only if no profile exists — the human runs this
 
 There is no notary key in the backup; credentials are per-machine.
 
@@ -198,19 +224,24 @@ xcrun notarytool history --keychain-profile "AC_NOTARY"
 **not** store. Nothing in §4b will work until this command lists history
 (an empty history is fine — the point is that it authenticates).
 
-### 4b. Per release — an assistant can run all of this
+### 4c. Per release — an assistant can run all of this
 
 Notarize the DMG (it contains the app; one submission covers both):
 
 ```sh
-xcrun notarytool submit dist/macVM.dmg --keychain-profile "AC_NOTARY" --wait
+xcrun notarytool submit dist/macVM.dmg --keychain-profile "macvm" --wait
 ```
+
+Use the profile name §4a found — on this machine it is **`macvm`**. Run it from
+the repo root, or give an absolute path: `notarytool` reports a missing file as
+`The file couldn't be opened because it doesn't exist`, which reads like a
+notarization problem and is really a `cd` problem.
 
 `--wait` blocks until Apple answers, typically a few minutes. Expect
 `status: Accepted`. On `Invalid`, get the reason — it is always specific:
 
 ```sh
-xcrun notarytool log <submission-id> --keychain-profile "AC_NOTARY"
+xcrun notarytool log <submission-id> --keychain-profile "macvm"
 ```
 
 Then staple, so the ticket travels with the file and Gatekeeper is satisfied
@@ -238,6 +269,40 @@ source=Notarized Developer ID
 ```
 
 ---
+
+### 4d. Verified end to end, 2026-08-09
+
+Submission `8d2db906-4170-4c17-a6dd-0bbc6793aa45` → `status: Accepted`, both
+artifacts stapled, and:
+
+```
+dist/macVM.app: accepted
+source=Notarized Developer ID
+origin=Developer ID Application: ALBAN DOMINIC READ (8T5K8XJSZR)
+```
+
+`xcrun stapler validate` passes, so the ticket travels with the file and
+Gatekeeper is satisfied with no network.
+
+### 4e. If Apple returns 401 / "your Apple ID has been locked"
+
+Rate limiting from repeated failed authentications, not a security incident.
+`store-credentials` validates against Apple on every attempt, so a loop of
+retries — especially with the wrong profile name, or an Apple ID password where
+an app-specific one belongs — will trip it.
+
+- Try **unlock** before **reset**: a trusted device (Settings → your name →
+  Sign-In & Security), or signing in at appleid.apple.com. An unlock keeps your
+  password and your existing app-specific passwords.
+- A **reset** revokes every app-specific password you have ever issued, so
+  generate a new one afterwards or you will keep seeing 401 and think the lock
+  never lifted.
+- Avoid reset with no trusted device to hand: it can start account recovery,
+  which takes days and locks you out of iCloud — where this signing backup
+  lives.
+- None of this touches signing. The certificate, the private key and any
+  already-signed artifacts are local and unaffected; only the notary service
+  call is blocked.
 
 ## 5. Renewal and loss
 
