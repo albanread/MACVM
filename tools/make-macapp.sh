@@ -38,9 +38,24 @@ BUILD_NUMBER="${BUILD_NUMBER:-$(git rev-list --count HEAD 2>/dev/null || echo 1)
 #   SIGN_ID="Developer ID Application: Name (TEAMID)"  tools/make-macapp.sh cocoa
 # and, once notarytool credentials are stored, additionally:
 #   NOTARY_PROFILE=macvm ...
+# Notarizing makes TWO submissions and waits on Apple for both — once for the
+# .app (so the bundle carries its own ticket) and once for the .dmg. Budget a
+# few minutes each. Check for an EXISTING profile before creating one:
+#   xcrun notarytool history --keychain-profile macvm
+# (there is no list-profiles command, so a wrong name looks exactly like no
+# credential at all — see docs/signing_and_notarization.md §4a)
 SIGN_ID="${SIGN_ID:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 ENTITLEMENTS="$ROOT/tools/macvm.entitlements"
+
+# Submit $1 to the notary service, then staple the ticket to $2. The two
+# differ for an .app: Apple will not accept a bundle directly, so a zip goes
+# up, while the ticket is written into the bundle that stays behind.
+notarize_staple() {   # $1 = file to submit, $2 = path to staple
+  xcrun notarytool submit "$1" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$2"
+  xcrun stapler validate "$2" 2>&1 | sed 's/^/    /'
+}
 
 make_icns() {   # $1 = source png, $2 = out.icns
   local src="$1" out="$2" set
@@ -149,6 +164,22 @@ PLIST
     echo "▸ [$mode] UNSIGNED (set SIGN_ID to sign; see tools/macvm.entitlements)"
   fi
 
+  # --- notarize + staple THE APP, before packaging ---
+  # Order matters. A ticket stapled to the .dmg does NOT travel with the app
+  # when a user drags it out to /Applications, so that copy can only be
+  # validated by calling home to Apple — which fails or stalls on a first
+  # launch that is offline or behind a restrictive network. Stapling the
+  # bundle here means the app carries its own proof wherever it is copied,
+  # and the dmg built below inherits it because `ditto` copies the ticket
+  # along with the bundle. (Found 2026-08-09: the shipped dmg passed
+  # `spctl` while the app inside answered "does not have a ticket stapled".)
+  if [ -n "$NOTARY_PROFILE" ] && [ -n "$SIGN_ID" ]; then
+    echo "▸ [$mode] notarizing the app (waits on Apple)"
+    local appzip; appzip="$(mktemp -d)/${appname// /-}.zip"
+    /usr/bin/ditto -c -k --keepParent "$APP" "$appzip"
+    notarize_staple "$appzip" "$APP"
+  fi
+
   # --- .dmg (with a drag-to-Applications target) ---
   local DMG="$DIST/${appname// /-}.dmg"
   echo "▸ [$mode] packaging $DMG"
@@ -172,10 +203,14 @@ PLIST
     if [ -z "$SIGN_ID" ]; then
       echo "▸ [$mode] NOTARY_PROFILE set but SIGN_ID is not — notarization needs a signed app; skipping" >&2
     else
-      echo "▸ [$mode] notarizing (this waits on Apple)"
-      xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
-      xcrun stapler staple "$DMG"
-      spctl -a -vvv -t install "$APP" 2>&1 | sed 's/^/    /'
+      # A second submission: the dmg is a different file with its own hash, so
+      # the app's ticket does not cover it. Stapling the container too means
+      # the download itself passes Gatekeeper, not just the app inside.
+      echo "▸ [$mode] notarizing the dmg (waits on Apple)"
+      notarize_staple "$DMG" "$DMG"
+      echo "▸ [$mode] final assessment"
+      spctl -a -vv "$APP" 2>&1 | sed 's/^/    /'
+      spctl -a -vv -t open --context context:primary-signature "$DMG" 2>&1 | sed 's/^/    /'
     fi
   fi
   echo "▸ [$mode] done: $DMG  ($(du -h "$DMG" | cut -f1))"

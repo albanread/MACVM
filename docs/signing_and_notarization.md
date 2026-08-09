@@ -224,7 +224,33 @@ xcrun notarytool history --keychain-profile "AC_NOTARY"
 **not** store. Nothing in §4b will work until this command lists history
 (an empty history is fine — the point is that it authenticates).
 
-### 4c. Per release — an assistant can run all of this
+### 4c. Per release — one command
+
+`make-macapp.sh` does the whole chain when both variables are set:
+
+```sh
+SIGN_ID="Developer ID Application: ALBAN DOMINIC READ (8T5K8XJSZR)" NOTARY_PROFILE=macvm \
+  tools/make-macapp.sh cocoa
+```
+
+It signs, notarizes the **.app** and staples it, packages the dmg from the
+stapled bundle, signs the dmg, notarizes and staples that too. Two submissions,
+a few minutes each.
+
+**Why the app is stapled before packaging:** a ticket on the dmg does not
+travel with the app when a user drags it to /Applications, so that copy can
+only be validated by calling Apple — which stalls or fails on a first launch
+that is offline. Verified 2026-08-09: before the fix the shipped dmg passed
+`spctl` while the app inside answered *"does not have a ticket stapled"*.
+The check that matters:
+
+```sh
+hdiutil attach dist/macVM.dmg -nobrowse
+ditto /Volumes/macVM/macVM.app /tmp/dragtest/macVM.app   # simulate the drag
+xcrun stapler validate /tmp/dragtest/macVM.app           # must say: worked
+```
+
+### 4c-manual. The same steps by hand
 
 Notarize the DMG (it contains the app; one submission covers both):
 
