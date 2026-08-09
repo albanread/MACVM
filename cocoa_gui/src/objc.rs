@@ -207,6 +207,26 @@ pub fn send_attr(storage: Id, name: Id, value: Id, loc: u64, len: u64) {
     f(storage, sel, name, value, loc, len)
 }
 
+pub fn send2_id(recv: Id, s: Sel, a: Id, b: Id) -> Id {
+    let f: extern "C" fn(Id, Sel, Id, Id) -> Id =
+        unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(recv, s, a, b)
+}
+
+/// Let already-queued main-thread work run: deferred `performSelector:`
+/// reloads, layout, redisplay. A few short run-loop passes, which dispatch
+/// queued events AND zero-delay timers. Main thread only.
+pub fn settle_run_loop() {
+    let run_loop = get_class("NSRunLoop");
+    let date_cls = get_class("NSDate");
+    let mode = nsstring("kCFRunLoopDefaultMode");
+    for _ in 0..3 {
+        let current = send0(run_loop, sel("currentRunLoop"));
+        let until = send1_f64(date_cls, sel("dateWithTimeIntervalSinceNow:"), 0.02);
+        send2_id(current, sel("runMode:beforeDate:"), mode, until);
+    }
+}
+
 pub fn send3_id(recv: Id, s: Sel, a: Id, b: Id, c: Id) -> Id {
     let f: extern "C" fn(Id, Sel, Id, Id, Id) -> Id =
         unsafe { std::mem::transmute(msg_send_ptr()) };
@@ -597,6 +617,14 @@ unsafe fn write_cgimage_png(image: *mut c_void, path: &str) -> bool {
 /// posture). Best-effort: returns false if there is no window yet, or capture
 /// fails (e.g. Screen Recording permission not granted).
 pub fn snapshot_client_area(path: &str) -> bool {
+    // SETTLE FIRST. Several panes update on a LATER run-loop turn by design —
+    // notably the debugger's stack table, whose reloadData must not run inside
+    // the VM doit that produced the report (a reentrant data-source callback
+    // answers 0 rows). A person never notices the extra turn; a SCRIPT that
+    // snapshots straight after `debug "step"` does, and captured a stale or
+    // empty pane. Pumping the queued events here makes a scripted screenshot
+    // show what the user would actually be looking at.
+    settle_run_loop();
     let app = app_shared();
     let mut win = send0(app, sel("keyWindow"));
     if win.is_null() {

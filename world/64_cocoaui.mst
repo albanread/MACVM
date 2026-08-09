@@ -1963,6 +1963,16 @@ Object subclass: CocoaUI [
      querying item state (toolbarItemNamed:, appearanceMenuItemFor:), and
      snapshot under #system when you need to SEE it."
     CocoaUI class >> snapshotTo: aPath [
+        "The MAIN window goes through the host's real screen capture
+         (CGWindowListCreateImage — the same one the control channel uses).
+         The offscreen `cacheDisplayInRect:` path below does not draw
+         NSTableView rows, so a scripted screenshot came back with empty
+         tables (the debugger's stack, the browser's class list) even though
+         the screen itself was correct."
+        | r |
+        r := (self hostService send: 'snapshotWindowTo:' with: (Cocoa nsString: aPath)) asString.
+        r = '1' ifTrue: [ ^self ].
+        "Fall back to the offscreen redraw (no key window, e.g. fully hidden)."
         ^self snapshotWindow: Win to: aPath
     ]
     "Same capture for ANY window we own (the asset editors' gates snapshot

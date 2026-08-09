@@ -298,6 +298,19 @@ Object subclass: CocoaDebugger [
         self wireAction: aField to: aBlock.
     ]
     CocoaDebugger class >> deferReloadStack [
+        "Reload NOW, not on a timer. `render` already holds the parsed frames
+         and runs top-level in the drain (never inside a table callback), so a
+         synchronous reload is safe here — and a DEFERRED one was being
+         STARVED: driven by AppleScript the commands arrive back-to-back and
+         the main thread never idles, so performSelector:afterDelay: 0 never
+         fired and the stack column stayed empty while the frame and source
+         panes (set inline) were correct. Under the control channel, whose
+         scripts sleep between commands, the timer did fire — which is exactly
+         why this looked like a bundle-only bug.
+
+         The deferred reload is KEPT as a follow-up: on the very first halt the
+         view is built after this runs, and that pass re-reads the (by then
+         laid-out) table."
         StackTable isNil ifFalse: [
             StackTable onMain performSelector: 'reloadData' withObject: nil afterDelay: 0.0 ].
     ]

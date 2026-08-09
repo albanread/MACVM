@@ -1125,6 +1125,19 @@ extern "C" fn imp_compact_world(_this: *mut c_void, _cmd: *mut c_void) -> Id {
     }
 }
 
+/// `snapshotWindowTo:` — a REAL screen capture of the key window
+/// (`CGWindowListCreateImage`), which is what the control channel's `snap`
+/// has always used. The world's own `cacheDisplayInRect:` path redraws the
+/// view tree OFFSCREEN, and that does not render NSTableView rows (they are
+/// lazily-managed row views) — so every scripted screenshot showed empty
+/// tables: the debugger's stack column, the browser's class list. The pixels
+/// on screen were right the whole time; the capture was lying. Answers
+/// '1' on success, '0' otherwise.
+extern "C" fn imp_snapshot_window_to(_this: *mut c_void, _cmd: *mut c_void, path: Id) -> Id {
+    let ok = crate::objc::snapshot_client_area(&ns_to_string(path));
+    objc::nsstring(if ok { "1" } else { "0" })
+}
+
 /// `revertLastChange` — Debug ▸ Revert to Previous Version and Reload. Walks
 /// the image's own version history back one step for the most recently edited
 /// method or class (`Image::most_recent_undoable` + `undo_method`/`undo_class`,
@@ -1425,7 +1438,7 @@ pub fn register() {
     type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 52] = [
+    let methods: [(&str, *const c_void, &str); 53] = [
         ("colorizeWorkspaceStorage:", imp_colorize_workspace_storage as Imp1 as *const c_void, "@@:@"),
         ("addToWorldPath:", imp_add_to_world as Imp1 as *const c_void, "@@:@"),
         ("dbgReport", imp_dbg_report as Imp0 as *const c_void, "@@:"),
@@ -1444,6 +1457,7 @@ pub fn register() {
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("revertLastChange", imp_revert_last_change as Imp0 as *const c_void, "@@:"),
         ("compactWorld", imp_compact_world as Imp0 as *const c_void, "@@:"),
+        ("snapshotWindowTo:", imp_snapshot_window_to as Imp1 as *const c_void, "@@:@"),
         ("snapshotWorldDefault", imp_snapshot_world_default as Imp0 as *const c_void, "@@:"),
         ("latestSnapshotPath", imp_latest_snapshot_path as Imp0 as *const c_void, "@@:"),
         ("snapshotWorldTo:", imp_snapshot_world_to as Imp1 as *const c_void, "@@:@"),
