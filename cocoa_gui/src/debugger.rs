@@ -6,7 +6,7 @@
 //! halt), and `drain_perform` services the flag top-level with
 //! `CocoaDebugger haltArrived.` — never inside a callback.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 
@@ -34,6 +34,7 @@ impl DebugFrontend for GuiFrontend {
         if let Ok(mut cell) = REPORT.lock() {
             report.clone_into(&mut cell);
         }
+        REPORT_GEN.fetch_add(1, Ordering::AcqRel);
         HALT_ARRIVED.store(true, Ordering::Release);
         (self.wake)();
     }
@@ -79,11 +80,70 @@ pub fn report() -> String {
 }
 
 /// Host verb `dbgCommand:` — one command line into the parked halt loop.
-pub fn send_command(line: String) {
+/// DROPPED when nothing is halted: a command sent while RUNNING would sit in
+/// the channel and be consumed the instant the NEXT halt parks — a stale
+/// `continue` silently resuming a breakpoint you just planted (measured: an
+/// exploratory `debug "continue"` while running ate the following halt).
+pub fn send_command(line: String) -> bool {
+    let running = REPORT
+        .lock()
+        .map(|r| r.starts_with("RUNNING"))
+        .unwrap_or(true);
+    if running {
+        return false;
+    }
     if let Ok(slot) = CMD_TX.lock() {
         if let Some(tx) = slot.as_ref() {
-            let _ = tx.send(line);
+            return tx.send(line).is_ok();
         }
+    }
+    false
+}
+
+/// Bumped by `publish` — the halt loop republishes after EVERY command, so a
+/// caller that sends a command and immediately reads the report was racing it
+/// (a `step` answered the PRE-step state; a `print`'s OUT read back empty).
+static REPORT_GEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn report_gen() -> u64 {
+    REPORT_GEN.load(Ordering::Acquire)
+}
+
+/// Bounded wait for the halt loop's next republish (~a bytecode step's worth
+/// of work; the cap covers a `continue`, whose RUNNING publish is immediate).
+pub fn wait_report_changed(seen: u64) {
+    for _ in 0..100 {
+        if REPORT_GEN.load(Ordering::Acquire) > seen {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Generation counter bumped by the pump AFTER applying a breakpoint batch —
+/// what makes `set breakpoint` SYNCHRONOUS for a script. Planting only parks
+/// a request; the primary applies it a beat later, so a script that plants
+/// and immediately evaluates was racing the pump (and losing: the code ran
+/// unbroken, then the transcript showed the breakpoint arriving after).
+static APPLIED_GEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn applied_gen() -> u64 {
+    APPLIED_GEN.load(Ordering::Acquire)
+}
+
+pub fn bump_applied_gen() {
+    APPLIED_GEN.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Block (bounded) until the pump has applied everything parked BEFORE this
+/// call. Called on the main thread by the host breakpoint verbs; typical wait
+/// is one pump beat, the cap keeps a dead primary from hanging a script.
+pub fn wait_applied(seen: u64) {
+    for _ in 0..200 {
+        if APPLIED_GEN.load(Ordering::Acquire) > seen {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

@@ -413,7 +413,9 @@ fn primary_generation_main(
         );
         // DBG4 "Break on entry": apply any parked breakpoint requests HERE,
         // on the primary's own thread (planting pins the method to tier-0).
-        for (class, sel, set) in crate::debugger::take_breakpoints() {
+        let bp_batch = crate::debugger::take_breakpoints();
+        let bp_applied = !bp_batch.is_empty();
+        for (class, sel, set) in bp_batch {
             let r = if set {
                 primary.set_breakpoint_by_name(&class, &sel)
             } else {
@@ -427,6 +429,9 @@ fn primary_generation_main(
                 "Transcript showCr: '{}'.",
                 crate::filein::escape_st(&note)
             ));
+        }
+        if bp_applied {
+            crate::debugger::bump_applied_gen();
         }
         let beat = if crate::game::is_active() { 4 } else { PUMP_BEAT_MS };
         // A recovered guest error (ErrorPolicy::Resume) surfaces HERE, with

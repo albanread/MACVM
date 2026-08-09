@@ -465,6 +465,17 @@ fn dispatch_from(vm: &mut VmState, mut method: MethodOop, mut bci: usize) -> Oop
         // discipline every send arm already follows).
         if vm.debug.active {
             let hit_bp = method.has_bp() && crate::runtime::debug::hit(vm, method, bci);
+            // MACVM_DBG_BP=1: one line per has_bp-method dispatch — the direct
+            // instrument for "why didn't my breakpoint halt?" (temporary-grade
+            // but env-gated and free when unset).
+            if method.has_bp() && std::env::var_os("MACVM_DBG_BP").is_some() {
+                eprintln!(
+                    "BPDBG method={:#x} bci={bci} hit={hit_bp} depth={} active={}",
+                    method.oop().raw(),
+                    vm.debug.session_depth,
+                    vm.debug.active
+                );
+            }
             let hit_step = vm.debug.step.is_some() && crate::runtime::debug::step_check(vm, bci);
             if hit_bp || hit_step {
                 let reason = if hit_bp {

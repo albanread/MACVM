@@ -492,8 +492,21 @@ Object subclass: CocoaScript [
                 "Setting the error properties is not enough — a suspended
                  command must still be RESUMED for AppleScript to raise it."
                 self errorOn: cmd number: -2741 message: 'evaluate: ' , text.
-                ^cmd send: 'resumeExecutionWithResult:' with: nil ].
-        cmd send: 'resumeExecutionWithResult:' with: (Cocoa nsString: aString asString)
+                ^self deferResume: cmd with: nil ].
+        self deferResume: cmd with: (Cocoa nsString: aString asString)
+    ]
+
+    "Resume on a FRESH run-loop turn, never inline. resumeExecutionWithResult:
+     pumps the Apple Event queue SYNCHRONOUSLY — a queued next event (scripts
+     send them back-to-back) would be dispatched re-entrantly INTO the VM
+     callback this resume is running in, nesting a doit inside a live
+     interpreter frame — the forbidden reentrancy, and a measured SIGSEGV
+     (far=0x100000000000, recovered by the C6 door, mis-blamed on whatever
+     script command ran next). performSelector:afterDelay: fires with NO VM
+     frame on the stack; AppKit retains the argument until then."
+    CocoaScript class >> deferResume: cmd with: resultOrNil [
+        cmd onMain performSelector: 'resumeExecutionWithResult:'
+            withObject: resultOrNil afterDelay: 0.0
     ]
 
     "Resume with a script error instead of a value — the deadline path."
@@ -505,7 +518,7 @@ Object subclass: CocoaScript [
         Suspended at: key put: nil.
         cmd := entry at: 1.
         self errorOn: cmd number: -10000 message: aString.
-        cmd send: 'resumeExecutionWithResult:' with: nil
+        self deferResume: cmd with: nil
     ]
 
     "Called from the ~4 Hz beat (CocoaUI updateMetrics...). Resumes every

@@ -1329,7 +1329,13 @@ extern "C" fn imp_dbg_report(_this: *mut c_void, _cmd: *mut c_void) -> Id {
 /// re-publishes the full report after every command; the UI just re-renders
 /// on the next haltArrived. Answers nil.
 extern "C" fn imp_dbg_command(_this: *mut c_void, _cmd: *mut c_void, line: Id) -> Id {
-    crate::debugger::send_command(ns_to_string(line));
+    let seen = crate::debugger::report_gen();
+    if crate::debugger::send_command(ns_to_string(line)) {
+        // The loop republishes after every command; answering before that
+        // republish hands the caller the PRE-command state (a stepped
+        // debugger still showing the old line, a print with an empty OUT).
+        crate::debugger::wait_report_changed(seen);
+    }
     std::ptr::null_mut()
 }
 
@@ -1344,14 +1350,20 @@ extern "C" fn imp_set_halt_on_error(_this: *mut c_void, _cmd: *mut c_void, flag:
 /// `setBreakpointClass:selector:` / `clearBreakpointClass:selector:` — DBG4
 /// "Break on entry": park a breakpoint request for the supervisor pump (it
 /// runs on the primary's own thread; the outcome rides the primary
-/// transcript). Answer nil.
+/// transcript), then WAIT for the pump to apply it. Synchronous by design:
+/// a script that plants and immediately evaluates was racing the pump beat
+/// and losing — the code ran unbroken and the "breakpoint set" line arrived
+/// after. Typical wait is one beat; the bound keeps a wedged primary from
+/// hanging the caller. Answer nil.
 extern "C" fn imp_set_breakpoint(
     _this: *mut c_void,
     _cmd: *mut c_void,
     class: Id,
     selector: Id,
 ) -> Id {
+    let seen = crate::debugger::applied_gen();
     crate::debugger::request_breakpoint(ns_to_string(class), ns_to_string(selector), true);
+    crate::debugger::wait_applied(seen);
     std::ptr::null_mut()
 }
 extern "C" fn imp_clear_breakpoint(
@@ -1360,7 +1372,9 @@ extern "C" fn imp_clear_breakpoint(
     class: Id,
     selector: Id,
 ) -> Id {
+    let seen = crate::debugger::applied_gen();
     crate::debugger::request_breakpoint(ns_to_string(class), ns_to_string(selector), false);
+    crate::debugger::wait_applied(seen);
     std::ptr::null_mut()
 }
 
