@@ -656,7 +656,13 @@ Object subclass: CocoaBrowser2 [
         SourceView isNil ifTrue: [ ^self ].
         ts := SourceView onMain textStorage.
         ts isNil ifTrue: [ ^self ].
-        self hostService onMain colorizeStorage: ts.
+        "The Comment pane holds PROSE, not code — the class comment with its
+         surrounding quotes stripped. Colouring it as code lit up whatever
+         looked like a selector mid-sentence (`slurp:` blue inside an English
+         paragraph). Nothing between quotes is code, so it gets one colour."
+        EditMode == #comment
+            ifTrue: [ self hostService onMain colorizeCommentStorage: ts ]
+            ifFalse: [ self hostService onMain colorizeStorage: ts ].
         ts release.
     ]
     CocoaBrowser2 class >> modeChanged [

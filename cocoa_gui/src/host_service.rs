@@ -422,6 +422,39 @@ extern "C" fn imp_colorize_workspace_storage(
     colorize_storage_common(storage, true)
 }
 
+/// `colorizeCommentStorage:` — paint an ENTIRE storage as one comment.
+///
+/// The browser's Comment pane holds prose, not code: the class comment with
+/// its surrounding `"` already stripped. Running the code colouriser over it
+/// lit up whatever happened to look like a selector or a keyword mid-sentence
+/// (`slurp:` blue in the middle of an English paragraph), which is exactly
+/// what a comment must never do. Nothing between quotes is code, so this pass
+/// asks no questions about the text at all — one colour, the SAME
+/// `secondaryLabelColor` the colouriser gives `Kind::Comment`, so the two can
+/// never drift apart. Answers nil.
+extern "C" fn imp_colorize_comment_storage(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    storage: Id,
+) -> Id {
+    if storage.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ns = objc::send0(storage, objc::sel("string"));
+    let total = objc::send0_int(ns, objc::sel("length")) as u64;
+    let name_color = objc::nsstring("NSColor");
+    let name_font = objc::nsstring("NSFont");
+    let nscolor = objc::get_class("NSColor");
+    let comment_color = objc::send0(nscolor, objc::sel("secondaryLabelColor"));
+    let nsfont = objc::get_class("NSFont");
+    let base_font = objc::send1_f64(nsfont, objc::sel("userFixedPitchFontOfSize:"), 12.0);
+    objc::send0(storage, objc::sel("beginEditing"));
+    objc::send_attr(storage, name_color, comment_color, 0, total);
+    objc::send_attr(storage, name_font, base_font, 0, total);
+    objc::send0(storage, objc::sel("endEditing"));
+    std::ptr::null_mut()
+}
+
 fn colorize_storage_common(storage: Id, check_unknown: bool) -> Id {
     use crate::colorize::{spans_utf16, spans_utf16_checked, Kind};
     if storage.is_null() {
@@ -1378,7 +1411,7 @@ pub fn register() {
     type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 51] = [
+    let methods: [(&str, *const c_void, &str); 52] = [
         ("colorizeWorkspaceStorage:", imp_colorize_workspace_storage as Imp1 as *const c_void, "@@:@"),
         ("addToWorldPath:", imp_add_to_world as Imp1 as *const c_void, "@@:@"),
         ("dbgReport", imp_dbg_report as Imp0 as *const c_void, "@@:"),
@@ -1427,6 +1460,7 @@ pub fn register() {
         ("acceptEditorClass:", imp_accept_editor_class as Imp1 as *const c_void, "@@:@"),
         ("launchDemo:", imp_launch_demo as Imp1 as *const c_void, "@@:@"),
         ("colorizeStorage:", imp_colorize_storage as Imp1 as *const c_void, "@@:@"),
+        ("colorizeCommentStorage:", imp_colorize_comment_storage as Imp1 as *const c_void, "@@:@"),
         ("implementorsOf:", imp_implementors_of as Imp1 as *const c_void, "@@:@"),
         ("sendersOf:", imp_senders_of as Imp1 as *const c_void, "@@:@"),
         ("definitionsOf:", imp_definitions_of as Imp1 as *const c_void, "@@:@"),
