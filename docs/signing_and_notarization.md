@@ -8,6 +8,11 @@ illustrative. Complements `iCloud Drive → signing/README-mac-studio-setup.md`
 Audience: whoever (or whatever) is driving the release — a human, or an
 assistant working in this repo.
 
+**Signing a DIFFERENT app?** The identity and notary credential are shared
+across every app on this machine; only entitlements and bundle layout differ.
+The project-neutral version of this runbook lives beside the credentials at
+`iCloud Drive → signing/CODEX-signing-runbook.md`.
+
 ---
 
 ## 0. Rules for an assistant working on this
