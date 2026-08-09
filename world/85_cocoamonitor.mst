@@ -1,0 +1,397 @@
+"85_cocoamonitor.mst — the Monitor tab: every running VM, live.
+
+ MACVM is a multi-VM application: a primary Smalltalk VM on its own thread,
+ the UI worker VM on the main thread, and up to sixteen spawned compute
+ workers. This view is the roster — one table row per VM (name, state,
+ memory, GC, allocation rate, JIT activity) at a user-selectable refresh
+ period, plus a UI BRIDGE band for the Cocoa side of the app: drain passes,
+ callback dispatches, envelopes, script requests — the main-thread work that
+ is otherwise invisible to every VM-side counter.
+
+ Data path (blast, not patch): ONE host verb (`monitorRows`) answers the
+ whole table each refresh — the Rust roster (`macvm::embed::monitor_*`) is
+ fed by each VM's own thread, so nothing here ever crosses into another VM.
+ The only derived number is ALLOC/S, diffed HERE from the raw running totals
+ because only this side knows the refresh period the user picked.
+
+ The tick rides the ~4 Hz metrics beat (`CocoaUI updateMetricsMem:...` —
+ the one periodic callback that demonstrably reaches the world; world-side
+ NSTimers never fire). The period popup divides that beat. Table reloads are
+ DEFERRED (performSelector:afterDelay: 0) — the tick runs inside a drain
+ exec, where a synchronous reload's datasource callbacks would re-enter the
+ VM and answer zero rows (the debugger's stack-pane lesson).
+
+ Designed to grow a profiling pane: selecting a row is already wired
+ (`rowClicked`), and the natural extension is a lower split showing the
+ selected VM's hot compiled methods (the `nmethods` surface). Not built yet."
+
+Object subclass: CocoaMonitor [
+    <classVars: Container TablePane Table Cols Face Rows BridgeLabel
+                Popup Actions LastMs Period Prev PrevMs>
+
+    CocoaMonitor class >> barHeight [ ^34.0 ]
+    CocoaMonitor class >> bridgeHeight [ ^50.0 ]
+    CocoaMonitor class >> headerHeight [ ^22.0 ]
+
+    "── registration (tab-host protocol, 64_cocoaui) ──────────────────────
+     'magnifyingglass' has no SVG in icons-mono/, so toolbarIconNamed: falls
+     back to the SF Symbol of the same name — the intended monitoring glyph."
+    CocoaMonitor class >> register [
+        CocoaUI registerViewNamed: #monitor title: 'Monitor' icon: 'magnifyingglass'
+                container: [ self containerView ]
+                onShow: [ self refresh ]
+    ]
+    CocoaMonitor class >> containerView [
+        Container isNil ifTrue: [ self buildView ].
+        ^Container
+    ]
+
+    "── the ~4 Hz beat (updateMetricsMem: calls me every beat) ────────────
+     The beat is the SCHEDULER but wall-clock is the GATE: a primary stuck in
+     a long doit starves the beat (its wake drives the drain), and counting
+     beats would stretch 'every 1 s' into arbitrarily long — exactly when
+     the user is watching for the busy row. Any beat that does arrive
+     refreshes if the period has elapsed in real time."
+    CocoaMonitor class >> nowMs [ ^Time millisecondClockValue ]
+    CocoaMonitor class >> beatTick [
+        | now |
+        Container isNil ifTrue: [ ^self ].          "never shown yet"
+        Period isNil ifTrue: [ ^self ].             "paused"
+        now := self nowMs.
+        LastMs isNil ifTrue: [ LastMs := 0 ].
+        now - LastMs >= (Period * 1000) ifTrue: [
+            LastMs := now.
+            self refresh ].
+    ]
+
+    "── one refresh: pull both blasts, derive rates, defer the reload ─────"
+    CocoaMonitor class >> refresh [
+        | raw lines out |
+        Container isNil ifTrue: [ ^self ].
+        raw := self stripOk: (CocoaBrowser hostService onMain monitorRows) asString.
+        lines := self linesOf: raw.
+        out := OrderedCollection new.
+        lines do: [ :line | | f |
+            f := self fieldsOf: line.
+            f size >= 11 ifTrue: [ out add: (self displayRowFor: f) ] ].
+        Rows := out.
+        BridgeLabel isNil ifFalse: [
+            BridgeLabel onMain setStringValue:
+                (self stripOk: (CocoaBrowser hostService onMain bridgeStatsLine) asString) ].
+        self deferReloadTable.
+    ]
+
+    "raw fields: label kind state mem pct gc allocs nm compiles deopts icm.
+     Display row: vm kind state memory heap% gc alloc/s nm compiles deopts icm
+     — everything verbatim except allocs, diffed into a per-second rate."
+    CocoaMonitor class >> displayRowFor: f [
+        | label allocs rate |
+        label := f at: 1.
+        allocs := (f at: 7) asNumber.
+        rate := self rateFor: label allocs: allocs.
+        ^{ label. f at: 2. f at: 3. f at: 4. (f at: 5) , '%'. f at: 6.
+           rate. f at: 8. f at: 9. f at: 10. f at: 11 }
+    ]
+
+    "bytes/sec from the raw running total: delta over the WALL-CLOCK ms since
+     the counter last moved. The baseline only advances when the value
+     changes — a busy VM publishes nothing until its doit ends, and dividing
+     that whole burst by one tick would overstate the rate; anchoring at the
+     last change yields the true average over the busy window. First sighting
+     (or a respawn's counter reset) answers a dash."
+    CocoaMonitor class >> rateFor: label allocs: allocs [
+        | now prev prevMs rate |
+        now := self nowMs.
+        Prev isNil ifTrue: [ Prev := Dictionary new. PrevMs := Dictionary new ].
+        prev := Prev at: label ifAbsent: [ nil ].
+        prevMs := PrevMs at: label ifAbsent: [ nil ].
+        (prev isNil or: [ prevMs isNil or: [ allocs < prev ] ]) ifTrue: [
+            Prev at: label put: allocs.
+            PrevMs at: label put: now.
+            ^'—' ].
+        allocs = prev ifTrue: [ ^'0 B/s' ].
+        rate := (allocs - prev) * 1000 // ((now - prevMs) max: 1).
+        Prev at: label put: allocs.
+        PrevMs at: label put: now.
+        ^(self bytesString: rate) , '/s'
+    ]
+
+    "Scripting convenience (and the popup's own path below): 0=Paused,
+     1=every second, 2=every 2 s, 3=every 5 s."
+    CocoaMonitor class >> setPeriodIndex: idx [
+        Popup isNil ifFalse: [ Popup onMain selectItemAtIndex: idx ].
+        idx <= 0
+            ifTrue: [ Period := nil ]
+            ifFalse: [ Period := #(1 2 5) at: (idx min: 3) ].
+        LastMs := 0.    "an un-pause refreshes on the very next beat"
+    ]
+
+    CocoaMonitor class >> bytesString: n [
+        | v u units tenths |
+        units := Array with: ' B' with: ' KB' with: ' MB' with: ' GB'.
+        v := n. u := 1.
+        [ v >= 1024 and: [ u < 4 ] ] whileTrue: [
+            u = 1 ifTrue: [ tenths := v * 10 // 1024 ] ifFalse: [ tenths := tenths // 1024 ].
+            v := v // 1024. u := u + 1 ].
+        u = 1 ifTrue: [ ^n printString , ' B' ].
+        ^(tenths // 10) printString , '.' , (tenths \\ 10) printString , (units at: u)
+    ]
+
+    "── the view ──────────────────────────────────────────────────────────"
+    CocoaMonitor class >> buildView [
+        | host frame w h barH bridgeH tableY scroll hdr bx lbl btn hint |
+        host := CocoaUI contentHost.
+        frame := host onMain frame.
+        w := frame at: 3. h := frame at: 4.
+        barH := self barHeight. bridgeH := self bridgeHeight.
+        tableY := barH + bridgeH.
+        Actions := OrderedCollection new.
+
+        Container := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Container onMain setAutoresizesSubviews: true.
+
+        "── the VM table, capped by its header band ──"
+        scroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - tableY - self headerHeight).
+        scroll onMain setHasVerticalScroller: true.
+        scroll onMain setHasHorizontalScroller: true.
+        scroll onMain setBorderType: 0.
+        Table := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: 100.0).
+        Table onMain setUsesAlternatingRowBackgroundColors: true.
+        Table onMain setRowHeight: 22.0.
+        Table onMain setAllowsColumnReordering: false.
+        Cols := OrderedCollection new.
+        self addColumn: 'vm'     title: 'VM'        width: 96.0.
+        self addColumn: 'kind'   title: 'KIND'      width: 70.0.
+        self addColumn: 'state'  title: 'STATE'     width: 60.0.
+        self addColumn: 'memory' title: 'MEMORY'    width: 150.0.
+        self addColumn: 'heap'   title: 'HEAP'      width: 55.0.
+        self addColumn: 'gc'     title: 'GC S·F'    width: 78.0.
+        self addColumn: 'alloc'  title: 'ALLOC/S'   width: 96.0.
+        self addColumn: 'nm'     title: 'NMETHODS'  width: 82.0.
+        self addColumn: 'jit'    title: 'COMPILES'  width: 78.0.
+        self addColumn: 'deopt'  title: 'DEOPTS'    width: 64.0.
+        self addColumn: 'ic'     title: 'IC MISSES' width: 80.0.
+        Face := MacvmDelegate tableSourceOn: (Worker classNamed: #CocoaMonitorFace) new.
+        self deferAttachFace.
+        scroll onMain setDocumentView: Table.
+        hdr := self headerLabeled: 'VIRTUAL MACHINES — one row per running VM'.
+        TablePane := self paneWith: hdr scroll: scroll
+                          at: tableY wide: w high: h - tableY.
+        Container onMain addSubview: TablePane.
+
+        "── UI BRIDGE band: the Cocoa side's own counters ──"
+        hdr := self headerLabeled: 'UI BRIDGE — MAIN THREAD'.
+        hdr onMain setFrame: (Array with: 0.0 with: barH + bridgeH - self headerHeight
+                                    with: w with: self headerHeight).
+        hdr onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMaxYMargin.
+        Container onMain addSubview: hdr.
+        BridgeLabel := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: 8.0 with: barH + 3.0 with: w - 16.0 with: 20.0).
+        BridgeLabel onMain setStringValue: '—'.
+        BridgeLabel onMain setEditable: false.
+        BridgeLabel onMain setSelectable: true.
+        BridgeLabel onMain setBordered: false.
+        BridgeLabel onMain setDrawsBackground: false.
+        BridgeLabel onMain setFont: (CocoaUI fixedFontOfSize: 11.0).
+        BridgeLabel onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMaxYMargin.
+        Container onMain addSubview: BridgeLabel.
+
+        "── bottom bar: refresh period + manual refresh ──"
+        bx := 8.0.
+        lbl := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: bx with: 9.0 with: 52.0 with: 17.0).
+        lbl onMain setStringValue: 'Update:'.
+        lbl onMain setEditable: false.
+        lbl onMain setSelectable: false.
+        lbl onMain setBordered: false.
+        lbl onMain setDrawsBackground: false.
+        lbl onMain setFont: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 11.0).
+        Container onMain addSubview: lbl.
+        bx := bx + 56.
+        Popup := ((Cocoa classNamed: 'NSPopUpButton') onMain alloc) onMain
+            initWithFrame: (Array with: bx with: 4.0 with: 110.0 with: 26.0) pullsDown: false.
+        Popup onMain addItemWithTitle: 'Paused'.
+        Popup onMain addItemWithTitle: 'Every 1 s'.
+        Popup onMain addItemWithTitle: 'Every 2 s'.
+        Popup onMain addItemWithTitle: 'Every 5 s'.
+        Popup onMain selectItemAtIndex: 1.
+        Period := 1.
+        self wireAction: Popup to: [ self periodChanged ].
+        Container onMain addSubview: Popup.
+        bx := bx + 118.
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain
+            initWithFrame: (Array with: bx with: 4.0 with: 100.0 with: 26.0).
+        btn onMain setTitle: 'Refresh Now'.
+        btn onMain setBezelStyle: 1.
+        self wireAction: btn to: [ self refresh ].
+        Container onMain addSubview: btn.
+        hint := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: w - 268.0 with: 9.0 with: 260.0 with: 17.0).
+        hint onMain setStringValue: 'workers appear here when code spawns them'.
+        hint onMain setEditable: false.
+        hint onMain setSelectable: false.
+        hint onMain setBordered: false.
+        hint onMain setDrawsBackground: false.
+        hint onMain setAlignment: 1.    "NSTextAlignmentRight on macOS"
+        hint onMain setTextColor: ((Cocoa classNamed: 'NSColor') onMain tertiaryLabelColor).
+        hint onMain setFont: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 10.0).
+        hint onMain setAutoresizingMask: CocoaUI maskMinXMargin.
+        Container onMain addSubview: hint.
+    ]
+
+    CocoaMonitor class >> addColumn: ident title: aTitle width: wid [
+        | col |
+        col := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain
+            initWithIdentifier: ident.
+        col onMain setWidth: wid.
+        col onMain setEditable: false.
+        (col onMain headerCell) onMain setStringValue: aTitle.
+        Table onMain addTableColumn: col.
+        Cols add: ident.
+    ]
+
+    "── pane helpers (the debugger's anti-snowstorm idiom, positioned) ────"
+    CocoaMonitor class >> headerLabeled: aTitle [
+        | f |
+        f := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: 100.0 with: self headerHeight).
+        f onMain setStringValue: '  ' , aTitle.
+        f onMain setEditable: false.
+        f onMain setSelectable: false.
+        f onMain setBordered: false.
+        f onMain setDrawsBackground: true.
+        f onMain setBackgroundColor: ((Cocoa classNamed: 'NSColor') onMain windowBackgroundColor).
+        f onMain setTextColor: ((Cocoa classNamed: 'NSColor') onMain secondaryLabelColor).
+        f onMain setFont: ((Cocoa classNamed: 'NSFont') onMain boldSystemFontOfSize: 11.0).
+        ^f
+    ]
+    CocoaMonitor class >> paneWith: aHeader scroll: aScroll at: y wide: w high: h [
+        | pane hh |
+        hh := self headerHeight.
+        pane := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: y with: w with: h).
+        pane onMain setAutoresizesSubviews: true.
+        pane onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        aHeader onMain setFrame: (Array with: 0.0 with: h - hh with: w with: hh).
+        aHeader onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        aScroll onMain setFrame: (Array with: 0.0 with: 0.0 with: w with: h - hh).
+        aScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        pane onMain addSubview: aHeader.
+        pane onMain addSubview: aScroll.
+        ^pane
+    ]
+    CocoaMonitor class >> wireAction: aControl to: aBlock [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        Actions add: delegate.
+    ]
+
+    "── table plumbing ────────────────────────────────────────────────────"
+    CocoaMonitor class >> rowCount [ ^Rows isNil ifTrue: [ 0 ] ifFalse: [ Rows size ] ]
+    CocoaMonitor class >> valueAtCol: aCol row: aRow [
+        | ident idx row |
+        (Rows isNil or: [ aRow >= Rows size ]) ifTrue: [ ^'' ].
+        ident := (aCol onMain identifier) asString.
+        idx := Cols indexOf: ident.
+        idx = 0 ifTrue: [ ^'' ].
+        row := Rows at: aRow + 1.
+        idx > row size ifTrue: [ ^'' ].
+        ^row at: idx
+    ]
+    CocoaMonitor class >> rowClicked [
+        "Selection hook — reserved for the profiling pane (a lower split
+         showing the selected VM's hot compiled methods). No-op in v1."
+        ^self
+    ]
+    CocoaMonitor class >> deferAttachFace [
+        "setDataSource: makes AppKit query the source SYNCHRONOUSLY. If
+         buildView is running inside an exec (a scripted switchToView: over
+         the control channel), that nested dispatch RE-ENTERS the VM and
+         faults; inside a user-click callback it merely fails closed. Neither
+         is the attach we want, so park it on the run loop: macvmAction:
+         fires top-level with the VM quiescent — the one context where the
+         initial row query may dispatch freely. (The debugger's deferred-
+         reload lesson, one level earlier: defer the ATTACH, not just the
+         reload.)"
+        | holder d |
+        holder := CocoaToolbarAction on: [ self attachFace ].
+        d := MacvmDelegate actionTargetOn: holder.
+        Actions add: d.
+        d onMain performSelector: 'macvmAction:' withObject: nil afterDelay: 0.0.
+    ]
+    CocoaMonitor class >> attachFace [
+        (Table isNil or: [ Face isNil ]) ifTrue: [ ^self ].
+        Table onMain setDataSource: Face.
+        Table onMain setDelegate: Face.
+        self wireAction: Table to: [ self rowClicked ].
+        self deferReloadTable.
+    ]
+    CocoaMonitor class >> deferReloadTable [
+        "Deferred, never synchronous: this runs inside a drain exec, where a
+         synchronous reload's datasource callbacks would re-enter the VM and
+         answer zero rows (the debugger's stack-pane lesson). The tick's slow
+         cadence means the run loop always idles in between, so afterDelay: 0
+         always fires."
+        Table isNil ifFalse: [
+            Table onMain performSelector: 'reloadData' withObject: nil afterDelay: 0.0 ].
+    ]
+    CocoaMonitor class >> periodChanged [
+        Popup isNil ifTrue: [ ^self ].
+        self setPeriodIndex: (Popup onMain indexOfSelectedItem).
+    ]
+
+    "── string helpers ────────────────────────────────────────────────────"
+    CocoaMonitor class >> stripOk: s [
+        (s size > 3 and: [ (s copyFrom: 1 to: 3) = 'OK ' ])
+            ifTrue: [ ^s copyFrom: 4 to: s size ].
+        ^s
+    ]
+    CocoaMonitor class >> linesOf: aString [
+        | lines start |
+        lines := OrderedCollection new.
+        start := 1.
+        1 to: aString size do: [ :i |
+            (aString at: i) = Character nl ifTrue: [
+                i > start ifTrue: [ lines add: (aString copyFrom: start to: i - 1) ].
+                start := i + 1 ] ].
+        start <= aString size ifTrue: [ lines add: (aString copyFrom: start to: aString size) ].
+        ^lines
+    ]
+    CocoaMonitor class >> fieldsOf: aLine [
+        | fields start us |
+        us := Character value: 31.
+        fields := OrderedCollection new.
+        start := 1.
+        1 to: aLine size do: [ :i |
+            (aLine at: i) = us ifTrue: [
+                fields add: (aLine copyFrom: start to: i - 1).
+                start := i + 1 ] ].
+        fields add: (aLine copyFrom: start to: aLine size).
+        ^fields
+    ]
+
+    CocoaMonitor class >> teardown [
+        Actions isNil ifFalse: [
+            Actions do: [ :d | d isValid ifTrue: [ d release ] ] ].
+        Face isNil ifFalse: [ Face isValid ifTrue: [ Face release ] ].
+        Actions := nil. Face := nil.
+        Container := nil. TablePane := nil. Table := nil. Cols := nil.
+        Rows := nil. BridgeLabel := nil. Popup := nil.
+        Prev := nil. PrevMs := nil.
+    ]
+]
+
+"The table's datasource/delegate face — instantiated once, wrapped by
+ MacvmDelegate tableSourceOn: (the debugger's pattern)."
+Object subclass: CocoaMonitorFace [
+    numberOfRowsInTableView: aTable [ ^CocoaMonitor rowCount ]
+    tableView: aTable objectValueForTableColumn: aCol row: aRow [
+        ^CocoaMonitor valueAtCol: aCol row: aRow ]
+]

@@ -39,6 +39,7 @@
       <enumerator name="canvas"    code="MvV6" description="The drawing canvas."/>
       <enumerator name="help"      code="MvV7" description="The documentation pane."/>
       <enumerator name="debugger"  code="MvV8" description="The debugger."/>
+      <enumerator name="monitor"   code="MvV9" description="The VM monitor."/>
     </enumeration>
 
     <enumeration name="appearance" code="MvAe"

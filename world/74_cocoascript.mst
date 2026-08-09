@@ -67,7 +67,7 @@ Object subclass: CocoaScript [
      registration order in CocoaUI class >> startup (workspace first, then
      each view class's own register)."
     CocoaScript class >> viewCodes [
-        ^#(workspace browser browser2 find editor outliner canvas help debugger)
+        ^#(workspace browser browser2 find editor outliner canvas help debugger monitor)
     ]
 
     "The `appearance` enumeration — CocoaUI's own themeOrder."

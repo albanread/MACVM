@@ -1008,6 +1008,71 @@ extern "C" fn imp_snapshot_world_default(_this: *mut c_void, _cmd: *mut c_void) 
 
 /// `latestSnapshotPath` — the newest `.zip` in the snapshot folder, so the
 /// menu can name the file it is about to restore. `OK <path>` / `ERR none`.
+/// `monitorRows` — the Monitor tab's whole table in one blast: one line per
+/// VM in the process-wide roster (primary, UI worker, spawned workers),
+/// `US`-separated fields. Everything display-ready except `allocs`, which
+/// stays a raw running total so the Smalltalk side can diff successive reads
+/// into an allocation RATE at whatever refresh period the user picked.
+/// Fields: label · kind · state · mem used/cap · heap% · gc s·f · allocs ·
+/// nmethods · compiles · deopts · ic misses.
+extern "C" fn imp_monitor_rows(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    let mut rows = macvm::embed::monitor_snapshot();
+    let rank = |k: &str| match k {
+        "primary" => 0,
+        "ui" => 1,
+        _ => 2,
+    };
+    rows.sort_by(|a, b| rank(a.kind).cmp(&rank(b.kind)).then(a.label.cmp(&b.label)));
+    let sep = SEP.to_string();
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let m = &r.metrics;
+            // Workers flag busy explicitly (their exec IS the work); the
+            // primary and UI heartbeat instead — publish every beat — so for
+            // them a stale row while alive means "stuck inside guest code"
+            // (a long doit, a beachballing main thread). 900 ms ≈ 3 missed
+            // beats: one is scheduling jitter, three is genuinely running.
+            let state = if !r.alive {
+                "dead"
+            } else if r.busy || (r.kind != "worker" && r.age_ms.is_some_and(|a| a > 900)) {
+                "busy"
+            } else {
+                "idle"
+            };
+            let used = m.eden_used + m.old_used;
+            let cap = (m.eden_capacity + m.old_reserved).max(1);
+            let pct = ((used as f64 / cap as f64) * 100.0).round() as u64;
+            [
+                clean_field(&r.label),
+                r.kind.to_string(),
+                state.to_string(),
+                format!(
+                    "{} / {}",
+                    crate::format_bytes(used),
+                    crate::format_bytes(cap)
+                ),
+                pct.to_string(),
+                format!("{} · {}", m.scavenges, m.full_gcs),
+                m.bytes_allocated.to_string(),
+                m.nmethods.to_string(),
+                m.compilations.to_string(),
+                m.deopts.to_string(),
+                m.ic_misses.to_string(),
+            ]
+            .join(&sep)
+        })
+        .collect();
+    ok(&lines.join("\n"))
+}
+
+/// `bridgeStatsLine` — the Monitor tab's UI BRIDGE band: the Cocoa-side
+/// counters (drain passes + beat gap, callback dispatches, primary→UI
+/// envelopes, control-channel requests) that no VM-side number ever shows.
+extern "C" fn imp_bridge_stats_line(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    ok(&crate::bridge_stats::line())
+}
+
 extern "C" fn imp_latest_snapshot_path(_this: *mut c_void, _cmd: *mut c_void) -> Id {
     let dir = snapshot_dir();
     let newest = std::fs::read_dir(&dir).ok().and_then(|d| {
@@ -1438,7 +1503,9 @@ pub fn register() {
     type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 53] = [
+    let methods: [(&str, *const c_void, &str); 55] = [
+        ("monitorRows", imp_monitor_rows as Imp0 as *const c_void, "@@:"),
+        ("bridgeStatsLine", imp_bridge_stats_line as Imp0 as *const c_void, "@@:"),
         ("colorizeWorkspaceStorage:", imp_colorize_workspace_storage as Imp1 as *const c_void, "@@:@"),
         ("addToWorldPath:", imp_add_to_world as Imp1 as *const c_void, "@@:@"),
         ("dbgReport", imp_dbg_report as Imp0 as *const c_void, "@@:"),

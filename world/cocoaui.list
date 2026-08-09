@@ -55,3 +55,9 @@
 # CocoaSoundEditor (docs/asset_editors_design.md stage 6): Tools > Sound
 # Editor — the ADSR instrument panel over prim 263's parametric synth wire.
 77_sounded.mst
+# CocoaMonitor (the Monitor tab): one table row per running VM (primary, UI
+# worker, spawned workers) from the host's `monitorRows` roster verb, plus
+# the UI BRIDGE band (`bridgeStatsLine` — the Cocoa side's own counters).
+# Rides the ~4 Hz metrics beat at a user-selectable period; self-registers
+# by name with the SF-Symbol magnifying glass.
+85_cocoamonitor.mst

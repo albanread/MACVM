@@ -133,6 +133,7 @@ pub fn start(wake: std::sync::Arc<dyn Fn() + Send + Sync>) -> Option<Receiver<Ct
 /// default-mode drain on the MAIN thread.
 pub fn serve(rx: &Receiver<CtlReq>, ui: &mut macvm::embed::VmHandle) {
     while let Ok(req) = rx.try_recv() {
+        crate::bridge_stats::ctl_request();
         let reply = if let Some(src) = req.cmd.strip_prefix("eval ") {
             match ui.eval(src) {
                 Ok(v) => format!("OK {v}"),

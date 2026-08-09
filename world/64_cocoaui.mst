@@ -178,6 +178,7 @@ Object subclass: CocoaUI [
         (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv register ].
         (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc register ].
         (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc register ].
+        (Worker classNamed: #CocoaMonitor) ifNotNil: [ :mc | mc register ].
         "A- / A+ and Do It / Print It, after every view's switcher item."
         self buildFontButtons.
         "Every item is registered now, so the toolbar can ask for the full
@@ -618,6 +619,7 @@ Object subclass: CocoaUI [
          rides THIS one, the beat that demonstrably reaches the world ~4Hz.
          Late-bound by name, the CG7/CG8 discipline."
         (Worker classNamed: #CocoaSpriteEditor) ifNotNil: [ :ed | ed previewTick ].
+        (Worker classNamed: #CocoaMonitor) ifNotNil: [ :mc | mc beatTick ].
         (MetricLabels at: #MEM ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: memStr ].
         (MetricLabels at: #JIT ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: jitStr ].
         (MetricLabels at: #CODE ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: codeStr ].
@@ -1904,6 +1906,7 @@ Object subclass: CocoaUI [
             (Worker classNamed: #CocoaSoundEditor) ifNotNil: [ :sn | sn teardown ].
             (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc teardown ].
             (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc teardown ].
+            (Worker classNamed: #CocoaMonitor) ifNotNil: [ :mc | mc teardown ].
             ActTarget isNil ifFalse: [ ActTarget isValid ifTrue: [ ActTarget release ] ].
             ToolbarDelegates isNil ifFalse: [
                 ToolbarDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].

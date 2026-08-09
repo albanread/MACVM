@@ -31,6 +31,7 @@
 use std::cell::Cell;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::codecache::deopt_trap;
 use crate::frontend::{self, CompileError};
@@ -486,6 +487,138 @@ pub struct VmMetrics {
     pub ic_misses: u64,
 }
 
+// ───────────────────────── VM monitor registry ──────────────────────────────
+// (Monitor tab) A process-wide roster of every VM the app runs — primary, UI
+// worker, spawned workers — each publishing its own [`VmMetrics`] snapshot
+// from its OWNER thread at quiescent points (the supervisor beat, the main-
+// thread metrics tick, a worker's post-dispatch). Readers (the Monitor tab's
+// host verb) take the parked copies. This is `PrimarySupervisor::metrics`'s
+// owner-samples/reader-reads split, generalized to N VMs: `VmHandle::metrics`
+// is plain field reads of `&self.vm`, so only the thread that owns the handle
+// may sample — the registry is where those samples become visible to main.
+// A slot for a BUSY VM (mid-doit, not publishing) simply holds its last
+// quiescent snapshot, which is exactly what was true when it was last idle;
+// `busy` is the flag that says "and it has since started running".
+
+/// One VM's row in the monitor roster. `label`/`kind` are fixed at
+/// registration; the rest is republished by the owner thread.
+pub struct VmMonitorSlot {
+    pub label: String,
+    /// `"primary"`, `"ui"`, or `"worker"` — display grouping only.
+    pub kind: &'static str,
+    alive: std::sync::atomic::AtomicBool,
+    busy: std::sync::atomic::AtomicBool,
+    metrics: Mutex<VmMetrics>,
+    /// When `publish` last ran. For a VM that heartbeats (the primary and UI
+    /// publish every beat) a GROWING age while alive means "stuck inside
+    /// guest code" — the busy signal for VMs whose pump blocks inside `exec`,
+    /// where a busy flag around the exec would read permanently busy.
+    last_publish: Mutex<Option<std::time::Instant>>,
+}
+
+impl VmMonitorSlot {
+    /// Park a fresh snapshot (owner thread only). Publishing revives a slot:
+    /// a respawned primary re-registers under the same label and its first
+    /// beat flips the row back to alive.
+    pub fn publish(&self, m: VmMetrics) {
+        use std::sync::atomic::Ordering::Relaxed;
+        *self.metrics.lock().unwrap_or_else(|e| e.into_inner()) = m;
+        *self
+            .last_publish
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+        self.alive.store(true, Relaxed);
+    }
+
+    /// Owner thread flags "about to run guest code" / "back to quiescent" —
+    /// so the Monitor can say *busy* honestly instead of showing a stale
+    /// idle row for a worker deep in a long doit.
+    pub fn set_busy(&self, b: bool) {
+        self.busy.store(b, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The VM is gone (worker retired, primary died awaiting respawn). The
+    /// row stays — dead rows are information, not noise — until a same-label
+    /// registration reuses it.
+    pub fn mark_dead(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.alive.store(false, Relaxed);
+        self.busy.store(false, Relaxed);
+    }
+}
+
+/// A read-side copy of one slot, snapped under the roster lock.
+pub struct VmMonitorRow {
+    pub label: String,
+    pub kind: &'static str,
+    pub alive: bool,
+    pub busy: bool,
+    /// Milliseconds since the owner last published (`None` = never).
+    pub age_ms: Option<u64>,
+    pub metrics: VmMetrics,
+}
+
+static VM_MONITOR: Mutex<Vec<std::sync::Arc<VmMonitorSlot>>> = Mutex::new(Vec::new());
+
+/// Join the roster. A dead slot with the same label is reused (a respawned
+/// primary or a reused worker id keeps ONE row rather than accreting
+/// tombstones); otherwise a new row is appended in registration order —
+/// which is also display order, so primary/ui land first naturally.
+pub fn monitor_register(label: String, kind: &'static str) -> std::sync::Arc<VmMonitorSlot> {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let mut roster = VM_MONITOR.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = roster
+        .iter()
+        .find(|s| !s.alive.load(Relaxed) && s.label == label)
+    {
+        slot.alive.store(true, Relaxed);
+        slot.busy.store(false, Relaxed);
+        return slot.clone();
+    }
+    let slot = std::sync::Arc::new(VmMonitorSlot {
+        label,
+        kind,
+        alive: AtomicBool::new(true),
+        busy: AtomicBool::new(false),
+        metrics: Mutex::new(VmMetrics::default()),
+        last_publish: Mutex::new(None),
+    });
+    roster.push(slot.clone());
+    slot
+}
+
+/// Read-side: copy every row (any thread).
+pub fn monitor_snapshot() -> Vec<VmMonitorRow> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let roster = VM_MONITOR.lock().unwrap_or_else(|e| e.into_inner());
+    roster
+        .iter()
+        .map(|s| VmMonitorRow {
+            label: s.label.clone(),
+            kind: s.kind,
+            alive: s.alive.load(Relaxed),
+            busy: s.busy.load(Relaxed),
+            age_ms: s
+                .last_publish
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map(|t| t.elapsed().as_millis() as u64),
+            metrics: *s.metrics.lock().unwrap_or_else(|e| e.into_inner()),
+        })
+        .collect()
+}
+
+/// Callbacks dispatched into any VM via [`VmHandle::dispatch_callback`] —
+/// delegate tickets, action targets, timers: the main-thread work that is
+/// otherwise invisible to the Smalltalk-side counters. Bumped once per
+/// dispatch that actually runs a body.
+static CALLBACKS_DISPATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read-side for the Monitor's bridge line.
+pub fn callbacks_dispatched() -> u64 {
+    CALLBACKS_DISPATCHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Adapts a `TranscriptSink` into the plain `std::io::Write` that
 /// `VmState::out` already expects — SPEC §16.2's sink trait is
 /// guest-output-shaped (whole strings), `Write` is byte-shaped; this is the
@@ -871,6 +1004,10 @@ impl VmHandle {
         if callback_active() {
             return default;
         }
+        // Monitor tab: one tick per callback that actually runs — the
+        // main-thread work (delegate tickets, actions, timers) the VM-side
+        // counters never see.
+        CALLBACKS_DISPATCHED.fetch_add(1, Ordering::Relaxed);
         let slot = deopt_trap::claim_jmp_slot();
         // SAFETY: as `eval` — `sigsetjmp` inline at this exact call site, whose
         // frame (this `dispatch_callback` invocation) stays live for the whole

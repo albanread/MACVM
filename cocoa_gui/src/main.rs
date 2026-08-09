@@ -11,6 +11,7 @@
 //! drains the UI worker's inbox on the main thread (§8). ⌘Q quits clean.
 
 mod boot;
+mod bridge_stats;
 mod canvas;
 mod colorize;
 mod complete;
@@ -48,6 +49,11 @@ struct DrainState {
     ui: VmHandle,
     inbox: HostedInbox,
     supervisor: PrimarySupervisor,
+    /// Monitor tab: the UI worker's row in the process-wide VM roster,
+    /// republished from `refresh_metrics` (main thread owns the handle, so
+    /// this is the one place its metrics may be sampled). Survives a CG9
+    /// rebuild — same role, same row.
+    ui_mon: std::sync::Arc<macvm::embed::VmMonitorSlot>,
     /// CG5: the previous tick's `bytes_allocated`, to derive a per-tick alloc
     /// RATE (the toolbar shows B/s, `VmMetrics` only carries the running
     /// total). `None` before the first sample (no rate yet, not zero).
@@ -68,7 +74,7 @@ struct DrainState {
 
 /// `1536` -> `"1.5K"`, base-1024, one decimal past the first suffix — the
 /// same compact style the WKWebView GUI's own toolbar uses for MEM/ALLOC.
-fn format_bytes(n: u64) -> String {
+pub(crate) fn format_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
     let mut v = n as f64;
     let mut u = 0;
@@ -147,6 +153,13 @@ fn refresh_metrics(st: &mut DrainState) {
     let used = m.eden_used + m.old_used;
     let mem_pct = ((used as f64 / cap as f64) * 100.0).round().clamp(0.0, 100.0) as i64;
 
+    // Monitor tab: the UI worker's own roster row — sampled here because the
+    // main thread owns the handle, at the same ~4 Hz the toolbar rides.
+    // BEFORE the exec below, deliberately: the Monitor's tick runs INSIDE
+    // that exec, and it must see a fresh UI heartbeat — published after, a
+    // starved drain cadence (primary stuck in a long doit stalls the beat
+    // wake) made the UI row read stale-hence-busy when only the primary was.
+    st.ui_mon.publish(st.ui.metrics());
     let doit = format!(
         "CocoaUI updateMetricsMem: '{mem}' jit: '{jit}' code: '{code}' alloc: '{alloc_rate}' gc: '{gc}' memPct: {mem_pct}."
     );
@@ -162,6 +175,9 @@ extern "C" fn drain_perform(info: *mut c_void) {
     // SAFETY: `info` is the `&mut *Box<DrainState>` main installed; this runs on
     // the main thread where nothing else borrows it concurrently.
     let st = unsafe { &mut *(info as *mut DrainState) };
+
+    // Monitor tab: count the pass + the beat gap (the bridge's own pulse).
+    bridge_stats::beat();
 
     // (CG9) Service a UI-worker rebuild request FIRST, before any envelope
     // dispatch — we run here on the main thread with the VM quiescent (never
@@ -250,6 +266,7 @@ extern "C" fn drain_perform(info: *mut c_void) {
         // here; the never-answerable ones are abandoned by `environmentRestarted`
         // below.
         while let Some(env) = st.inbox.poll() {
+            bridge_stats::envelope();
             let _ = st.ui.dispatch_hosted_envelope(env);
         }
         // Re-sync onto the fresh primary generation: re-point the reply link +
@@ -264,6 +281,7 @@ extern "C" fn drain_perform(info: *mut c_void) {
         let _ = st.ui.exec("CocoaUI environmentRestarted.");
     }
     while let Some(env) = st.inbox.poll() {
+        bridge_stats::envelope();
         if let Err(e) = st.ui.dispatch_hosted_envelope(env) {
             eprintln!("macvm-cocoa: UI worker drain error: {e}");
         }
@@ -435,6 +453,7 @@ fn main() {
         ui,
         inbox: link.hosted_inbox,
         supervisor: sup,
+        ui_mon: macvm::embed::monitor_register("ui".into(), "ui"),
         prev_alloc: None,
         ctl,
         // CG9 rebuild ingredients — the current peer id + sender the fresh VM

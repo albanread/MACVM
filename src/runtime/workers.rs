@@ -436,11 +436,22 @@ fn worker_main(
         return;
     };
     handle.install_worker_role(id, to_primary.clone());
+    // Monitor tab: this thread owns the handle, so it is the one place the
+    // worker's metrics can be sampled — published at every quiescent point
+    // (post-boot, post-dispatch). An idle worker's numbers are frozen, which
+    // is exactly right: nothing is running.
+    let mon = crate::embed::monitor_register(format!("worker {id}"), "worker");
+    mon.publish(handle.metrics());
     // From here on, everything the worker prints (Transcript, error traces)
     // reaches the primary's transcript instead of a stray stdout (M2).
     handle.set_transcript(Box::new(ForwardTranscript::to(id, to_primary.clone())));
     if let Some(src) = init {
-        if handle.exec(src).is_err() {
+        mon.set_busy(true);
+        let ok = handle.exec(src).is_ok();
+        mon.set_busy(false);
+        mon.publish(handle.metrics());
+        if !ok {
+            mon.mark_dead();
             let _ = to_primary.send(died_envelope(id));
             return;
         }
@@ -452,11 +463,19 @@ fn worker_main(
         // its state is suspect, so report death and unwind. The VmHandle
         // drops normally (heap unmapped) — pthread_exit is only for the
         // truly unrecoverable path inside the fatal machinery itself.
-        if handle.exec("Worker dispatchPending.").is_err() {
+        mon.set_busy(true);
+        let ok = handle.exec("Worker dispatchPending.").is_ok();
+        mon.set_busy(false);
+        mon.publish(handle.metrics());
+        if !ok {
+            mon.mark_dead();
             let _ = to_primary.send(died_envelope(id));
             return;
         }
     }
+    // Channel closed: the primary terminated us (or died). Retired, not
+    // crashed — same roster outcome either way.
+    mon.mark_dead();
 }
 
 /// Send bytes (prim 221). From the primary: to worker `id` (marking it dead

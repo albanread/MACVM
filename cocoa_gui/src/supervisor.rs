@@ -332,6 +332,15 @@ fn primary_generation_main(
     // registry). It boots compute workers from the same source (CG8).
     primary.set_worker_boot(world_boot.clone());
 
+    // Monitor tab: this generation's row in the process-wide VM roster. The
+    // label is constant across generations, so a respawn REVIVES the same
+    // row (monitor_register reuses a dead same-label slot) instead of
+    // accreting one per death. Published every beat below — the beat IS the
+    // heartbeat, so a row that stops aging means a primary stuck in guest
+    // code, which the Monitor renders as busy.
+    let mon = macvm::embed::monitor_register("primary".into(), "primary");
+    mon.publish(primary.metrics());
+
     // (CG10) The primary drives the game demos (only a primary can spawn the
     // compute workers ParallelMandel needs). Its GameCommands cross to the main
     // thread over the shared queue + run-loop wake — the same worker→main
@@ -367,7 +376,10 @@ fn primary_generation_main(
     // the ONLY signal a dead generation can send — and it fires ONLY on a real
     // fatal, never merely because the primary is busy in a long doit (the CG4
     // review's must-fix: a busy primary must never be respawned).
+    let mon_for_hook = mon.clone();
     macvm::embed::set_thread_fatal_hook(Box::new(move || {
+        // Runs just before `pthread_exit` — the only cleanup a fatal permits.
+        mon_for_hook.mark_dead();
         let _ = events.send(Event::Died);
     }));
 
@@ -400,7 +412,9 @@ fn primary_generation_main(
     // of File In's contract.
     let filein_birth = crate::filein::birth_stamp();
     while !stop.load(Ordering::Acquire) {
-        *metrics.lock().unwrap_or_else(|e| e.into_inner()) = primary.metrics();
+        let m = primary.metrics();
+        *metrics.lock().unwrap_or_else(|e| e.into_inner()) = m;
+        mon.publish(m);
         ui_wake();
         // (CG10) While a game runs, spin fast — a short inbox timeout so band
         // replies dispatch promptly — and run each frame step at TOP LEVEL here
@@ -478,6 +492,8 @@ fn primary_generation_main(
             ));
         }
     }
+    // Clean retire (Restart) — the next generation revives the row.
+    mon.mark_dead();
 }
 
 #[cfg(test)]
