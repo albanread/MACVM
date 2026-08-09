@@ -221,7 +221,7 @@ Object subclass: CocoaScript [
             ifTrue: [ ^self errorOn: cmd number: -10000
                            message: 'browse: the browser is not loaded' ].
         CocoaUI switchToView: #browser2.
-        browser selectClass: name.
+        browser revealClass: name.
         sel := self argument: 'selector' of: cmd.
         sel isNil ifFalse: [ browser selectMethod: sel ].
         ^nil

@@ -949,7 +949,44 @@ Object subclass: CocoaBrowser2 [
                     SelectedPackage := pkg. SelectedPackageName := aName. Classes := pkg at: 2.
                     self clearClassSelection. self deferReload: ClassTable. ^self ] ] ].
     ]
-    CocoaBrowser2 class >> scriptSelectClass: aName [ self selectClass: aName ]
+    CocoaBrowser2 class >> scriptSelectClass: aName [ self revealClass: aName ]
+
+    "Arriving from OUTSIDE the browser — Find''s Go to Definition, AppleScript
+     `browse`, any script — the class list must catch up too. `selectClass:`
+     alone fills the protocol/method panes and the source, but it never touches
+     the package tree or the class list, so the found class''s methods appeared
+     under whichever package happened to be selected before, with nothing lit
+     in the class column. This finds the class''s own package, makes it the
+     selection, and highlights the class row before selecting it.
+
+     The class-list CLICK path deliberately does NOT come through here: it is
+     already in the right package, and reloading a table from inside its own
+     selection callback fights the click."
+    CocoaBrowser2 class >> revealClass: aName [
+        | idx |
+        aName isNil ifTrue: [ ^self ].
+        Tree isNil ifFalse: [
+            Tree do: [ :ln |
+                (ln at: 2) do: [ :pkg |
+                    ((pkg at: 2) includes: aName) ifTrue: [
+                        SelectedPackage := pkg.
+                        SelectedPackageName := pkg at: 1.
+                        Classes := pkg at: 2 ] ] ] ].
+        self selectClass: aName.
+        idx := 0.
+        Classes isNil ifFalse: [
+            1 to: Classes size do: [ :k | (Classes at: k) = aName ifTrue: [ idx := k ] ] ].
+        (idx = 0 or: [ ClassTable isNil ]) ifTrue: [ ^self ].
+        "Reload SYNCHRONOUSLY here, not through deferReload: — a row index
+         only means something once the table already holds the new package''s
+         classes, and a deferred reload would land after this selection and
+         wipe it."
+        ClassTable onMain reloadData.
+        ClassTable onMain selectRowIndexes: ((Cocoa classNamed: 'NSIndexSet') onMain
+                                                 indexSetWithIndex: idx - 1)
+                   byExtendingSelection: false.
+        ClassTable onMain scrollRowToVisible: idx - 1
+    ]
     CocoaBrowser2 class >> scriptSelectProtocol: aName [
         | i |
         Protocols isNil ifTrue: [ ^self ].

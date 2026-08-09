@@ -177,7 +177,7 @@ Object subclass: CocoaFind [
         b2 := Worker classNamed: #CocoaBrowser2.
         b2 isNil ifTrue: [ ^self ].
         CocoaUI switchToView: #browser2.
-        b2 selectClass: cls.
+        b2 revealClass: cls.
         Kind == #definitions ifFalse: [
             sel := (r at: 2) isNil ifTrue: [ self searchTerm ] ifFalse: [ r at: 2 ].
             b2 selectMethod: sel ].
