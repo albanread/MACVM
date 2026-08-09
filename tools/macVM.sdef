@@ -90,6 +90,10 @@
                 description="The package the browser is showing, or empty.">
         <cocoa key="scriptSelectedPackage"/>
       </property>
+      <property name="debugger state" code="MvDs" type="text" access="r"
+                description="The halted debugger's full report — reason, stack frames and the current line — or RUNNING when nothing is halted.">
+        <cocoa key="scriptDebuggerState"/>
+      </property>
       <property name="busy" code="MvBs" type="boolean" access="r"
                 description="True while the Smalltalk image is evaluating something.">
         <cocoa key="scriptBusy"/>
@@ -166,6 +170,37 @@
              description="Walk the world's history back one step for the most recently edited class or method, then reload.  The previous source returns as a new version, so the revert is itself undoable.">
       <cocoa class="MacvmRevertLastCommand"/>
       <result type="text" description="What was reverted."/>
+    </command>
+
+    <!-- Debugger: halt Smalltalk, step through it, inspect it. -->
+
+    <command name="debug" code="MvSuMvDb"
+             description="Send one command to the halted debugger: step, next (step over), finish (step out), continue, abort, frame N, or print &lt;expression&gt;.  Answers the debugger state after the command.">
+      <cocoa class="MacvmDebugCommand"/>
+      <direct-parameter type="text"
+                        description="step | next | finish | continue | abort | frame N | print &lt;expr&gt;"/>
+      <result type="text" description="The debugger state (RUNNING when not halted)."/>
+    </command>
+
+    <command name="set breakpoint" code="MvSuMvSB"
+             description="Break on entry to a method.  The next call halts Smalltalk and opens the Debugger.">
+      <cocoa class="MacvmSetBreakpointCommand"/>
+      <direct-parameter type="text" description="A class name, e.g. &quot;Integer&quot;."/>
+      <parameter name="selector" code="MvSl" type="text"
+                 description="The method to break on, e.g. &quot;factorial&quot;.">
+        <cocoa key="selector"/>
+      </parameter>
+      <result type="text" description="What was planted."/>
+    </command>
+
+    <command name="clear breakpoint" code="MvSuMvCB"
+             description="Remove a break-on-entry planted by `set breakpoint`.">
+      <cocoa class="MacvmClearBreakpointCommand"/>
+      <direct-parameter type="text" description="A class name."/>
+      <parameter name="selector" code="MvSl" type="text" description="The method.">
+        <cocoa key="selector"/>
+      </parameter>
+      <result type="text" description="What was cleared."/>
     </command>
 
     <command name="clear transcript" code="MvSuMvCT"

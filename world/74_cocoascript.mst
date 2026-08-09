@@ -39,7 +39,8 @@ Object subclass: CocoaScript [
     CocoaScript class >> scriptKeys [
         ^#('scriptCurrentView' 'scriptAppearance' 'scriptTranscript'
            'scriptWorkspaceText' 'scriptTranscriptCollapsed' 'scriptBusy'
-           'scriptSelectedClass' 'scriptSelectedMethod' 'scriptSelectedPackage')
+           'scriptSelectedClass' 'scriptSelectedMethod' 'scriptSelectedPackage'
+           'scriptDebuggerState')
     ]
 
     "Called by AppKit (through the #app role) for every `application` property
@@ -185,6 +186,65 @@ Object subclass: CocoaScript [
     ]
     CocoaScript class >> scriptSelectedPackage [
         ^self browserOr: [ :b | b selectedPackageName ]
+    ]
+
+    "── the debugger (DBG4), scriptable ─────────────────────────────────
+     Everything the Debugger tab's buttons do, driven by name. The halt
+     itself is a PARKED loop on the primary: `debug` posts one command into
+     it and answers the state, so a script steps by sending a command and
+     reading the state back — exactly what the buttons do, minus the mouse."
+    CocoaScript class >> scriptDebuggerState [
+        "dbgReport answers an NSString ObjcRef; a `text` property must cross
+         as a Smalltalk String, so decode it here rather than handing AppleScript
+         a wrapper it cannot marshal."
+        | r out |
+        "NO `onMain`: a KVC accessor is ALREADY on the main thread (AppKit
+         called us there), and hopping again from inside that callback fails
+         with 'no main run loop?' — which AppleScript reports as a bare -10000.
+         Every other accessor in this file is plain Smalltalk for the same
+         reason."
+        r := CocoaUI hostService send: 'dbgReport'.
+        r isNil ifTrue: [ ^'RUNNING' ].
+        out := r asString.
+        r release.
+        ^(out isNil or: [ out isEmpty ]) ifTrue: [ 'RUNNING' ] ifFalse: [ out ]
+    ]
+
+    CocoaScript class >> performDebugCommand: cmd [
+        | line |
+        line := cmd sendString: 'directParameter'.
+        (line isNil or: [ line isEmpty ]) ifTrue: [
+            ^self errorOn: cmd number: -1701
+                   message: 'debug: say step, next, finish, continue, abort, frame N, or print <expr>' ].
+        CocoaUI hostService send: 'dbgCommand:' with: (Cocoa nsString: line).
+        "The halt loop republishes its report as it processes the command;
+         answering the state here is what makes a script able to step and
+         look, step and look."
+        ^self scriptDebuggerState
+    ]
+
+    CocoaScript class >> performSetBreakpointCommand: cmd [
+        ^self breakpointFor: cmd set: true
+    ]
+    CocoaScript class >> performClearBreakpointCommand: cmd [
+        ^self breakpointFor: cmd set: false
+    ]
+    CocoaScript class >> breakpointFor: cmd set: setIt [
+        | cls sel |
+        cls := cmd sendString: 'directParameter'.
+        sel := self argument: 'selector' of: cmd.
+        (cls isNil or: [ cls isEmpty ]) ifTrue: [
+            ^self errorOn: cmd number: -1701 message: 'breakpoint: no class name given' ].
+        (sel isNil or: [ sel isEmpty ]) ifTrue: [
+            ^self errorOn: cmd number: -1701 message: 'breakpoint: no selector given' ].
+        setIt
+            ifTrue: [ CocoaUI hostService
+                        send: 'setBreakpointClass:selector:'
+                        with: (Cocoa nsString: cls) with: (Cocoa nsString: sel) ]
+            ifFalse: [ CocoaUI hostService
+                        send: 'clearBreakpointClass:selector:'
+                        with: (Cocoa nsString: cls) with: (Cocoa nsString: sel) ].
+        ^(setIt ifTrue: [ 'break on ' ] ifFalse: [ 'cleared break on ' ]) , cls , '>>' , sel
     ]
 
     CocoaScript class >> sweepTicks [ ^SweepTicks isNil ifTrue: [ 0 ] ifFalse: [ SweepTicks ] ]

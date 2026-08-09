@@ -806,6 +806,14 @@ script_getter!(imp_script_transcript, "scriptTranscript");
 script_getter!(imp_script_workspace_text, "scriptWorkspaceText");
 script_getter!(imp_script_transcript_collapsed, "scriptTranscriptCollapsed");
 script_getter!(imp_script_busy, "scriptBusy");
+// Browser + debugger read-backs. EVERY key named in `CocoaScript scriptKeys`
+// needs a getter REGISTERED here too: delegateHandlesKey: answering YES only
+// tells KVC to send the accessor, and a key with no method here dies as
+// `valueForUndefinedKey:` — which AppleScript reports as a bare -10000.
+script_getter!(imp_script_selected_class, "scriptSelectedClass");
+script_getter!(imp_script_selected_method, "scriptSelectedMethod");
+script_getter!(imp_script_selected_package, "scriptSelectedPackage");
+script_getter!(imp_script_debugger_state, "scriptDebuggerState");
 
 script_setter!(imp_set_script_current_view, "setScriptCurrentView:");
 script_setter!(imp_set_script_appearance, "setScriptAppearance:");
@@ -871,6 +879,26 @@ fn app_delegate_class() -> Option<*mut c_void> {
                     (
                         "scriptCurrentView",
                         imp_ptr!(imp_script_current_view, ImpId0),
+                        "@@:",
+                    ),
+                    (
+                        "scriptSelectedClass",
+                        imp_ptr!(imp_script_selected_class, ImpId0),
+                        "@@:",
+                    ),
+                    (
+                        "scriptSelectedMethod",
+                        imp_ptr!(imp_script_selected_method, ImpId0),
+                        "@@:",
+                    ),
+                    (
+                        "scriptSelectedPackage",
+                        imp_ptr!(imp_script_selected_package, ImpId0),
+                        "@@:",
+                    ),
+                    (
+                        "scriptDebuggerState",
+                        imp_ptr!(imp_script_debugger_state, ImpId0),
                         "@@:",
                     ),
                     (
@@ -1007,6 +1035,10 @@ script_command!(imp_perform_restore_snapshot, "performRestoreSnapshotCommand:");
 script_command!(imp_perform_compact_world, "performCompactWorldCommand:");
 script_command!(imp_perform_revert_world, "performRevertWorldCommand:");
 script_command!(imp_perform_revert_last, "performRevertLastCommand:");
+// Debugger (halt, step, inspect) — the DBG4 surface, scriptable.
+script_command!(imp_perform_debug, "performDebugCommand:");
+script_command!(imp_perform_set_break, "performSetBreakpointCommand:");
+script_command!(imp_perform_clear_break, "performClearBreakpointCommand:");
 
 static SCRIPT_COMMAND_CLASSES: OnceLock<()> = OnceLock::new();
 
@@ -1052,6 +1084,15 @@ pub fn register_script_commands() -> bool {
             (
                 "MacvmRevertLastCommand",
                 imp_ptr!(imp_perform_revert_last, ImpId0),
+            ),
+            ("MacvmDebugCommand", imp_ptr!(imp_perform_debug, ImpId0)),
+            (
+                "MacvmSetBreakpointCommand",
+                imp_ptr!(imp_perform_set_break, ImpId0),
+            ),
+            (
+                "MacvmClearBreakpointCommand",
+                imp_ptr!(imp_perform_clear_break, ImpId0),
             ),
         ] {
             register_class_under(
