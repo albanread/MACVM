@@ -54,6 +54,62 @@ Object subclass: Sprite [
     ]
 ]
 
+"--- GameFrame: the parameters one frame hands the game. Defined before
+ GamePane so GamePane can reference it (name resolution is compile-time,
+ per file). ---"
+"I am the bundle of parameters the engine hands a game once per frame:
+ which keys are held, where the pointer is and which buttons are down. A
+ step block can take me as its argument — `onStep: [ :frame | ... frame
+ mouseX ... ]` — or ignore me and ask the pane instead (`pane mouseX`),
+ which forwards to whichever frame is current. I exist so that giving games
+ a NEW per-frame parameter means adding an instance variable here, not
+ another class variable on GamePane: the pane's class-side shell is merged
+ into the image on every reseed, and growing it once already cost a
+ world-boot regression (docs/gamepane_design.md)."
+Object subclass: GameFrame [
+    | keys mouseX mouseY mouseButtons |
+
+    GameFrame class >> new [ ^super new initFrame ]
+
+    initFrame [
+        "A frame nobody has filled in yet: no keys held, and a pointer that has
+         never been over the pane (-1, the same 'nowhere' the GUI sends before
+         the mouse arrives)."
+        keys := 0. mouseX := -1. mouseY := -1. mouseButtons := 0.
+        ^self
+    ]
+
+    keys: k [
+        "Record just the held-key mask — the shape the WKWebView GUI sends,
+         which has no mouse to report. Leaves the pointer as it was."
+        keys := k.
+        ^self
+    ]
+
+    keys: k mouseX: mx y: my buttons: mb [
+        "Record a whole frame's input — what the Cocoa GUI's frame timer sends."
+        keys := k. mouseX := mx. mouseY := my. mouseButtons := mb.
+        ^self
+    ]
+
+    keyHeld: keyCode [
+        "Is game key `keyCode` (GamePane class>>keyLeft etc.) held this frame?"
+        ^(keys bitAnd: (1 bitShift: keyCode)) ~= 0
+    ]
+
+    "The pointer, in PANE PIXELS from the top-left — the same coordinates
+     point:y:color: and blit: use, converted by the GUI from the window's own
+     size so they stay right when the game window is resized. Buttons are
+     LEVEL-triggered (held, not clicked): a demo wanting 'the moment it went
+     down' compares against what it saw last frame, exactly as keyHeld: asks."
+    mouseX [ "Pointer x in pane pixels (-1 before it enters)." ^mouseX ]
+    mouseY [ "Pointer y in pane pixels (-1 before it enters)." ^mouseY ]
+    mouseButtons [ "Raw button bitmask: 1 left, 2 right." ^mouseButtons ]
+    mouseDown [ "Is the left button held?" ^(mouseButtons bitAnd: 1) ~= 0 ]
+    mouseRightDown [ "Is the right button held?" ^(mouseButtons bitAnd: 2) ~= 0 ]
+    mouseInPane [ "Has the pointer been over the pane at all yet?" ^mouseX >= 0 ]
+]
+
 "I drive the native game pane from Smalltalk: a low-resolution palette
  display with drawing primitives, sprites, sound, keyboard input and a
  frame loop. Draw with cls:, point:y:color:, line:y:to:y:color:,
@@ -65,11 +121,17 @@ Object subclass: Sprite [
  one moment the GUI shows it — plus optional cleanup with onReset:; then
  `run` starts the GUI-owned frame timer and `stop` ends it. Inside the
  step block, poll held keys with keyHeld: and my class-side key constants
- (keyLeft, keyRight, keyUp, keyDown, keyA, keyB). In a headless VM every
- game primitive silently fails, so I am harmless to load outside the GUI.
- Breakout and MandelZoom are complete worked examples."
+ (keyLeft, keyRight, keyUp, keyDown, keyA, keyB), and the pointer with
+ mouseX/mouseY (pane pixels, top-left origin) plus mouseDown/mouseRightDown.
+ In a headless VM every game primitive silently fails, so I am harmless to
+ load outside the GUI. Breakout, MandelZoom and Life are complete worked
+ examples."
 Object subclass: GamePane [
-    <classVars: StepBlock Keys NextId ResetBlock>
+    "One slot for the whole per-frame parameter set (a GameFrame), not one per
+     parameter: every class variable here has to survive the image's
+     shell-merge on reseed, so the list should stop growing as the engine
+     learns new inputs."
+    <classVars: StepBlock NextId ResetBlock Frame>
 
     "── palettes ─────────────────────────────────────────────────────────
      A fresh pane arrives with COLOURS ALREADY IN IT. Before this, a new
@@ -301,7 +363,18 @@ Object subclass: GamePane [
 
     onStep: aBlock [
         "Register the per-frame block. It is held in a class variable, so it is
-         GC-rooted for the whole game (and so is everything it closes over)."
+         GC-rooted for the whole game (and so is everything it closes over).
+
+         Take an argument to be handed this frame's parameters — the keys and
+         the pointer, as a GameFrame:
+
+             pane onStep: [ :frame |
+                 frame mouseDown ifTrue: [ ... frame mouseX ... ] ]
+
+         or take none and reach the same values through the pane
+         (`pane mouseDown`, `pane keyHeld:`), which is what the older demos
+         do. Both are supported; the argument form is the one that keeps
+         working unchanged as the engine gains new per-frame inputs."
         StepBlock := aBlock.
         ^self
     ]
@@ -333,6 +406,18 @@ Object subclass: GamePane [
          frame? Only meaningful inside the step block."
         ^GamePane keyHeld: keyCode
     ]
+
+    "--- the mouse, from inside a step block that took no argument ---
+     `pane mouseDown ifTrue: [ ... pane mouseX ... pane mouseY ... ]`. Each of
+     these forwards to the current GameFrame, where the real documentation
+     lives; a block written `[ :frame | ... ]` asks that object directly
+     instead, and is the form that survives the engine gaining new inputs."
+
+    mouseX [ "Pointer x in pane pixels this frame (-1 before it enters)." ^GamePane mouseX ]
+    mouseY [ "Pointer y in pane pixels this frame (-1 before it enters)." ^GamePane mouseY ]
+    mouseDown [ "Is the left button held this frame?" ^GamePane mouseDown ]
+    mouseRightDown [ "Is the right button held this frame?" ^GamePane mouseRightDown ]
+    mouseInPane [ "Has the pointer been over the pane yet?" ^GamePane mouseInPane ]
 
     "--- sprites (docs/gamepane_design.md) ---"
 
@@ -407,18 +492,55 @@ Object subclass: GamePane [
         ^self linePaletteAt: line index: i rgb: ((r bitShift: 16) + (g bitShift: 8) + b)
     ]
 
+    GamePane class >> frame [
+        "This frame's parameters — the single object the engine fills in each
+         tick and hands to the game. Created on demand, so a headless VM that
+         never steps still answers every query sensibly."
+        Frame isNil ifTrue: [ Frame := GameFrame new ].
+        ^Frame
+    ]
+
     GamePane class >> stepWithKeys: mask [
-        "Run one frame: record the held-key bitmask, then run the step block.
-         Called by the GUI's frame timer via a GameStep request, once per tick
-         on an idle worker (never nested)."
-        Keys := mask.
-        StepBlock isNil ifFalse: [ StepBlock value ].
+        "Run one frame from a held-key mask alone — the WKWebView GUI's shape,
+         and what the headless tests drive. Leaves the pointer as it was."
+        self frame keys: mask.
+        ^self runStep
+    ]
+    GamePane class >> stepWithKeys: mask mouseX: mx y: my buttons: mb [
+        "Run one frame with the mouse as well as the keys — what the Cocoa
+         GUI's frame timer sends. Filling the frame BEFORE running the block
+         means the game sees this frame's input, not the last one's."
+        self frame keys: mask mouseX: mx y: my buttons: mb.
+        ^self runStep
+    ]
+    GamePane class >> runStep [
+        "Run the registered step block, handing it this frame's parameters if
+         it takes an argument. Both shapes are first-class: `onStep: [ ... ]`
+         reads the frame through the pane (`pane mouseX`), while
+         `onStep: [ :frame | ... ]` is given it directly — which is the form
+         that stays honest as the engine learns new per-frame inputs, since
+         they arrive as messages on the frame rather than new global state.
+         Called once per tick on an idle worker (never nested)."
+        StepBlock isNil ifTrue: [ ^self ].
+        StepBlock numArgs = 1
+            ifTrue: [ StepBlock value: self frame ]
+            ifFalse: [ StepBlock value ].
         ^self
     ]
+
+    "--- input, class side: every one of these now forwards to the current
+     frame, so `GamePane keyHeld:` keeps meaning exactly what it did for
+     Breakout, Worms, Galaxigans and FftScope. ---"
+
+    GamePane class >> mouseX [ ^self frame mouseX ]
+    GamePane class >> mouseY [ ^self frame mouseY ]
+    GamePane class >> mouseButtons [ ^self frame mouseButtons ]
+    GamePane class >> mouseDown [ "Is the LEFT button held this frame?" ^self frame mouseDown ]
+    GamePane class >> mouseRightDown [ "Is the RIGHT button held this frame?" ^self frame mouseRightDown ]
+    GamePane class >> mouseInPane [ "Has the pointer been over the pane yet?" ^self frame mouseInPane ]
     GamePane class >> keyHeld: keyCode [
-        "Bit `keyCode` of the current held-key mask."
-        Keys isNil ifTrue: [ ^false ].
-        ^(Keys bitAnd: (1 bitShift: keyCode)) ~= 0
+        "Bit `keyCode` of this frame's held-key mask."
+        ^self frame keyHeld: keyCode
     ]
     GamePane class >> reset [
         "Run and clear whatever cleanup a demo registered via `onReset:` FIRST
@@ -428,7 +550,10 @@ Object subclass: GamePane [
          like any other guest error."
         ResetBlock ifNotNil: [ ResetBlock value. ResetBlock := nil ].
         StepBlock := nil.
-        Keys := 0.
+        "Drop the frame entirely rather than zeroing fields one by one — the
+         next session gets a fresh one, and this line does not need editing
+         when the frame learns a new parameter."
+        Frame := nil.
     ]
     GamePane class >> nextId [
         "A fresh monotonic sprite id. The GUI registry maps it to MacGamePane's

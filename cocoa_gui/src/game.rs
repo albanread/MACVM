@@ -14,8 +14,9 @@
 //! tracking-safe (§8) and keeps the IDE window live alongside it, for free.
 //!
 //! Frame loop: the primary's `GamePane>>run` emits `StartLoop` → main opens the
-//! window + starts the timer → each tick submits `GamePane stepWithKeys:` to
-//! the primary (single-outstanding: not until the last frame's `Present` landed)
+//! window + starts the timer → each tick submits
+//! `GamePane stepWithKeys:mouseX:y:buttons:` (this frame's held keys and mouse)
+//! to the primary (single-outstanding: not until the last frame's `Present` landed)
 //! → the step's draw commands stream back over the sink → main applies them,
 //! and the frame's own `Present` shows it.
 
@@ -61,6 +62,15 @@ static STOP_DUE: AtomicBool = AtomicBool::new(false);
 /// This tick's held-key bitmask (bit 0=Left…5=B), read on the tick, sent with
 /// the step.
 static GAME_KEY_MASK: AtomicI64 = AtomicI64::new(0);
+/// This tick's mouse, sent with the step alongside the keys. Position is in
+/// PANE PIXELS (not view points and not the engine's normalized fraction):
+/// the tick is the one place that knows both the fraction and this session's
+/// pane size, so it converts once and Smalltalk gets coordinates in the same
+/// space as every drawing method. `-1` means "no pane, nothing sensible to
+/// report". Buttons are a bitmask: bit 0 = left, bit 1 = right.
+static GAME_MOUSE_X: AtomicI64 = AtomicI64::new(-1);
+static GAME_MOUSE_Y: AtomicI64 = AtomicI64::new(-1);
+static GAME_MOUSE_BUTTONS: AtomicI64 = AtomicI64::new(0);
 /// A demo entry doit to launch, run TOP-LEVEL on the primary's supervisor loop
 /// (never a nested `uiReq`/`primEvalDoit` — that corrupts the interp-regs-mirror
 /// root and the next frame's compile-GC scavenge double-copies). One demo at a
@@ -237,6 +247,11 @@ fn close_window() {
     REQ_W.store(PANE_W as i64, Ordering::Release);
     REQ_H.store(PANE_H as i64, Ordering::Release);
     REQ_FPS.store(DEFAULT_FPS, Ordering::Release);
+    // Forget where the mouse was; the next demo's first frame should not see a
+    // pointer position left behind by this one.
+    GAME_MOUSE_X.store(-1, Ordering::Release);
+    GAME_MOUSE_Y.store(-1, Ordering::Release);
+    GAME_MOUSE_BUTTONS.store(0, Ordering::Release);
     GAME.with(|cell| {
         if let Some(g) = cell.borrow_mut().take() {
             objc::send0(g.timer, objc::sel("invalidate"));
@@ -530,6 +545,142 @@ pub fn press_close_button() -> bool {
     })
 }
 
+/// Deliver a synthetic mouse press or release at a PANE PIXEL, for scripted
+/// verification of the mouse path (`gamemouse` on the control channel) — the
+/// same role `press_close_button` plays for the red close button. Main-thread
+/// only (the control drain calls this). Returns false if no game window is open.
+///
+/// This routes through `-[NSApplication sendEvent:]` rather than calling the
+/// view's `mouseDown:` directly, ON PURPOSE: the interesting question is
+/// whether AppKit delivers a mouse event to MacGamePane's key-capable view at
+/// all, and calling the IMP by hand would assume the very thing under test.
+/// What it does NOT cover is the hardware/WindowServer leg in front of that —
+/// a real click also proves the window is front and accepting input.
+///
+/// `button`: 0 = left, 1 = right. `down`: press, else release.
+pub fn synth_mouse(pane_x: i64, pane_y: i64, button: i64, down: bool) -> bool {
+    // NSEventType: LeftMouseDown 1, LeftMouseUp 2, RightMouseDown 3,
+    // RightMouseUp 4.
+    let event_type: u64 = match (button, down) {
+        (0, true) => 1,
+        (0, false) => 2,
+        (_, true) => 3,
+        (_, false) => 4,
+    };
+    GAME.with(|cell| {
+        let borrowed = cell.borrow();
+        let Some(g) = borrowed.as_ref() else {
+            return false;
+        };
+        let window = objc::send0(g.win.view, objc::sel("window"));
+        if window.is_null() {
+            return false;
+        }
+        // Pane pixel -> the CENTRE of that pixel as a fraction of the pane,
+        // then up to the view's real size in points (which is not the pane
+        // size once the window has been resized), then flipped: an unflipped
+        // NSView and the window's base coordinates both count y from the
+        // BOTTOM, while a pane pixel counts from the top.
+        let bounds = objc::send0_rect(g.win.view, objc::sel("bounds"));
+        let fx = (pane_x as f64 + 0.5) / g.w as f64;
+        let fy = (pane_y as f64 + 0.5) / g.h as f64;
+        let x = bounds.x + fx * bounds.w;
+        let y = bounds.y + (1.0 - fy) * bounds.h;
+        let event = objc::send_mouse_event(
+            objc::get_class("NSEvent"),
+            objc::sel(
+                "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:\
+                 eventNumber:clickCount:pressure:",
+            ),
+            event_type,
+            x,
+            y,
+            0,
+            0.0,
+            objc::window_number(window),
+            objc::NIL,
+            0,
+            1,
+            if down { 1.0 } else { 0.0 },
+        );
+        if event.is_null() {
+            return false;
+        }
+        // Send to the GAME WINDOW, not to NSApp. `-[NSApplication sendEvent:]`
+        // routes a key event to whichever window is KEY, so with the IDE
+        // window in front a scripted keystroke lands in the documentation
+        // browser instead of the game (observed exactly that). The window's
+        // own `sendEvent:` still runs AppKit's real dispatch — hit-testing for
+        // mouse, first responder for keys — into the view under test.
+        objc::send1_id(window, objc::sel("sendEvent:"), event);
+        true
+    })
+}
+
+/// The game window's window number, for a scripted screenshot of THAT window
+/// (the IDE window is often still key, so `snapshot_client_area`'s `keyWindow`
+/// would photograph the wrong one). `None` if no game window is open.
+pub fn game_window_number() -> Option<i64> {
+    GAME.with(|cell| {
+        let borrowed = cell.borrow();
+        let g = borrowed.as_ref()?;
+        let window = objc::send0(g.win.view, objc::sel("window"));
+        if window.is_null() {
+            return None;
+        }
+        Some(objc::window_number(window))
+    })
+}
+
+/// Deliver a synthetic key press or release to the game window, for scripted
+/// verification (`gamekey` on the control channel) — the keyboard twin of
+/// [`synth_mouse`], and the way a script can pause a demo before drawing on it.
+/// `key_code` is a macOS virtual key code (49 = space). Main-thread only.
+pub fn synth_key(key_code: u16, down: bool, characters: &str) -> bool {
+    // NSEventType: KeyDown 10, KeyUp 11.
+    let event_type: u64 = if down { 10 } else { 11 };
+    GAME.with(|cell| {
+        let borrowed = cell.borrow();
+        let Some(g) = borrowed.as_ref() else {
+            return false;
+        };
+        let window = objc::send0(g.win.view, objc::sel("window"));
+        if window.is_null() {
+            return false;
+        }
+        let chars = objc::nsstring(characters);
+        let event = objc::send_key_event(
+            objc::get_class("NSEvent"),
+            objc::sel(
+                "keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:\
+                 characters:charactersIgnoringModifiers:isARepeat:keyCode:",
+            ),
+            event_type,
+            0.0,
+            0.0,
+            0,
+            0.0,
+            objc::window_number(window),
+            objc::NIL,
+            chars,
+            chars,
+            false,
+            key_code,
+        );
+        if event.is_null() {
+            return false;
+        }
+        // Send to the GAME WINDOW, not to NSApp. `-[NSApplication sendEvent:]`
+        // routes a key event to whichever window is KEY, so with the IDE
+        // window in front a scripted keystroke lands in the documentation
+        // browser instead of the game (observed exactly that). The window's
+        // own `sendEvent:` still runs AppKit's real dispatch — hit-testing for
+        // mouse, first responder for keys — into the view under test.
+        objc::send1_id(window, objc::sel("sendEvent:"), event);
+        true
+    })
+}
+
 /// Called by the PRIMARY's supervisor loop each iteration: the next thing to
 /// `exec` TOP-LEVEL (never nested — a nested entry corrupts the interp-regs
 /// mirror root, crashing the next frame's compile-GC). Priority: stop the
@@ -555,7 +706,12 @@ pub fn poll_primary_step() -> Option<String> {
         return None;
     }
     let mask = GAME_KEY_MASK.load(Ordering::Relaxed);
-    Some(format!("GamePane stepWithKeys: {mask}"))
+    let mx = GAME_MOUSE_X.load(Ordering::Relaxed);
+    let my = GAME_MOUSE_Y.load(Ordering::Relaxed);
+    let mb = GAME_MOUSE_BUTTONS.load(Ordering::Relaxed);
+    Some(format!(
+        "GamePane stepWithKeys: {mask} mouseX: {mx} y: {my} buttons: {mb}"
+    ))
 }
 
 // ── the frame timer's target (an ObjC object with a `gameTick:` method) ──────
@@ -578,8 +734,32 @@ extern "C" fn game_tick(_this: objc::Id, _cmd: objc::Sel, _timer: objc::Id) {
         }
     }
     GAME_KEY_MASK.store(mask, Ordering::Relaxed);
+    read_mouse_into_pane_pixels();
     STEP_DUE.store(true, Ordering::Release);
     objc::wake_main_runloop();
+}
+
+/// Turn the engine's normalized mouse position into this session's pane pixels
+/// and stash it for the next step. Runs on the main thread (the timer IMP), the
+/// only place `GAME` — and so the session's actual pane size — is reachable;
+/// `poll_primary_step` runs on the primary's supervisor thread and just reads
+/// the atomics, exactly as it already does for the key mask.
+///
+/// The right edge is the reason for the `min`: a fraction of exactly 1.0 (the
+/// clamp in `record_position`, or a click on the last pixel column) would
+/// otherwise index one past the last cell.
+fn read_mouse_into_pane_pixels() {
+    let (fx, fy, left, right) = macgamepane_graphics::input::mouse_state();
+    let (px, py) = GAME.with(|cell| match cell.borrow().as_ref() {
+        Some(g) => (
+            ((fx * g.w as f64) as i64).min(g.w as i64 - 1),
+            ((fy * g.h as f64) as i64).min(g.h as i64 - 1),
+        ),
+        None => (-1, -1),
+    });
+    GAME_MOUSE_X.store(px, Ordering::Relaxed);
+    GAME_MOUSE_Y.store(py, Ordering::Relaxed);
+    GAME_MOUSE_BUTTONS.store(i64::from(left) | (i64::from(right) << 1), Ordering::Relaxed);
 }
 
 /// Register a `MacvmGameTimer` class with the `gameTick:` method once, and

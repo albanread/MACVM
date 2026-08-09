@@ -166,6 +166,58 @@ pub fn serve(rx: &Receiver<CtlReq>, ui: &mut macvm::embed::VmHandle) {
         } else if req.cmd == "stopgame" {
             crate::game::request_stop();
             "OK game stopped".to_string()
+        } else if let Some(rest) = req.cmd.strip_prefix("gamemouse ") {
+            // Scripted mouse for the game pane: `gamemouse <x> <y> <button>
+            // <down|up>` with x/y in PANE PIXELS. Same role as `gameclose` —
+            // exercise a real AppKit path (here `sendEvent:` into the game
+            // view) rather than reaching past it, so a script can prove the
+            // pointer reaches Smalltalk and lands on the cell it should.
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            match (
+                f.first().and_then(|v| v.parse::<i64>().ok()),
+                f.get(1).and_then(|v| v.parse::<i64>().ok()),
+                f.get(2).and_then(|v| v.parse::<i64>().ok()),
+                f.get(3),
+            ) {
+                (Some(x), Some(y), Some(button), Some(&updown)) => {
+                    let down = updown == "down";
+                    if crate::game::synth_mouse(x, y, button, down) {
+                        format!("OK mouse {} at {x},{y}", if down { "down" } else { "up" })
+                    } else {
+                        "ERR no game window".to_string()
+                    }
+                }
+                _ => "ERR usage: gamemouse <x> <y> <button 0|1> <down|up>".to_string(),
+            }
+        } else if let Some(path) = req.cmd.strip_prefix("snapgame ") {
+            // Photograph the GAME window specifically. `snap` resolves
+            // keyWindow, which is the IDE window whenever it still holds focus
+            // — so a script verifying a demo needs to name the window it means.
+            match crate::game::game_window_number() {
+                Some(wid) if crate::objc::snapshot_window(wid, path.trim()) => "OK".to_string(),
+                Some(_) => "ERR capture failed".to_string(),
+                None => "ERR no game window".to_string(),
+            }
+        } else if let Some(rest) = req.cmd.strip_prefix("gamekey ") {
+            // `gamekey <virtual-keycode> <down|up>` — e.g. `gamekey 49 down`
+            // for space. Lets a script pause a demo before driving the mouse
+            // at it, and proves the key path the same way `gamemouse` proves
+            // the pointer one.
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            match (
+                f.first().and_then(|v| v.parse::<u16>().ok()),
+                f.get(1),
+            ) {
+                (Some(code), Some(&updown)) => {
+                    let down = updown == "down";
+                    if crate::game::synth_key(code, down, " ") {
+                        format!("OK key {code} {}", if down { "down" } else { "up" })
+                    } else {
+                        "ERR no game window".to_string()
+                    }
+                }
+                _ => "ERR usage: gamekey <keycode> <down|up>".to_string(),
+            }
         } else if req.cmd == "gameclose" {
             // CG10: exercise the red close-button path end-to-end — send the game
             // window a real `performClose:`, which fires our `windowWillClose:`

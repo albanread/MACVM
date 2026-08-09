@@ -2335,6 +2335,278 @@ mod tests {
     }
 
     #[test]
+    fn a_step_block_may_take_the_frame_as_a_parameter_or_take_none() {
+        // The per-frame parameters are ONE object (GameFrame) held in ONE
+        // GamePane class variable, rather than a class variable per input —
+        // so teaching the engine a new input is an instance variable there,
+        // not another slot on GamePane's class-side shell (which every image
+        // reseed has to merge, and which has cost a world-boot regression
+        // before). Both step-block shapes must work: the argument form gets
+        // the frame directly, the older no-argument form reaches the same
+        // values through the pane.
+        let mut vm = boot_test_vm(JitMode::Off);
+
+        // Argument form: the block is handed this frame's own parameters.
+        vm.eval(
+            "GamePane new onStep: [ :frame | \
+               Transcript showCr: frame mouseX printString, ' ', \
+                 frame mouseY printString, ' ', frame mouseDown printString, ' ', \
+                 (frame keyHeld: GamePane keyLeft) printString ].",
+        )
+        .expect("a one-argument step block must register");
+        vm.exec("GamePane stepWithKeys: 1 mouseX: 77 y: 88 buttons: 1.")
+            .expect("a step must run");
+        assert_eq!(
+            vm.eval("GamePane frame mouseX.").unwrap(),
+            "77",
+            "the frame must carry this tick's pointer"
+        );
+        assert_eq!(vm.eval("GamePane frame mouseY.").unwrap(), "88");
+        assert_eq!(vm.eval("GamePane frame mouseDown.").unwrap(), "true");
+        assert_eq!(vm.eval("GamePane frame mouseRightDown.").unwrap(), "false");
+        assert_eq!(
+            vm.eval("GamePane keyHeld: GamePane keyLeft.").unwrap(),
+            "true",
+            "the class-side accessor must forward to the frame, so every \
+             existing demo keeps reading the same thing"
+        );
+
+        // No-argument form: still runs, still sees the frame via the pane.
+        vm.eval("GamePane new onStep: [ GamePane new cls: 7 ].")
+            .expect("a zero-argument step block must register");
+        vm.exec("GamePane stepWithKeys: 0 mouseX: 5 y: 6 buttons: 2.")
+            .expect("a step must run");
+        assert_eq!(vm.eval("GamePane mouseX.").unwrap(), "5");
+        assert_eq!(vm.eval("GamePane mouseRightDown.").unwrap(), "true");
+        assert_eq!(vm.eval("GamePane mouseDown.").unwrap(), "false");
+
+        // A keys-only step (the WKWebView GUI's shape) leaves the pointer be.
+        vm.exec("GamePane stepWithKeys: 0.").expect("keys-only step");
+        assert_eq!(
+            vm.eval("GamePane mouseX.").unwrap(),
+            "5",
+            "a keys-only step must not disturb the pointer"
+        );
+
+        // reset drops the whole frame, so nothing leaks into the next session.
+        vm.exec("GamePane reset.").expect("reset");
+        assert_eq!(vm.eval("GamePane mouseX.").unwrap(), "-1");
+        assert_eq!(vm.eval("GamePane mouseInPane.").unwrap(), "false");
+        assert_eq!(
+            vm.eval("GamePane keyHeld: GamePane keyLeft.").unwrap(),
+            "false"
+        );
+    }
+
+    #[test]
+    fn life_glider_walks_one_cell_diagonally_every_four_generations() {
+        // The rules themselves, on the demo's own grid. `Life launch`
+        // (world/45a_life.mst) seeds a glider in the top-left corner; a glider
+        // is periodic with period 4 and translates by exactly (+1,+1) over
+        // that period, so this is a precise statement about Conway's rules,
+        // the toroidal neighbour count and the read/write grid swap all being
+        // right — not just "it drew something".
+        //
+        // `perGen` is 4, so 16 frame ticks = 4 generations. The R-pentomino
+        // seeded at the centre of the 80x60 grid is nowhere near the corner
+        // within 4 generations, so it cannot perturb this.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.exec("Life launch.").expect("Life launch must run");
+
+        // Seeded glider: (2,1) (3,2) (1,3) (2,3) (3,3).
+        for (x, y) in [(2, 1), (3, 2), (1, 3), (2, 3), (3, 3)] {
+            assert_eq!(
+                vm.eval(&format!("Life current at: {x} y: {y}.")).unwrap(),
+                "1",
+                "glider cell ({x},{y}) must be alive at generation 0"
+            );
+        }
+        assert_eq!(vm.eval("Life current generation.").unwrap(), "0");
+
+        for _ in 0..16 {
+            vm.exec("GamePane stepWithKeys: 0.")
+                .expect("a Life frame must not error");
+        }
+        assert_eq!(
+            vm.eval("Life current generation.").unwrap(),
+            "4",
+            "16 frames at one generation per 4 must advance exactly 4 generations"
+        );
+
+        // The same five cells, every one moved by (+1,+1).
+        for (x, y) in [(3, 2), (4, 3), (2, 4), (3, 4), (4, 4)] {
+            assert_eq!(
+                vm.eval(&format!("Life current at: {x} y: {y}.")).unwrap(),
+                "1",
+                "after 4 generations the glider must occupy ({x},{y})"
+            );
+        }
+        // And vacated the cells it came from that the shifted shape does not
+        // re-cover — otherwise a grid that never clears would also pass.
+        for (x, y) in [(2, 1), (1, 3), (2, 3)] {
+            assert_eq!(
+                vm.eval(&format!("Life current at: {x} y: {y}.")).unwrap(),
+                "0",
+                "the glider must have vacated ({x},{y})"
+            );
+        }
+    }
+
+    #[test]
+    fn life_mouse_draws_and_erases_cells_and_space_toggles_pause() {
+        // The controls, driven exactly as the Cocoa GUI's frame timer drives
+        // them (`poll_primary_step` formats this very message with the tick's
+        // key mask and pane-pixel mouse). Steps 1..3 are deliberately not
+        // generation ticks (perGen is 4), so a painted cell is not immediately
+        // reaped by the rules and each assertion is about input alone.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.exec("Life launch.").expect("Life launch must run");
+
+        // Pane pixel (40,60) with 4px cells is grid cell (10,15) — empty at
+        // launch, so any liveness here came from the mouse.
+        assert_eq!(vm.eval("Life current at: 10 y: 15.").unwrap(), "0");
+
+        // Tick 1: left button held over that pixel -> the cell is drawn.
+        vm.exec("GamePane stepWithKeys: 0 mouseX: 40 y: 60 buttons: 1.")
+            .expect("a step with the mouse must run");
+        assert_eq!(
+            vm.eval("Life current at: 10 y: 15.").unwrap(),
+            "1",
+            "the left button must draw the cell under the pointer"
+        );
+
+        // Tick 2: right button over the same pixel -> erased again.
+        vm.exec("GamePane stepWithKeys: 0 mouseX: 40 y: 60 buttons: 2.")
+            .expect("a step with the right button must run");
+        assert_eq!(
+            vm.eval("Life current at: 10 y: 15.").unwrap(),
+            "0",
+            "the right button must erase the cell under the pointer"
+        );
+
+        // Tick 3: SPACE (game key A, bit 4) pauses. The toggle is edge-
+        // triggered, so holding it across the NEXT tick must NOT resume.
+        assert_eq!(vm.eval("Life current isRunning.").unwrap(), "true");
+        vm.exec("GamePane stepWithKeys: 16 mouseX: -1 y: -1 buttons: 0.")
+            .expect("a step with space held must run");
+        assert_eq!(
+            vm.eval("Life current isRunning.").unwrap(),
+            "false",
+            "SPACE must pause the simulation"
+        );
+        vm.exec("GamePane stepWithKeys: 16 mouseX: -1 y: -1 buttons: 0.")
+            .expect("a second step with space still held must run");
+        assert_eq!(
+            vm.eval("Life current isRunning.").unwrap(),
+            "false",
+            "holding SPACE must not re-toggle — the pause is edge-triggered"
+        );
+        // Released, then pressed again -> resumes.
+        vm.exec("GamePane stepWithKeys: 0 mouseX: -1 y: -1 buttons: 0.")
+            .expect("space released");
+        vm.exec("GamePane stepWithKeys: 16 mouseX: -1 y: -1 buttons: 0.")
+            .expect("space pressed again");
+        assert_eq!(
+            vm.eval("Life current isRunning.").unwrap(),
+            "true",
+            "pressing SPACE again must resume"
+        );
+    }
+
+    #[test]
+    fn life_paused_holds_its_generation_and_still_paints() {
+        // Pausing must stop the SIMULATION without stopping the FRAME — the
+        // pane still has to present, or the window would freeze rather than
+        // pause. Prove both halves: the generation stops moving while frames
+        // keep flowing.
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+        vm.exec("Life launch.").expect("Life launch must run");
+
+        // Pause on the first tick, then run plenty of frames.
+        vm.exec("GamePane stepWithKeys: 16 mouseX: -1 y: -1 buttons: 0.")
+            .expect("pause");
+        assert_eq!(vm.eval("Life current isRunning.").unwrap(), "false");
+        let gen_at_pause = vm.eval("Life current generation.").unwrap();
+        captured.lock().unwrap().clear();
+        for _ in 0..30 {
+            vm.exec("GamePane stepWithKeys: 0 mouseX: -1 y: -1 buttons: 0.")
+                .expect("a paused frame must not error");
+        }
+        assert_eq!(
+            vm.eval("Life current generation.").unwrap(),
+            gen_at_pause,
+            "a paused Life must not advance a generation"
+        );
+        let cmds = captured.lock().unwrap();
+        assert!(
+            cmds.iter().filter(|c| matches!(c, GameCommand::Present)).count() >= 30,
+            "every paused frame must still present, or the window freezes"
+        );
+    }
+
+    #[test]
+    fn life_renders_a_grid_through_the_game_channel() {
+        // The picture, headlessly: rasterize Life's blits into a 320x240 index
+        // buffer (the same proof style as MandelZoom's) and assert the frame
+        // is a real lattice — live cells, dead cells and the gutter grid lines
+        // all present — rather than a flat fill.
+        const W: usize = 320;
+        const H: usize = 240;
+        struct Raster(Arc<Mutex<Vec<u8>>>);
+        impl GameSink for Raster {
+            fn emit(&mut self, cmd: GameCommand) {
+                let mut b = self.0.lock().unwrap();
+                if let GameCommand::Blit { data } = cmd {
+                    let n = data.len().min(b.len());
+                    b[..n].copy_from_slice(&data[..n]);
+                }
+            }
+        }
+        let buf = Arc::new(Mutex::new(vec![0u8; W * H]));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(Raster(buf.clone())));
+        vm.exec("Life launch.").expect("Life launch must run");
+        vm.exec("GamePane stepWithKeys: 0.").expect("one frame");
+
+        let pixels = buf.lock().unwrap();
+        // Default palette: 27 green (alive), 17 midnight (dead), 16 black
+        // (the gutters between cells).
+        let alive = pixels.iter().filter(|&&p| p == 27).count();
+        let dead = pixels.iter().filter(|&&p| p == 17).count();
+        let grid = pixels.iter().filter(|&&p| p == 16).count();
+        assert!(alive > 0, "the seeded patterns must paint live cells");
+        assert!(dead > alive, "most of an 80x60 grid starts dead");
+        // Each 4x4 cell contributes 7 gutter pixels (last row + last column,
+        // sharing the corner): 80*60*7 exactly.
+        assert_eq!(
+            grid,
+            80 * 60 * 7,
+            "the cell gutters must draw a complete lattice"
+        );
+        assert_eq!(alive + dead + grid, W * H, "every pixel must be accounted for");
+
+        // Eyeball aid under --nocapture: the top-left corner, where the glider
+        // lives, one character per cell.
+        let mut art = String::from("\nLife generation 0, top-left 40x20 cells:\n");
+        for cy in 0..20usize {
+            for cx in 0..40usize {
+                let p = pixels[(cy * 4) * W + cx * 4];
+                art.push(if p == 27 { '#' } else { '.' });
+            }
+            art.push('\n');
+        }
+        println!("{art}");
+    }
+
+    #[test]
     fn gamepane_reset_stops_the_running_demo() {
         // Escape's close path submits `GamePane reset.` (gui close_game_pane).
         // Prove the VM-side contract it relies on: reset nils the registered

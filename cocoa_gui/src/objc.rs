@@ -170,6 +170,117 @@ pub fn send1_id(recv: Id, s: Sel, a: Id) -> Id {
     f(recv, s, a)
 }
 
+/// `+[NSEvent keyEventWithType:location:modifierFlags:timestamp:windowNumber:
+/// context:characters:charactersIgnoringModifiers:isARepeat:keyCode:]` — the
+/// keyboard twin of [`send_mouse_event`], for scripted verification.
+///
+/// `cocoa_data` gives `g,h2,g,f,g,g,g,g,g,g`, and the last two are the subtle
+/// part: eight integer arguments already fill `x0..x7`, so `isARepeat` and
+/// `keyCode` are passed on the STACK — and Apple's arm64 ABI packs stack
+/// arguments at their natural size rather than rounding each to 8 bytes, so
+/// they must be declared as the `bool`/`u16` they really are. Widening them
+/// would silently misalign `keyCode`, and the whole point of this call is to
+/// deliver a specific key code.
+#[allow(clippy::too_many_arguments)]
+pub fn send_key_event(
+    cls: Id,
+    s: Sel,
+    event_type: u64,
+    loc_x: f64,
+    loc_y: f64,
+    modifier_flags: u64,
+    timestamp: f64,
+    window_number: i64,
+    context: Id,
+    characters: Id,
+    chars_ignoring_modifiers: Id,
+    is_a_repeat: bool,
+    key_code: u16,
+) -> Id {
+    let f: extern "C" fn(Id, Sel, u64, f64, f64, u64, f64, i64, Id, Id, Id, bool, u16) -> Id =
+        unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(
+        cls,
+        s,
+        event_type,
+        loc_x,
+        loc_y,
+        modifier_flags,
+        timestamp,
+        window_number,
+        context,
+        characters,
+        chars_ignoring_modifiers,
+        is_a_repeat,
+        key_code,
+    )
+}
+
+/// A returned `CGRect`/`NSRect` — origin then size, four `f64` fields. Distinct
+/// from the private `CgRect` below, which is only ever passed to real typed C
+/// functions; this one IS returned through a transmuted `objc_msgSend`, which
+/// is sound here because four `f64`s are a homogeneous floating-point
+/// aggregate and arm64 returns those in `v0..v3` rather than through the
+/// `objc_msgSend_stret` pointer (`cocoa_data`: `NSView bounds` → `ret_class: h4`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Zero-arg, `CGRect`-returning send — e.g. `-[NSView bounds]`.
+pub fn send0_rect(recv: Id, s: Sel) -> Rect {
+    let f: extern "C" fn(Id, Sel) -> Rect = unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(recv, s)
+}
+
+/// `+[NSEvent mouseEventWithType:location:modifierFlags:timestamp:windowNumber:
+/// context:eventNumber:clickCount:pressure:]` — synthesize a mouse event to
+/// hand to `-[NSApplication sendEvent:]`, which is how a scripted click reaches
+/// a view through AppKit's ordinary routing rather than by calling its
+/// `mouseDown:` behind the window's back.
+///
+/// The argument shapes are `cocoa_data`'s, not guesswork: `g,h2,g,f,g,g,g,g,f`.
+/// The `h2` location is an HFA, so its two `f64` members are passed
+/// independently in `v0`/`v1` while the integer arguments fill `x2..x7` in
+/// order and the remaining floats take `v2`/`v3` — which is exactly what this
+/// parameter list compiles to on arm64.
+#[allow(clippy::too_many_arguments)]
+pub fn send_mouse_event(
+    cls: Id,
+    s: Sel,
+    event_type: u64,
+    loc_x: f64,
+    loc_y: f64,
+    modifier_flags: u64,
+    timestamp: f64,
+    window_number: i64,
+    context: Id,
+    event_number: i64,
+    click_count: i64,
+    pressure: f32,
+) -> Id {
+    let f: extern "C" fn(Id, Sel, u64, f64, f64, u64, f64, i64, Id, i64, i64, f32) -> Id =
+        unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(
+        cls,
+        s,
+        event_type,
+        loc_x,
+        loc_y,
+        modifier_flags,
+        timestamp,
+        window_number,
+        context,
+        event_number,
+        click_count,
+        pressure,
+    )
+}
+
 pub fn send1_i64(recv: Id, s: Sel, a: i64) -> Id {
     let f: extern "C" fn(Id, Sel, i64) -> Id = unsafe { std::mem::transmute(msg_send_ptr()) };
     f(recv, s, a)
@@ -562,7 +673,7 @@ extern "C" {
 }
 
 /// `[win windowNumber]` — a plain `NSInteger` return, no struct in sight.
-fn window_number(win: Id) -> i64 {
+pub fn window_number(win: Id) -> i64 {
     let f: extern "C" fn(Id, Sel) -> i64 = unsafe { std::mem::transmute(msg_send_ptr()) };
     f(win, sel("windowNumber"))
 }
@@ -636,7 +747,16 @@ pub fn snapshot_client_area(path: &str) -> bool {
     if win.is_null() {
         return false;
     }
-    let wid = window_number(win);
+    snapshot_window(window_number(win), path)
+}
+
+/// Capture ONE window by its window number, whether or not it is key. The game
+/// pane lives in its own `NSWindow`, and a script that just launched a demo
+/// must be able to photograph THAT window even when the IDE window still holds
+/// key — which is exactly the case `snapshot_client_area` above got wrong when
+/// it always resolved `keyWindow`.
+pub fn snapshot_window(wid: i64, path: &str) -> bool {
+    settle_run_loop();
     if wid <= 0 {
         return false;
     }

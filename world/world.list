@@ -90,6 +90,10 @@
 # MandelZoom: a zooming Mandelbrot rendered live in the game pane (reuses
 # Mandelbrot>>escapeAtRe:im:; progressive per-frame render, docs/gamepane_design.md).
 45_mandelzoom.mst
+# Life: Conway's Game of Life in the game pane — the demo the pane's MOUSE
+# support was built for (SPACE pauses, left draws, right erases; blit: per
+# frame, toroidal 80x60 grid; docs/gamepane_design.md).
+45a_life.mst
 # MandelVM: MandelZoom that dives once then stops — the standalone-window demo
 # (macvm-gui mandelvm / run-mandelvm.sh) that quits when the demo ends.
 46_mandelvm.mst
