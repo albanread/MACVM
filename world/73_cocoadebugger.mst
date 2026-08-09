@@ -19,6 +19,7 @@
  live while the primary sits frozen at the halt."
 Object subclass: CocoaDebugger [
     <classVars: Container BarBox BarButtons StackTable StackCol StackScroll StackFace
+                VSplit HSplit StackPane SourcePane FramePane StackHeader SourceHeader FrameHeader
                 SourceView SourceScroll FrameView FrameScroll PrintField
                 Frames Reason Halted SelectedRow SourceDelegate>
 
@@ -81,9 +82,13 @@ Object subclass: CocoaDebugger [
         ^outText isEmpty ifTrue: [ '' ] ifFalse: [ (String with: Character nl) , '── output ──' , (String with: Character nl) ]
     ]
     CocoaDebugger class >> updateReasonTitle [
+        StackHeader isNil ifFalse: [
+            StackHeader onMain setStringValue: (Halted
+                ifTrue: [ '  STACK — ' , Reason ]
+                ifFalse: [ '  STACK' ]) ].
         Halted
             ifTrue: [ CocoaUI appendTranscript: 'debugger: HALTED — ' , Reason ]
-            ifFalse: [ "resumed — nothing to say" ].
+            ifFalse: [ self showIdleHints ].
     ]
 
     "── stack table face ──"
@@ -217,9 +222,16 @@ Object subclass: CocoaDebugger [
         self wireField: PrintField to: [ self printIt ].
         Container onMain addSubview: PrintField.
 
-        "stack table (left of the middle band)"
-        StackScroll := self newScrollIn: (Array with: 0.0 with: midY with: sw with: midH)
-                            mask: CocoaUI maskHeightSizable + CocoaUI maskMaxXMargin.
+        "── three LABELED panes in real splitters (the anti-snowstorm layout).
+           Everything below the bar is one vertical NSSplitView: a horizontal
+           split (Stack | Source) over the Frame & Output pane. Thin
+           user-draggable dividers, positions autosaved — the browsers'\'' own
+           idiom (72_cocoabrowser2). Each pane is capped by a HEADER BAND on
+           windowBackgroundColor, which reads as a visible edge against the
+           text areas in light and dark alike, so every region has a name and
+           a boundary instead of floating in white."
+        StackScroll := self newScrollIn: (Array with: 0.0 with: 0.0 with: sw with: midH)
+                            mask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
         StackTable := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: sw with: midH).
         StackCol := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain initWithIdentifier: 'frame'.
@@ -228,31 +240,99 @@ Object subclass: CocoaDebugger [
         StackTable onMain addTableColumn: StackCol.
         StackTable onMain setHeaderView: nil.
         StackTable onMain setColumnAutoresizingStyle: 1.
+        "Zebra rows: free structure inside the pane."
+        StackTable onMain setUsesAlternatingRowBackgroundColors: true.
+        StackTable onMain setRowHeight: 22.0.
         "The data source/delegate must be an ObjC forwarder (MacvmDelegate
-         tableSourceOn:), NOT the raw Smalltalk face — the browsers' own rule."
+         tableSourceOn:), NOT the raw Smalltalk face — the browsers'\'' own rule."
         StackFace := MacvmDelegate tableSourceOn: (Worker classNamed: #CocoaDebuggerFace) new.
         StackTable onMain setDataSource: StackFace.
         StackTable onMain setDelegate: StackFace.
         self wireAction: StackTable to: [ self stackClicked ].
         StackScroll onMain setDocumentView: StackTable.
-        Container onMain addSubview: StackScroll.
+        StackHeader := self headerLabeled: 'STACK'.
+        StackPane := self paneWith: StackHeader scroll: StackScroll wide: sw high: midH.
 
-        "source pane (right of the middle band, fills remaining width)"
-        SourceScroll := self newScrollIn: (Array with: sw with: midY with: w - sw with: midH)
+        SourceScroll := self newScrollIn: (Array with: 0.0 with: 0.0 with: w - sw with: midH)
                              mask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
         SourceView := self newTextViewWide: (Array with: 0.0 with: 0.0 with: w - sw with: midH) editable: false.
         SourceScroll onMain setDocumentView: SourceView.
-        Container onMain addSubview: SourceScroll.
+        SourceHeader := self headerLabeled: 'SOURCE'.
+        SourcePane := self paneWith: SourceHeader scroll: SourceScroll wide: w - sw high: midH.
 
-        "frame / vars pane (bottom band)"
         FrameScroll := self newScrollIn: (Array with: 0.0 with: 0.0 with: w with: varsH)
-                            mask: CocoaUI maskWidthSizable + CocoaUI maskMaxYMargin.
+                            mask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
         FrameView := self newTextViewWide: (Array with: 0.0 with: 0.0 with: w with: varsH) editable: false.
         FrameScroll onMain setDocumentView: FrameView.
-        Container onMain addSubview: FrameScroll.
+        FrameHeader := self headerLabeled: 'FRAME & OUTPUT'.
+        FramePane := self paneWith: FrameHeader scroll: FrameScroll wide: w high: varsH.
+
+        HSplit := ((Cocoa classNamed: 'NSSplitView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: midH).
+        HSplit onMain setVertical: true.
+        HSplit onMain setDividerStyle: 3.
+        HSplit onMain addSubview: StackPane.
+        HSplit onMain addSubview: SourcePane.
+        HSplit onMain setAutosaveName: 'macvm.debugger.stack-source'.
+
+        VSplit := ((Cocoa classNamed: 'NSSplitView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: barY).
+        VSplit onMain setVertical: false.
+        VSplit onMain setDividerStyle: 3.
+        VSplit onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        VSplit onMain addSubview: HSplit.
+        VSplit onMain addSubview: FramePane.
+        VSplit onMain setAutosaveName: 'macvm.debugger.main'.
+        Container onMain addSubview: VSplit.
+        VSplit onMain adjustSubviews. HSplit onMain adjustSubviews.
+        VSplit onMain setPosition: midH ofDividerAtIndex: 0.
+        HSplit onMain setPosition: sw ofDividerAtIndex: 0.
+        self showIdleHints.
+    ]
+
+    "── the header band: a named cap for each pane ──"
+    CocoaDebugger class >> headerHeight [ ^22.0 ]
+    CocoaDebugger class >> headerLabeled: aTitle [
+        | f |
+        f := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: 100.0 with: self headerHeight).
+        f onMain setStringValue: '  ' , aTitle.
+        f onMain setEditable: false.
+        f onMain setSelectable: false.
+        f onMain setBordered: false.
+        f onMain setDrawsBackground: true.
+        f onMain setBackgroundColor: ((Cocoa classNamed: 'NSColor') onMain windowBackgroundColor).
+        f onMain setTextColor: ((Cocoa classNamed: 'NSColor') onMain secondaryLabelColor).
+        f onMain setFont: ((Cocoa classNamed: 'NSFont') onMain boldSystemFontOfSize: 11.0).
+        ^f
+    ]
+    CocoaDebugger class >> paneWith: aHeader scroll: aScroll wide: w high: h [
+        | pane hh |
+        hh := self headerHeight.
+        pane := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        pane onMain setAutoresizesSubviews: true.
+        aHeader onMain setFrame: (Array with: 0.0 with: h - hh with: w with: hh).
+        aHeader onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        aScroll onMain setFrame: (Array with: 0.0 with: 0.0 with: w with: h - hh).
+        aScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        pane onMain addSubview: aHeader.
+        pane onMain addSubview: aScroll.
+        ^pane
+    ]
+    CocoaDebugger class >> showIdleHints [
+        "Not halted: say so, instead of three blank white regions."
+        SourceView isNil ifFalse: [
+            SourceView onMain setString: '"nothing is halted.
+
+ Set a breakpoint — Debug menu, or from a script:
+     set breakpoint ''OrderedCollection'' selector ''add:''
+ — then run code that reaches it. The debugger opens here by itself."' ].
+        FrameView isNil ifFalse: [ FrameView onMain setString: '' ].
     ]
 
     "── view helpers (browser idioms, factored for this file) ──"
+
     CocoaDebugger class >> newScrollIn: rect mask: aMask [
         | s |
         s := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain initWithFrame: rect.
@@ -340,11 +420,17 @@ Object subclass: CocoaDebugger [
         BarButtons isNil ifFalse: [ BarButtons do: [ :d | d isValid ifTrue: [ d release ] ] ].
         StackFace isNil ifFalse: [ StackFace isValid ifTrue: [ StackFace release ] ].
         CocoaBrowser releaseView: BarBox.
+        CocoaBrowser releaseView: StackHeader. CocoaBrowser releaseView: SourceHeader.
+        CocoaBrowser releaseView: FrameHeader. CocoaBrowser releaseView: StackPane.
+        CocoaBrowser releaseView: SourcePane. CocoaBrowser releaseView: FramePane.
+        CocoaBrowser releaseView: HSplit. CocoaBrowser releaseView: VSplit.
         CocoaBrowser releaseView: StackTable. CocoaBrowser releaseView: StackScroll.
         CocoaBrowser releaseView: SourceView. CocoaBrowser releaseView: SourceScroll.
         CocoaBrowser releaseView: FrameView. CocoaBrowser releaseView: FrameScroll.
         CocoaBrowser releaseView: PrintField. CocoaBrowser releaseView: Container.
         BarButtons := nil. BarBox := nil. StackTable := nil. StackScroll := nil.
+        VSplit := nil. HSplit := nil. StackPane := nil. SourcePane := nil. FramePane := nil.
+        StackHeader := nil. SourceHeader := nil. FrameHeader := nil.
         SourceView := nil. SourceScroll := nil. FrameView := nil. FrameScroll := nil.
         PrintField := nil. Container := nil. StackFace := nil.
     ]
