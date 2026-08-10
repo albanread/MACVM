@@ -5,6 +5,11 @@ Status: implemented, in force since the CG9 UI-worker-rebuild work (`8266381`,
 `56a9aad`). This document is the authority for *why* the mechanism exists,
 *how* it's shaped, and *when* a new piece of Cocoa-GUI code needs to use it.
 
+§1–6 describe the mechanism as built. **§7 is an open hole in it** — the drain
+assumes it never runs inside a callback and does not check, which aborts the
+app through the AppleScript `snapshot` verb. Diagnosed, not yet fixed; that
+section is the plan.
+
 ## 1. Motivation
 
 The UI worker VM runs pinned to the main thread (AppKit requires it). Every
@@ -196,3 +201,138 @@ times.
    real click's tracking machinery sends) is the cheapest faithful
    reproduction available without OS-level mouse control on a bare,
    non-`.app`-bundled binary.
+
+## 7. The converse hole — the drain running *inside* a callback
+
+Status: **diagnosed 2026-08-10, not yet fixed.** This section is the plan.
+
+Everything above keeps VM work *out* of callbacks and hands it to the drain,
+on the premise that the drain itself is the safe place. `drain_perform` states
+that premise four times in its own comments — "main thread, VM quiescent",
+"never inside a callback", "a fresh top-level `exec` here" — and **never checks
+it**. It is a run-loop source. Anything that pumps the run loop while a
+callback is live fires it, and it runs `st.ui.exec(…)` — a fresh top-level VM
+entry stacked on the callback's paused activation.
+
+The AppleScript `snapshot` verb does exactly that, and aborts the app.
+
+### 7.1 The proved path
+
+From an instrumented backtrace (a temporary probe in `VmHandle::exec` printing
+whenever it is entered while `callback_active()`):
+
+```
+cocoa_send_n                        the world calls the host
+→ imp_snapshot_window_to            host_service.rs — the scripting verb's capture
+→ objc::snapshot_window             AppKit capture; PUMPS THE RUN LOOP
+→ drain_perform                     main.rs — the default-mode drain source fires
+→ VmHandle::exec("CocoaUI updateMetricsMem: …")     ← second top-level VM entry
+```
+
+The outer entry is the scripting verb's own `dispatch_callback`, paused
+mid-activation inside `performSnapshotCommand:`. The inner one runs the
+metrics readout against the same `&mut VmState`, and leaves `vm.stack.fp`
+pointing at ordinary data.
+
+The damage surfaces later, wherever the next stack walk happens — in the
+observed case `enter_compiled`'s zombie sweep:
+
+```
+WALKDUMP fp=42 sp=72 has_frame=true compiled_depth=0 deopt_resume_depth=0
+         link_idx=0 last_compiled_fp=0x0 tier_links=[]
+         slots 42/43/44 = three heap pointers, 32 bytes apart
+```
+
+`walk_frames` starts at `Mode::Interp(vm.stack.fp)`, finds three consecutive
+heap objects where a frame header should be, and panics with
+`Frame::saved_fp: not a smi`. The panic cannot unwind across the `extern "C"`
+scripting IMP, so `panic_cannot_unwind` aborts the process. AppleScript's
+*next* command then reports `-609 Connection is invalid`: that is the corpse,
+not a second bug, and chasing it as an Apple Event problem wastes a day.
+
+This is §1's failure mode 2 again — `walk_frames`, tier links, an abort that
+looks intermittent — reached from the opposite direction. §1 is a callback
+doing the work it should have deferred; this is the deferred work running
+inside a callback anyway.
+
+### 7.2 Why the existing guards miss it
+
+`callback_active()` is consulted in exactly two places, both on the way *in* to
+a callback: `dispatch_callback` and `objc_delegate::dispatch`. Its doc calls
+itself a re-entrancy guard, and for nested callbacks it is one.
+
+`exec` and `eval` consult nothing and set nothing. So the flag answers "is a
+callback live?" but nobody can ask "is a VM entry live?", which is the question
+that matters — and the doors that skip the check (`drain_perform`'s six
+`exec`s, the control channel's `eval`/`exec`, `refresh_metrics`) are precisely
+the ones the run loop can fire from underneath a callback.
+
+`enter_compiled`'s sweep guards (`compiled_depth == 0`, `deopt_resume_depth ==
+0`) are irrelevant here: both are legitimately zero. The stack is already
+corrupt by the time the sweep looks at it.
+
+### 7.3 The fix
+
+1. **Make the predicate honest.** Replace the callback-only flag with a VM
+   entry depth in `embed.rs`, maintained by all three doors — `exec`, `eval`,
+   `dispatch_callback` — with `callback_active()` kept as-is on top of it so
+   the existing nested-callback guard keeps its current meaning. Then a
+   `vm_entry_active()` exists for anyone who needs the real question.
+2. **Guard the drain.** `drain_perform` bails at the very top when
+   `vm_entry_active()` — *before* any `take_request()`, so no flag is consumed
+   and no work is lost. This is free: the supervisor's beat loop wakes the main
+   thread every 250 ms unconditionally (§5's "free safety net"), so a skipped
+   pass costs at most a quarter second of metrics staleness. `game::drain()`
+   and `refresh_metrics` sit inside `drain_perform` and are covered by the same
+   early return.
+3. **Stop the abort, and restore the VM.** `script_command!` already wraps its
+   `dispatch` in `catch_unwind` (verified: 15/15 hammer rounds no longer kill
+   the app) and reports a script error instead. That is necessary but not
+   sufficient — a panic unwinds *past* `run_method_reentrant`'s
+   `restore_activation`, so the VM stays wedged and every later verb answers
+   `-10000`. The catch arm must rewind to the idle baseline the way the
+   guest-fatal arm does (`restore_after_guest_fatal`, today private to
+   `VmHandle`) before returning the error.
+4. **Keep the `settle_run_loop` suppression.** `snapshot_client_area` skips its
+   settle inside a script dispatch (`in_script_dispatch()`). With (1) and (2)
+   in place this is no longer load-bearing for soundness, but it is still
+   right: a scripted capture should not be pumping AppKit's queue at all. The
+   control-channel and menu paths keep settling, so the stale-pane behaviour it
+   was added for is unaffected.
+
+Steps 1 and 2 are the actual fix; 3 turns any *future* escape into an error
+instead of an abort. Do not stop at 3 — it converts a crash into a silently
+dead VM, which is worse.
+
+### 7.4 Reproducing it
+
+Fails by round 2–3. It needs a view switch **and** an `evaluate` before the
+capture; either alone survives a dozen rounds, which is what made it look
+unreproducible when it was first reported as "crash!".
+
+```
+osascript -e 'tell application id "com.macvm.cocoa"
+  set current view to help
+  snapshot in POSIX file "/tmp/t.png"
+  evaluate "3 + 4"
+  snapshot in POSIX file "/tmp/t.png"
+end tell'
+```
+
+Two traps in the setup, both of which cost real time:
+
+- **Target by bundle id, not by name.** `tell application "macVM"` resolves
+  through LaunchServices to `/Applications/macVM.app` and *launches it* — so a
+  fix in `target/release` is never under test, and looks ineffective. `tell
+  application id "com.macvm.cocoa"` binds to the running instance.
+- **`/Applications` cannot be written to.** macOS App Management blocks it, so
+  the build under test has to be a copy: `ditto` the installed bundle
+  somewhere writable, drop in the fresh binary, then `codesign --force
+  --options runtime --entitlements tools/macvm.entitlements -s -` (ad-hoc is
+  enough locally; the JIT entitlement still applies). Launch that binary
+  directly and it registers under the same bundle id.
+
+A headless regression test is worth having and does not need AppKit: two
+`VmHandle` entries nested on one `VmState` is the whole bug. Assert that the
+inner one fails closed rather than corrupting `vm.stack.fp` — that is a unit
+test in `embed.rs`, not a GUI test, and it is what would have caught this.
