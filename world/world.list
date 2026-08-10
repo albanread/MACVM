@@ -98,6 +98,10 @@
 # right flags. Reads the buttons on their EDGE (one click, one square), the
 # opposite of Life's level-triggered painting; first click always safe.
 45b_minesweeper.mst
+# FreeCell: the single-player card game — drag-and-drop over the pane's mouse
+# support, Microsoft's original deal numbering (deal 617 is deal 617), and the
+# real supermove rule (free+1)*2^empty. All 52 cards face up.
+45c_freecell.mst
 # MandelVM: MandelZoom that dives once then stops — the standalone-window demo
 # (macvm-gui mandelvm / run-mandelvm.sh) that quits when the demo ends.
 46_mandelvm.mst

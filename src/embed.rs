@@ -2446,6 +2446,316 @@ mod tests {
     }
 
     #[test]
+    fn freecell_deals_match_the_published_reference_tables() {
+        // Designed from the spec, and pinned to it. The Microsoft FreeCell
+        // shuffle is a published algorithm — the MS C runtime LCG
+        // (state = 214013*state + 2531011 mod 2^31, value = state / 2^16), a
+        // deck ordered AC AD AH AS 2C ... (index = (rank-1)*4 + suit over
+        // CDHS), and a deal-as-you-go loop that swaps the last card into the
+        // chosen slot. These are the reference deals for game 1 and game 617
+        // as published with that spec.
+        //
+        // READ THE TABLES RIGHT: they are printed as ROWS OF EIGHT in DEAL
+        // order, so row one is the first card of each of the eight columns.
+        // Transposed here into the columns the game actually holds — reading a
+        // printed row as a column is what made this look broken the first
+        // time.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+
+        // Game #1, transposed to columns.
+        let deal1 = [
+            "JD KD 2S 4C 3S 6D 6S",
+            "2D KC KS 5C TD 8S 9C",
+            "9H 9S 9D TS 4S 8D 2H",
+            "JC 5S QD QH TH QS 6H",
+            "5D AD JS 4H 8H 6C",
+            "7H QC AS AC 2C 3D",
+            "7C KH AH 4D JH 8C",
+            "5H 3H 3C 7S 7D TC",
+        ];
+        // Game #617, transposed to columns.
+        let deal617 = [
+            "7D TD TH KD 4C 4S JD",
+            "AD 7S QC 5H QS TS KS",
+            "5C QD 3H 9S 9C 2H KC",
+            "3S AC 9D 3C 9H 5D 4H",
+            "5S 6D 6S 8S 7C JC",
+            "8C 8H 8D 7H 6H 6C",
+            "2D AS 3D 4D 2C JH",
+            "AH KH TC JS 2S QH",
+        ];
+
+        for (deal, want) in [(1i64, &deal1), (617i64, &deal617)] {
+            // Deal WITHOUT the opening auto-play, or aces already at a
+            // column's foot would have left for the foundations and the
+            // comparison would be against a position, not a deal.
+            vm.exec(&format!("FreeCell launchDeal: {deal}."))
+                .expect("FreeCell must deal");
+            vm.exec(&format!("FreeCell current dealRaw: {deal}."))
+                .expect("re-deal without the opening auto-play");
+            for (i, expect) in want.iter().enumerate() {
+                let got = vm
+                    .eval(&format!("FreeCell current columnString: {}.", i + 1))
+                    .unwrap();
+                assert_eq!(
+                    got.trim_matches('\''),
+                    *expect,
+                    "deal {deal}, column {}: the published table says \"{expect}\"",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn freecell_deals_all_52_cards_and_the_same_number_deals_the_same_game() {
+        // The deal is the foundation of everything else: if it can lose or
+        // duplicate a card, every rule test above it is meaningless. Checked
+        // across a spread of numbers, including the two the folklore names.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        for deal in [1i64, 617, 11982, 31999, 32000] {
+            vm.exec(&format!("FreeCell launchDeal: {deal}."))
+                .expect("FreeCell must deal");
+            // Every card 0..51 exactly once, across columns AND foundations
+            // (the deal auto-plays any ace already at a column's foot).
+            let mut seen = [0u32; 52];
+            for col in 1..=8i64 {
+                let n: i64 = vm
+                    .eval(&format!("FreeCell current columnSize: {col}."))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                for k in 1..=n {
+                    let c: usize = vm
+                        .eval(&format!("FreeCell current cardAtColumn: {col} index: {k}."))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    seen[c] += 1;
+                }
+            }
+            // Anything auto-played onto a foundation: suit s holds ranks 1..r.
+            for suit in 0..4usize {
+                let r: usize = vm
+                    .eval(&format!("FreeCell current foundationAt: {}.", suit + 1))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                for rank in 1..=r {
+                    seen[(rank - 1) * 4 + suit] += 1;
+                }
+            }
+            let missing: Vec<usize> = (0..52).filter(|&c| seen[c] == 0).collect();
+            let dupes: Vec<usize> = (0..52).filter(|&c| seen[c] > 1).collect();
+            assert!(
+                missing.is_empty() && dupes.is_empty(),
+                "deal {deal}: every card exactly once — missing {missing:?}, duplicated {dupes:?}"
+            );
+        }
+
+        // The same number deals the same game; a different one does not.
+        vm.exec("FreeCell launchDeal: 617.").unwrap();
+        let a = vm.eval("FreeCell current cardAtColumn: 1 index: 1.").unwrap();
+        vm.exec("FreeCell launchDeal: 617.").unwrap();
+        let b = vm.eval("FreeCell current cardAtColumn: 1 index: 1.").unwrap();
+        assert_eq!(a, b, "the same deal number must deal identically");
+    }
+
+    #[test]
+    fn freecell_supermove_capacity_follows_the_real_rule() {
+        // The one rule that is genuinely FreeCell's own: a run of n may move
+        // only if (free + 1) * 2^empty >= n, and an EMPTY destination column
+        // cannot also serve as the scratch space that makes the move possible.
+        // Driven through the game's own accessors on a real deal.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.exec("FreeCell launchDeal: 1.").unwrap();
+
+        // Opening position: four free cells, no empty columns.
+        assert_eq!(vm.eval("FreeCell current freeCellsOpen.").unwrap(), "4");
+        assert_eq!(vm.eval("FreeCell current emptyColumns.").unwrap(), "0");
+        assert_eq!(
+            vm.eval("FreeCell current moveCapacityToEmpty: false.").unwrap(),
+            "5",
+            "(4 free + 1) * 2^0 = 5"
+        );
+        // Onto an empty column, with none free, the target cannot count itself.
+        assert_eq!(
+            vm.eval("FreeCell current moveCapacityToEmpty: true.").unwrap(),
+            "5",
+            "no empty columns to lose: still 5"
+        );
+
+        // Fill three free cells by hand and re-ask: (1 + 1) * 2^0 = 2.
+        vm.exec("FreeCell current freeAt: 1 put: 0.").unwrap();
+        vm.exec("FreeCell current freeAt: 2 put: 1.").unwrap();
+        vm.exec("FreeCell current freeAt: 3 put: 2.").unwrap();
+        assert_eq!(vm.eval("FreeCell current freeCellsOpen.").unwrap(), "1");
+        assert_eq!(
+            vm.eval("FreeCell current moveCapacityToEmpty: false.").unwrap(),
+            "2"
+        );
+
+        // Empty two columns: (1 + 1) * 2^2 = 8 to a non-empty target, and
+        // (1 + 1) * 2^1 = 4 when the target is one of the empty ones.
+        vm.exec("FreeCell current clearColumn: 1.").unwrap();
+        vm.exec("FreeCell current clearColumn: 2.").unwrap();
+        assert_eq!(vm.eval("FreeCell current emptyColumns.").unwrap(), "2");
+        assert_eq!(
+            vm.eval("FreeCell current moveCapacityToEmpty: false.").unwrap(),
+            "8",
+            "(1 free + 1) * 2^2 = 8"
+        );
+        assert_eq!(
+            vm.eval("FreeCell current moveCapacityToEmpty: true.").unwrap(),
+            "4",
+            "an empty DESTINATION cannot double for itself: (1+1) * 2^1"
+        );
+    }
+
+    #[test]
+    fn freecell_enforces_stacking_and_foundation_order() {
+        // The two build rules, stated directly. Card c is rank c/4+1 of suit
+        // c%4 (0 clubs, 1 diamonds, 2 hearts, 3 spades) — so 4 is the two of
+        // clubs, 9 is the three of diamonds, and so on.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.exec("FreeCell launchDeal: 1.").unwrap();
+
+        // Tableau: one lower AND the opposite colour.
+        // 3 of clubs (c=8, black) onto 4 of diamonds (c=13, red) — legal.
+        assert_eq!(
+            vm.eval("FreeCell current canStack: 8 on: 13.").unwrap(),
+            "true",
+            "black 3 onto red 4 is the whole rule"
+        );
+        // 3 of spades (c=11, black) onto 4 of clubs (c=12, black) — same colour.
+        assert_eq!(
+            vm.eval("FreeCell current canStack: 11 on: 12.").unwrap(),
+            "false",
+            "same colour must be refused"
+        );
+        // 3 of clubs onto 5 of diamonds (c=17) — not adjacent in rank.
+        assert_eq!(
+            vm.eval("FreeCell current canStack: 8 on: 17.").unwrap(),
+            "false",
+            "a two-rank gap must be refused"
+        );
+
+        // Foundations: ace first, then strictly in sequence, by suit.
+        vm.exec("FreeCell current clearFoundations.").unwrap();
+        assert_eq!(
+            vm.eval("FreeCell current canFound: 0.").unwrap(),
+            "true",
+            "the ace of clubs starts its pile"
+        );
+        assert_eq!(
+            vm.eval("FreeCell current canFound: 4.").unwrap(),
+            "false",
+            "the two may not go before the ace"
+        );
+        vm.exec("FreeCell current foundationAt: 1 put: 1.").unwrap();
+        assert_eq!(
+            vm.eval("FreeCell current canFound: 4.").unwrap(),
+            "true",
+            "the two follows the ace"
+        );
+        assert_eq!(
+            vm.eval("FreeCell current canFound: 5.").unwrap(),
+            "false",
+            "the two of DIAMONDS does not follow the ace of clubs"
+        );
+    }
+
+    #[test]
+    fn freecell_drag_moves_a_legal_card_and_returns_an_illegal_one() {
+        // The whole input path, driven exactly as the GUI drives it: a press
+        // frame, drag frames, then a release frame. A refused drop must put
+        // the cards back where they came from — losing a card on a bad drop
+        // is the one bug a card game may not have.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.exec("FreeCell launchDeal: 1.").unwrap();
+
+        // Pick up the foot of column 1 and drop it on a free cell (always
+        // legal for a single card when the cell is empty).
+        let before: i64 = vm
+            .eval("FreeCell current columnSize: 1.")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let card = vm
+            .eval(&format!("FreeCell current cardAtColumn: 1 index: {before}."))
+            .unwrap();
+
+        // Column 1's foot: x is inside slot 1, y inside the last card's strip.
+        let px = 10 + 17;
+        let py = 62 + (before - 1) * 14 + 4;
+        vm.exec(&format!(
+            "GamePane stepWithKeys: 0 mouseX: {px} y: {py} buttons: 1."
+        ))
+        .expect("press");
+        assert_eq!(
+            vm.eval("FreeCell current isDragging.").unwrap(),
+            "true",
+            "pressing on a card must pick it up"
+        );
+        assert_eq!(vm.eval("FreeCell current heldCount.").unwrap(), "1");
+        assert_eq!(
+            vm.eval("FreeCell current columnSize: 1.")
+                .unwrap()
+                .parse::<i64>()
+                .unwrap(),
+            before - 1,
+            "the held card leaves the column while it is in the hand"
+        );
+
+        // Drag to free cell 1 (top row, slot 0) and release there.
+        vm.exec("GamePane stepWithKeys: 0 mouseX: 27 y: 20 buttons: 1.")
+            .expect("drag");
+        vm.exec("GamePane stepWithKeys: 0 mouseX: 27 y: 20 buttons: 0.")
+            .expect("release");
+        assert_eq!(vm.eval("FreeCell current isDragging.").unwrap(), "false");
+        assert_eq!(
+            vm.eval("FreeCell current freeAt: 1.").unwrap(),
+            card,
+            "the card must land in the free cell it was dropped on"
+        );
+
+        // Now an ILLEGAL drop: take that card back out and release it over
+        // the baize, where there is no slot at all.
+        vm.exec("GamePane stepWithKeys: 0 mouseX: 27 y: 20 buttons: 1.")
+            .expect("press the free cell");
+        assert_eq!(vm.eval("FreeCell current isDragging.").unwrap(), "true");
+        vm.exec("GamePane stepWithKeys: 0 mouseX: 4 y: 200 buttons: 1.")
+            .expect("drag to the baize");
+        vm.exec("GamePane stepWithKeys: 0 mouseX: 4 y: 200 buttons: 0.")
+            .expect("release on nothing");
+        assert_eq!(
+            vm.eval("FreeCell current freeAt: 1.").unwrap(),
+            card,
+            "a drop on nothing must return the card to where it was picked up"
+        );
+        assert_eq!(vm.eval("FreeCell current heldCount.").unwrap(), "0");
+    }
+
+    #[test]
+    fn freecell_recognises_a_won_game() {
+        // Winning: every foundation at the king. Set it up directly rather
+        // than playing a whole game out.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.exec("FreeCell launchDeal: 1.").unwrap();
+        assert_eq!(vm.eval("FreeCell current hasWon.").unwrap(), "false");
+        for suit in 1..=4 {
+            vm.exec(&format!("FreeCell current foundationAt: {suit} put: 13."))
+                .unwrap();
+        }
+        vm.exec("FreeCell current checkWon.").unwrap();
+        assert_eq!(
+            vm.eval("FreeCell current hasWon.").unwrap(),
+            "true",
+            "four kings up is a won game"
+        );
+    }
+
+    #[test]
     fn minesweeper_actually_draws_its_numbers_flags_and_mines() {
         // Every piece of this board is pixel art stamped into the blit buffer,
         // and the first version of it drew NOTHING — `String>>at:` hands back a

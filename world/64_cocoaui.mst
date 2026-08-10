@@ -1073,6 +1073,7 @@ Object subclass: CocoaUI [
         pairs add: (Array with: 'Galaxigans' with: 'Galaxigans launch').
         pairs add: (Array with: 'Game of Life' with: 'Life launch').
         pairs add: (Array with: 'Minesweeper' with: 'Minesweeper launch').
+        pairs add: (Array with: 'FreeCell' with: 'FreeCell launch').
         pairs add: (Array with: 'MandelZoom' with: 'MandelZoom launch').
         pairs add: (Array with: 'Parallel Mandelbrot' with: 'ParallelMandel launch').
         pairs add: (Array with: 'Worms' with: 'Worms launch').

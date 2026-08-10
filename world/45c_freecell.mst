@@ -1,0 +1,822 @@
+"45c_freecell.mst — FreeCell, the single-player card game, in the native Metal
+ game pane (docs/gamepane_design.md). Launch it from the Demos menu, or a
+ Workspace:
+
+     FreeCell launch
+     FreeCell launchDeal: 617     'the famously hard one'
+     FreeCell launchDeal: 11982   'the one deal of the original 32000 nobody can win'
+
+ DRAG a card (or a run of cards) with the left button and drop it where it
+ goes; RIGHT-click a card to send it straight to a foundation if it will go;
+ SPACE deals a new game; Escape quits.
+
+ Why FreeCell rather than Klondike: every one of the 52 cards is face up from
+ the first frame. There is no hidden information anywhere in the game, which
+ makes it a far better demo — nothing is concealed, so nothing can be faked —
+ and it makes the whole state assertable from a headless test.
+
+ THE DEALS ARE THE REAL ONES, and this is checked rather than claimed.
+ `dealNumber:` implements the Microsoft FreeCell shuffle to its published
+ specification: the Microsoft C runtime's linear congruential generator,
+ `state = (214013 * state + 2531011) mod 2^31` with the value taken as
+ `state // 2^16` (so 0..32767); a deck ordered Ace of Clubs, Ace of Diamonds,
+ Ace of Hearts, Ace of Spades, 2 of Clubs and so on, which is exactly
+ `index = (rank - 1) * 4 + suit` for suits C, D, H, S; and the deal-as-you-go
+ loop — pick the card at `random \\ remaining`, swap the LAST card into its
+ place, deal the picked card — round-robin across the eight columns.
+
+ Verified against the published reference deals for game 1 and game 617 (see
+ `freecell_deals_match_the_published_reference_tables` in src/embed.rs): every
+ card of both, in order, in the right column. So deal 617 here is deal 617
+ anywhere, and the numbers people have traded for thirty years mean what they
+ should.
+
+ A note on reading those reference tables, because it cost a wrong conclusion
+ once: they are printed as ROWS OF EIGHT in DEAL order, not as columns. Row
+ one is the first card of each of the eight columns. Read down a printed row
+ expecting a column and every deal looks subtly wrong.
+
+ The one genuinely interesting rule is the supermove. FreeCell proper only
+ ever moves ONE card; moving a run of n is shorthand for shuffling them
+ through the free cells and empty columns, so it is legal only if
+ (free + 1) * 2^empty >= n — and when the destination IS an empty column that
+ column cannot also be used as scratch, hence 2^(empty-1). See
+ `moveCapacityToEmpty:`.
+
+ Drawing: the whole board is composed into one reused ByteArray of palette
+ indices and blitted in a single command, recomposed only when something
+ moves — which includes every frame of a drag, since the held cards follow
+ the pointer. Ranks and suits are pixel art stamped into that same buffer
+ rather than drawn with the pane's text overlay: the overlay is retained
+ between frames, so redrawing 52 labels a frame would push thousands of
+ commands a second down the VM->GUI channel (the mistake Minesweeper made
+ once and this demo does not repeat).
+
+ In a headless VM every game primitive silently fails, so loading this class
+ outside the GUI is harmless — which is how its regression test drives it."
+"I am FreeCell, played in the native game pane: 52 cards face up, four free
+ cells, four foundations and eight columns. Launch me from the Demos menu, or
+ a Workspace: FreeCell launch (or FreeCell launchDeal: 617 — my deal numbers are
+ Microsoft's originals, checked card-for-card against the published reference
+ tables, so they match everyone else's). Drag a card or a legal run with the
+ left button; right-click a card
+ to send it to a foundation; SPACE deals again; Escape quits. I move runs by
+ the real rule — (free cells + 1) * 2^(empty columns) — and I send cards up
+ automatically when it is safe to do so. Harmless to load in a headless VM."
+Object subclass: FreeCell [
+    | pane buf worldW worldH
+      cols free found deal
+      dragCards dragFrom dragIndex dragX dragY dragging
+      moves won dirty rngState prevSpace prevRight |
+    <classVars: Current>
+
+    "── geometry ──────────────────────────────────────────────────────────
+     A card is 34x46 with a 38-pixel pitch, so eight of them span 300 of the
+     320-pixel pane. FAN is the giveaway number: in a stacked column only the
+     top FAN pixels of a covered card are ever visible, so the rank and the
+     suit have to live inside that strip — everything else about the card
+     face is decoration."
+    FreeCell class >> cardW [ ^34 ]
+    FreeCell class >> cardH [ ^46 ]
+    FreeCell class >> pitch [ ^38 ]
+    FreeCell class >> fan   [ ^14 ]
+    FreeCell class >> originX [ ^10 ]
+    FreeCell class >> topY   [ ^6 ]
+    FreeCell class >> tableY [ ^62 ]
+
+    "── palette ───────────────────────────────────────────────────────────"
+    FreeCell class >> cTable  [ ^16 ]   "the baize"
+    FreeCell class >> cFace   [ ^17 ]   "card face"
+    FreeCell class >> cInk    [ ^18 ]   "black suits, card edge"
+    FreeCell class >> cRed    [ ^19 ]   "red suits"
+    FreeCell class >> cSlot   [ ^20 ]   "empty cell/foundation outline"
+    FreeCell class >> cShade  [ ^21 ]   "card edge shadow"
+
+    FreeCell class >> launch [
+        "Deal a game from the wall clock — a different one every time."
+        ^self launchDeal: (Time millisecondClockValue \\ 32000) + 1
+    ]
+
+    FreeCell class >> launchDeal: n [
+        "Deal Microsoft FreeCell game number `n`. The same number always
+         deals the same 52 cards, here and everywhere else."
+        ^self new startDeal: n
+    ]
+
+    FreeCell class >> current [
+        "The game most recently launched, so a Workspace can question it while
+         it runs — `FreeCell current freeCellsUsed` — and so the regression
+         test can read the board."
+        ^Current
+    ]
+
+    startDeal: n [
+        Current := self.
+        pane := GamePane new.
+        worldW := 320.
+        worldH := 240.
+        buf := ByteArray new: worldW * worldH.
+        self buildPalette.
+        self dealNumber: n.
+        pane onStep: [ :frame | self stepWith: frame ]; run.
+        ^self
+    ]
+
+    buildPalette [
+        pane paletteAt: FreeCell cTable r: 0   g: 105 b: 60.
+        pane paletteAt: FreeCell cFace  r: 250 g: 250 b: 245.
+        pane paletteAt: FreeCell cInk   r: 20  g: 20  b: 25.
+        pane paletteAt: FreeCell cRed   r: 200 g: 35  b: 40.
+        pane paletteAt: FreeCell cSlot  r: 0   g: 80  b: 45.
+        pane paletteAt: FreeCell cShade r: 0   g: 60  b: 35.
+        ^self
+    ]
+
+    "── the deal ──────────────────────────────────────────────────────────"
+
+    nextRandom [
+        "Microsoft's LCG, exactly: state = (state * 214013 + 2531011) kept to
+         31 bits, and the value is the TOP 15 bits of that. Getting either
+         half wrong deals a plausible-looking game that matches nobody
+         else's."
+        rngState := ((rngState * 214013) + 2531011) \\ 2147483648.
+        ^rngState // 65536
+    ]
+
+    dealNumber: n [
+        "Deal game `n` and open it: the deal proper, then the opening
+         auto-play (an ace at the foot of a column goes straight up — real
+         FreeCell does this, and starting a game by clicking four aces is
+         nobody's idea of play)."
+        self dealRaw: n.
+        self autoPlay.
+        ^self
+    ]
+
+    dealRaw: n [
+        "The deal exactly as the specification gives it, with nothing played:
+         build the deck 0..51, then repeatedly pick the card at `random \\
+         remaining`, swap the LAST remaining card into its place, and put the
+         picked card onto the next column round-robin. This is the method the
+         published reference tables are a statement about, which is why it is
+         separate from the auto-play above.
+
+         Card `c` is rank `c // 4 + 1` (1 = Ace) of suit `c \\ 4`, suits
+         ordered C, D, H, S — i.e. the deck starts AC AD AH AS 2C …, as the
+         spec requires."
+        | deck j last |
+        deal := n.
+        rngState := n.
+        cols := Array new: 8.
+        1 to: 8 do: [ :i | cols at: i put: OrderedCollection new ].
+        free := Array new: 4.
+        found := Array new: 4.
+        1 to: 4 do: [ :i | found at: i put: 0 ].
+        deck := OrderedCollection new.
+        0 to: 51 do: [ :c | deck add: c ].
+        0 to: 51 do: [ :i |
+            j := self nextRandom \\ (52 - i).
+            last := deck at: 52 - i.
+            (cols at: (i \\ 8) + 1) add: (deck at: j + 1).
+            deck at: j + 1 put: last ].
+        dragging := false.
+        dragCards := OrderedCollection new.
+        moves := 0.
+        won := false.
+        dirty := true.
+        prevSpace := false.
+        prevRight := false.
+        ^self
+    ]
+
+    "── cards ─────────────────────────────────────────────────────────────
+     A card is a plain SmallInteger 0..51 — no object, no allocation, and the
+     rank and suit fall straight out of it."
+
+    rankOf: c [ "1 = Ace … 13 = King." ^(c // 4) + 1 ]
+    suitOf: c [ "0 clubs, 1 diamonds, 2 hearts, 3 spades." ^c \\ 4 ]
+    isRed: c [ "Diamonds and hearts." | s | s := self suitOf: c. ^s = 1 or: [ s = 2 ] ]
+
+    "── the rules ─────────────────────────────────────────────────────────"
+
+    canStack: c on: onto [
+        "Tableau build: one lower, and the opposite colour."
+        ^((self rankOf: c) = ((self rankOf: onto) - 1))
+            and: [ (self isRed: c) ~= (self isRed: onto) ]
+    ]
+
+    canFound: c [
+        "A card goes up only onto its own suit's pile, and only next in
+         sequence — an Ace onto an empty one."
+        ^(found at: (self suitOf: c) + 1) = ((self rankOf: c) - 1)
+    ]
+
+    freeCellsUsed [ | n | n := 0. 1 to: 4 do: [ :i | (free at: i) isNil ifFalse: [ n := n + 1 ] ]. ^n ]
+    freeCellsOpen [ ^4 - self freeCellsUsed ]
+
+    emptyColumns [
+        | n |
+        n := 0.
+        1 to: 8 do: [ :i | (cols at: i) isEmpty ifTrue: [ n := n + 1 ] ].
+        ^n
+    ]
+
+    availableEmpties [
+        "Empty columns usable as scratch. The column the run was LIFTED from
+         does not count even when the lift emptied it: the cards are in the
+         hand, not yet anywhere, and the rule is about the state the move
+         starts from. Without this, taking a whole column and dropping it
+         elsewhere would appear to gain a doubling it never had."
+        | n |
+        n := self emptyColumns.
+        (dragging and: [ dragFrom = #column and: [ (cols at: dragIndex) isEmpty ] ])
+            ifTrue: [ n := n - 1 ].
+        ^n max: 0
+    ]
+
+    moveCapacityToEmpty: targetIsEmpty [
+        "How many cards may travel as one run. FreeCell itself only ever
+         moves a single card; a run of n is shorthand for parking n-1 of them
+         in free cells and empty columns and putting them back, so the limit
+         is (free + 1) * 2^empty. When the DESTINATION is an empty column
+         that column cannot also be scratch, so it does not count itself."
+        | empties cap |
+        empties := self availableEmpties.
+        targetIsEmpty ifTrue: [ empties := empties - 1 ].
+        empties < 0 ifTrue: [ empties := 0 ].
+        cap := self freeCellsOpen + 1.
+        empties timesRepeat: [ cap := cap * 2 ].
+        ^cap
+    ]
+
+    runLengthAt: colIndex from: idx [
+        "How many cards from `idx` to the bottom of the column form a legal
+         descending, alternating-colour run — 0 if they do not."
+        | col n |
+        col := cols at: colIndex.
+        n := col size - idx + 1.
+        idx to: col size - 1 do: [ :k |
+            (self canStack: (col at: k + 1) on: (col at: k)) ifFalse: [ ^0 ] ].
+        ^n
+    ]
+
+    "── moving ────────────────────────────────────────────────────────────"
+
+    dropOnColumn: target [
+        "Drop the held run onto tableau column `target`, if the rules and the
+         capacity both allow it. Answers whether it moved."
+        | col dest |
+        col := cols at: target.
+        dest := col isEmpty ifTrue: [ nil ] ifFalse: [ col last ].
+        dest isNil
+            ifFalse: [ (self canStack: (dragCards first) on: dest) ifFalse: [ ^false ] ].
+        dragCards size > (self moveCapacityToEmpty: col isEmpty) ifTrue: [ ^false ].
+        dragCards do: [ :c | col add: c ].
+        ^true
+    ]
+
+    dropOnFree: target [
+        "A free cell holds exactly one card, so only a single card may land."
+        (free at: target) isNil ifFalse: [ ^false ].
+        dragCards size = 1 ifFalse: [ ^false ].
+        free at: target put: dragCards first.
+        ^true
+    ]
+
+    dropOnFoundation: target [
+        "One card, and it must be next in sequence for that pile's suit."
+        | c |
+        dragCards size = 1 ifFalse: [ ^false ].
+        c := dragCards first.
+        (self suitOf: c) + 1 = target ifFalse: [ ^false ].
+        (self canFound: c) ifFalse: [ ^false ].
+        found at: target put: (self rankOf: c).
+        ^true
+    ]
+
+    sendToFoundation: c from: place index: idx [
+        "The right-click convenience: put one card up if it will go, taking it
+         from wherever it currently is. Answers whether it moved."
+        (self canFound: c) ifFalse: [ ^false ].
+        found at: (self suitOf: c) + 1 put: (self rankOf: c).
+        place = #column ifTrue: [ (cols at: idx) removeLast ].
+        place = #free ifTrue: [ free at: idx put: nil ].
+        moves := moves + 1.
+        Sound click play.
+        self autoPlay.
+        self checkWon.
+        dirty := true.
+        ^true
+    ]
+
+    autoPlay [
+        "Send up everything that is unarguably safe, repeatedly. A card is
+         safe when no lower card of the opposite colour could still need it —
+         i.e. both opposite-colour foundations have already reached one below
+         its rank. Aces and twos are always safe. This is the standard
+         conservative rule: it never takes a card a later move might want."
+        | moved |
+        moved := true.
+        [ moved ] whileTrue: [
+            moved := false.
+            1 to: 4 do: [ :i |
+                | c |
+                c := free at: i.
+                (c isNil not and: [ (self canFound: c) and: [ self isSafe: c ] ]) ifTrue: [
+                    found at: (self suitOf: c) + 1 put: (self rankOf: c).
+                    free at: i put: nil.
+                    moved := true ] ].
+            1 to: 8 do: [ :i |
+                | col c |
+                col := cols at: i.
+                col isEmpty ifFalse: [
+                    c := col last.
+                    ((self canFound: c) and: [ self isSafe: c ]) ifTrue: [
+                        found at: (self suitOf: c) + 1 put: (self rankOf: c).
+                        col removeLast.
+                        moved := true ] ] ] ].
+        ^self
+    ]
+
+    isSafe: c [
+        "Safe to send up automatically: rank 2 or lower always, otherwise both
+         opposite-colour piles must be at least one below this rank."
+        | r a b |
+        r := self rankOf: c.
+        r <= 2 ifTrue: [ ^true ].
+        (self isRed: c)
+            ifTrue: [ a := found at: 1. b := found at: 4 ]      "clubs, spades"
+            ifFalse: [ a := found at: 2. b := found at: 3 ].    "diamonds, hearts"
+        ^a >= (r - 1) and: [ b >= (r - 1) ]
+    ]
+
+    checkWon [
+        won := (found at: 1) = 13 and: [
+            (found at: 2) = 13 and: [ (found at: 3) = 13 and: [ (found at: 4) = 13 ] ] ].
+        won ifTrue: [ Sound powerup play ].
+        ^self
+    ]
+
+    "── questions a Workspace (or a test) can ask ─────────────────────────"
+
+    dealNumber [ ^deal ]
+    moveCount [ ^moves ]
+    hasWon [ ^won ]
+    isDragging [ ^dragging ]
+    columnSize: i [ ^(cols at: i) size ]
+    cardAtColumn: i index: k [ ^(cols at: i) at: k ]
+    foundationAt: i [ "Top rank on suit i's pile, 0 if empty." ^found at: i ]
+    freeAt: i [ ^free at: i ]
+    heldCount [ ^dragCards size ]
+
+    nameOfCard: c [
+        "A card in the notation everyone else prints — '7D', 'TC', 'AS'. Ranks
+         are A23456789TJQK and suits CDHS, which is also the order the card
+         index encodes, so this doubles as a statement of the encoding."
+        ^(('A23456789TJQK' at: (self rankOf: c)) asString)
+            , (('CDHS' at: (self suitOf: c) + 1) asString)
+    ]
+
+    columnString: i [
+        "A whole column in reference notation, space-separated — what a test
+         diffs against a published deal table."
+        | s col |
+        col := cols at: i.
+        s := ''.
+        1 to: col size do: [ :k |
+            k > 1 ifTrue: [ s := s , ' ' ].
+            s := s , (self nameOfCard: (col at: k)) ].
+        ^s
+    ]
+
+    "Setting up a position — for a Workspace exploring an endgame, and for the
+     regression tests. These bypass the rules on purpose: they place, they do
+     not move."
+    freeAt: i put: c [ free at: i put: c. dirty := true. ^self ]
+    foundationAt: i put: r [ found at: i put: r. dirty := true. ^self ]
+    clearColumn: i [ cols at: i put: OrderedCollection new. dirty := true. ^self ]
+    clearFoundations [ 1 to: 4 do: [ :i | found at: i put: 0 ]. dirty := true. ^self ]
+
+    "── input ─────────────────────────────────────────────────────────────"
+
+    stepWith: frame [
+        "One frame. The board only recomposes when something moved — but a
+         drag moves something every frame, so `dirty` is set while the pointer
+         is down and holding cards."
+        self readSpaceFrom: frame.
+        self readMouseFrom: frame.
+        dirty ifTrue: [ self paint. self drawHud. dirty := false ].
+        pane present.
+        ^self
+    ]
+
+    readSpaceFrom: frame [
+        "SPACE deals the next game — on the EDGE, or holding it would reshuffle
+         sixty times a second."
+        | down |
+        down := frame keyHeld: GamePane keyA.
+        (down and: [ prevSpace not ]) ifTrue: [
+            prevSpace := true.
+            ^self dealNumber: (Time millisecondClockValue \\ 32000) + 1 ].
+        prevSpace := down.
+        ^self
+    ]
+
+    readMouseFrom: frame [
+        "Left button: press picks up, holding drags, release drops. Right
+         button: press sends the card under it to a foundation. Both are
+         EDGE-triggered on the press — a held button must not pick up again
+         every frame — while the DRAG itself reads the level, because
+         following the pointer is exactly what a held button means."
+        | left right wasRight |
+        frame mouseInPane ifFalse: [ ^self ].
+        left := frame mouseDown.
+        right := frame mouseRightDown.
+        wasRight := prevRight.
+        prevRight := right.
+        (left and: [ dragging not ]) ifTrue: [ ^self pickUpAt: frame mouseX y: frame mouseY ].
+        (left and: [ dragging ]) ifTrue: [
+            dragX := frame mouseX. dragY := frame mouseY. dirty := true. ^self ].
+        (left not and: [ dragging ]) ifTrue: [ ^self dropAt: frame mouseX y: frame mouseY ].
+        (right and: [ wasRight not ]) ifTrue: [ ^self rightClickAt: frame mouseX y: frame mouseY ].
+        ^self
+    ]
+
+    pickUpAt: px y: py [
+        "Take a card, or the legal run beneath it, off the board and into the
+         hand. The cards leave their column now and go back on an illegal
+         drop — which keeps drawing simple: what is in the hand is never also
+         on the board."
+        | where kind idx |
+        won ifTrue: [ ^self ].
+        where := self locationAt: px y: py.
+        where isNil ifTrue: [ ^self ].
+        kind := where at: 1. idx := where at: 2.
+        kind = #free ifTrue: [
+            (free at: idx) isNil ifTrue: [ ^self ].
+            dragCards := OrderedCollection new.
+            dragCards add: (free at: idx).
+            free at: idx put: nil.
+            dragFrom := #free. dragIndex := idx.
+            ^self beginDragAt: px y: py ].
+        kind = #column ifTrue: [
+            | col k run |
+            col := cols at: idx.
+            col isEmpty ifTrue: [ ^self ].
+            k := where at: 3.
+            run := self runLengthAt: idx from: k.
+            run = 0 ifTrue: [ Sound blip play. ^self ].
+            dragCards := OrderedCollection new.
+            k to: col size do: [ :m | dragCards add: (col at: m) ].
+            run timesRepeat: [ col removeLast ].
+            dragFrom := #column. dragIndex := idx.
+            ^self beginDragAt: px y: py ].
+        ^self
+    ]
+
+    beginDragAt: px y: py [
+        dragging := true.
+        dragX := px. dragY := py.
+        dirty := true.
+        Sound click play.
+        ^self
+    ]
+
+    dropAt: px y: py [
+        "Release. Try the slot under the pointer; if it refuses, the cards go
+         back where they came from."
+        | where ok |
+        dragging := false.
+        ok := false.
+        where := self locationAt: px y: py.
+        where isNil ifFalse: [
+            | kind idx |
+            kind := where at: 1. idx := where at: 2.
+            kind = #column ifTrue: [ ok := self dropOnColumn: idx ].
+            kind = #free ifTrue: [ ok := self dropOnFree: idx ].
+            kind = #foundation ifTrue: [ ok := self dropOnFoundation: idx ] ].
+        ok
+            ifTrue: [
+                moves := moves + 1.
+                Sound click play.
+                self autoPlay.
+                self checkWon ]
+            ifFalse: [ self returnHeld. Sound blip play ].
+        dragCards := OrderedCollection new.
+        dirty := true.
+        ^self
+    ]
+
+    returnHeld [
+        "Put the hand back exactly where it was picked up from."
+        dragFrom = #free ifTrue: [ free at: dragIndex put: dragCards first. ^self ].
+        dragCards do: [ :c | (cols at: dragIndex) add: c ].
+        ^self
+    ]
+
+    rightClickAt: px y: py [
+        "Send the card under the pointer up, if it will go."
+        | where kind idx |
+        (dragging or: [ won ]) ifTrue: [ ^self ].
+        where := self locationAt: px y: py.
+        where isNil ifTrue: [ ^self ].
+        kind := where at: 1. idx := where at: 2.
+        kind = #free ifTrue: [
+            (free at: idx) isNil ifTrue: [ ^self ].
+            ^self sendToFoundation: (free at: idx) from: #free index: idx ].
+        kind = #column ifTrue: [
+            | col |
+            col := cols at: idx.
+            col isEmpty ifTrue: [ ^self ].
+            "Only the bottom card of a column can go up."
+            (where at: 3) = col size ifFalse: [ ^self ].
+            ^self sendToFoundation: col last from: #column index: idx ].
+        ^self
+    ]
+
+    locationAt: px y: py [
+        "What is under (px, py)? Answers #(kind index cardIndex) — kind is
+         #free, #foundation or #column; cardIndex is which card down a column
+         was hit, counting from 1. nil for the baize."
+        | slot x |
+        slot := (px - FreeCell originX) // FreeCell pitch.
+        (slot < 0 or: [ slot > 7 ]) ifTrue: [ ^nil ].
+        x := FreeCell originX + (slot * FreeCell pitch).
+        (px - x) >= FreeCell cardW ifTrue: [ ^nil ].   "in the gutter between cards"
+        py < FreeCell tableY ifTrue: [
+            (py < FreeCell topY or: [ py >= (FreeCell topY + FreeCell cardH) ])
+                ifTrue: [ ^nil ].
+            ^slot < 4
+                ifTrue: [ Array with: #free with: slot + 1 with: 0 ]
+                ifFalse: [ Array with: #foundation with: slot - 3 with: 0 ] ].
+        ^self columnHitAt: slot + 1 y: py
+    ]
+
+    columnHitAt: colIndex y: py [
+        "Which card of a fanned column the pointer is on. Every card but the
+         last shows only FAN pixels; the last shows its whole height."
+        | col n top k |
+        col := cols at: colIndex.
+        n := col size.
+        n = 0 ifTrue: [
+            ^(py < (FreeCell tableY + FreeCell cardH))
+                ifTrue: [ Array with: #column with: colIndex with: 1 ]
+                ifFalse: [ nil ] ].
+        top := FreeCell tableY.
+        k := (py - top) // FreeCell fan + 1.
+        k > n ifTrue: [ k := n ].
+        k < 1 ifTrue: [ ^nil ].
+        "Below the last card's full height is baize, not the column."
+        py >= (top + ((n - 1) * FreeCell fan) + FreeCell cardH) ifTrue: [ ^nil ].
+        ^Array with: #column with: colIndex with: k
+    ]
+
+    "── drawing ───────────────────────────────────────────────────────────"
+
+    fill: px y: py width: w height: h color: c [
+        "Fill a rectangle, clipped to the buffer — the dragged cards follow the
+         pointer and can hang off any edge."
+        | x0 y0 x1 y1 idx |
+        x0 := px max: 0. y0 := py max: 0.
+        x1 := (px + w) min: worldW. y1 := (py + h) min: worldH.
+        y0 to: y1 - 1 do: [ :y |
+            idx := (y * worldW) + x0 + 1.
+            0 to: x1 - x0 - 1 do: [ :dx | buf at: idx + dx put: c ] ].
+        ^self
+    ]
+
+    plot: px y: py color: c [
+        (px >= 0 and: [ px < worldW and: [ py >= 0 and: [ py < worldH ] ] ])
+            ifTrue: [ buf at: (py * worldW) + px + 1 put: c ].
+        ^self
+    ]
+
+    paint [
+        "Compose the whole board, then the hand on top of it, in one blit."
+        self fill: 0 y: 0 width: worldW height: worldH color: FreeCell cTable.
+        1 to: 4 do: [ :i |
+            | x |
+            x := FreeCell originX + ((i - 1) * FreeCell pitch).
+            (free at: i) isNil
+                ifTrue: [ self drawSlotAt: x y: FreeCell topY ]
+                ifFalse: [ self drawCard: (free at: i) at: x y: FreeCell topY full: true ] ].
+        1 to: 4 do: [ :i |
+            | x r |
+            x := FreeCell originX + ((i + 3) * FreeCell pitch).
+            r := found at: i.
+            r = 0
+                ifTrue: [ self drawFoundationSlotAt: x y: FreeCell topY suit: i - 1 ]
+                ifFalse: [ self drawCard: ((r - 1) * 4) + (i - 1) at: x y: FreeCell topY full: true ] ].
+        1 to: 8 do: [ :i | self drawColumn: i ].
+        dragging ifTrue: [ self drawHand ].
+        pane blit: buf.
+        ^self
+    ]
+
+    drawColumn: i [
+        | col x y |
+        col := cols at: i.
+        x := FreeCell originX + ((i - 1) * FreeCell pitch).
+        col isEmpty ifTrue: [ ^self drawSlotAt: x y: FreeCell tableY ].
+        1 to: col size do: [ :k |
+            y := FreeCell tableY + ((k - 1) * FreeCell fan).
+            self drawCard: (col at: k) at: x y: y full: k = col size ].
+        ^self
+    ]
+
+    drawHand [
+        "The held cards, fanned under the pointer. Drawn last so they are over
+         everything, and offset so the pointer sits near the card's top-left —
+         where you grabbed it."
+        | x y |
+        x := dragX - 12.
+        y := dragY - 8.
+        1 to: dragCards size do: [ :k |
+            self drawCard: (dragCards at: k)
+                 at: x y: y + ((k - 1) * FreeCell fan)
+                 full: k = dragCards size ].
+        ^self
+    ]
+
+    drawSlotAt: x y: y [
+        "An empty cell or column: a darker rectangle with a light outline."
+        self fill: x y: y width: FreeCell cardW height: FreeCell cardH color: FreeCell cShade.
+        self fill: x y: y width: FreeCell cardW height: 1 color: FreeCell cSlot.
+        self fill: x y: y + FreeCell cardH - 1 width: FreeCell cardW height: 1 color: FreeCell cSlot.
+        self fill: x y: y width: 1 height: FreeCell cardH color: FreeCell cSlot.
+        self fill: x + FreeCell cardW - 1 y: y width: 1 height: FreeCell cardH color: FreeCell cSlot.
+        ^self
+    ]
+
+    drawFoundationSlotAt: x y: y suit: s [
+        "An empty foundation shows its suit, faintly, so you know where each
+         one goes before anything is on it."
+        self drawSlotAt: x y: y.
+        self stamp: (self suitArt: s) at: x + 13 y: y + 18 color: FreeCell cSlot.
+        ^self
+    ]
+
+    drawCard: c at: x y: y full: isFull [
+        "A card. `isFull` draws the whole face; otherwise only the top FAN
+         pixels will ever be seen, but the face is drawn anyway — the card
+         below overwrites the rest, and one code path is worth more than the
+         handful of stores it costs.
+
+         The rank and the suit go in the top-left, INSIDE the fan strip: in a
+         stacked column that strip is the only part of a covered card you can
+         see, so anything drawn lower is decoration for the bottom card
+         alone."
+        | h ink |
+        h := isFull ifTrue: [ FreeCell cardH ] ifFalse: [ FreeCell fan + 2 ].
+        self fill: x y: y width: FreeCell cardW height: h color: FreeCell cFace.
+        "A one-pixel edge, and the corners knocked off so it reads as a card."
+        self fill: x y: y width: FreeCell cardW height: 1 color: FreeCell cInk.
+        self fill: x y: y width: 1 height: h color: FreeCell cInk.
+        self fill: x + FreeCell cardW - 1 y: y width: 1 height: h color: FreeCell cInk.
+        isFull ifTrue: [
+            self fill: x y: y + h - 1 width: FreeCell cardW height: 1 color: FreeCell cInk ].
+        self plot: x y: y color: FreeCell cTable.
+        self plot: x + FreeCell cardW - 1 y: y color: FreeCell cTable.
+        ink := (self isRed: c) ifTrue: [ FreeCell cRed ] ifFalse: [ FreeCell cInk ].
+        self drawRank: (self rankOf: c) at: x + 3 y: y + 4 color: ink.
+        self stamp: (self suitArt: (self suitOf: c)) at: x + 22 y: y + 4 color: ink.
+        ^self
+    ]
+
+    drawRank: r at: x y: y color: ink [
+        "A for ace, J/Q/K for the court cards, 10 as two glyphs, the rest as
+         one digit."
+        r = 10
+            ifTrue: [
+                self stamp: (self glyph: 1) at: x y: y color: ink.
+                self stamp: (self glyph: 0) at: x + 6 y: y color: ink ]
+            ifFalse: [ self stamp: (self glyphForRank: r) at: x y: y color: ink ].
+        ^self
+    ]
+
+    glyphForRank: r [
+        r = 1 ifTrue: [ ^self glyphA ].
+        r = 11 ifTrue: [ ^self glyphJ ].
+        r = 12 ifTrue: [ ^self glyphQ ].
+        r = 13 ifTrue: [ ^self glyphK ].
+        ^self glyph: r
+    ]
+
+    stamp: rows at: px y: py color: c [
+        "Draw pixel art — an Array of equal-length row Strings, `#` set and
+         `.` transparent — into the frame buffer. `=` not `==`: String>>at:
+         answers a fresh Character, not the canonical one, so identity is
+         false even for the same character (the bug that made every piece of
+         Minesweeper's art silently invisible)."
+        | row |
+        1 to: rows size do: [ :r |
+            row := rows at: r.
+            1 to: row size do: [ :k |
+                (row at: k) = $# ifTrue: [
+                    self plot: px + k - 1 y: py + r - 1 color: c ] ] ].
+        ^self
+    ]
+
+    "── the pixel art ─────────────────────────────────────────────────────"
+
+    suitArt: s [
+        "Clubs, diamonds, hearts, spades — 7x7, in that order (the order the
+         card index encodes)."
+        | a |
+        a := OrderedCollection new.
+        s = 1 ifTrue: [
+            a add: '...#...'. a add: '..###..'. a add: '.#####.'. a add: '#######'.
+            a add: '.#####.'. a add: '..###..'. a add: '...#...'. ^a asArray ].
+        s = 2 ifTrue: [
+            a add: '.##.##.'. a add: '#######'. a add: '#######'. a add: '#######'.
+            a add: '.#####.'. a add: '..###..'. a add: '...#...'. ^a asArray ].
+        s = 3 ifTrue: [
+            a add: '...#...'. a add: '..###..'. a add: '.#####.'. a add: '#######'.
+            a add: '#######'. a add: '.#.#.#.'. a add: '..###..'. ^a asArray ].
+        a add: '..###..'. a add: '..###..'. a add: '#######'. a add: '#######'.
+        a add: '#.###.#'. a add: '...#...'. a add: '..###..'. ^a asArray
+    ]
+
+    glyph: n [
+        "Digits 0..9 as 5x7."
+        | a |
+        a := OrderedCollection new.
+        n = 0 ifTrue: [
+            a add: '.###.'. a add: '#...#'. a add: '#..##'. a add: '#.#.#'.
+            a add: '##..#'. a add: '#...#'. a add: '.###.'. ^a asArray ].
+        n = 1 ifTrue: [
+            a add: '..#..'. a add: '.##..'. a add: '..#..'. a add: '..#..'.
+            a add: '..#..'. a add: '..#..'. a add: '.###.'. ^a asArray ].
+        n = 2 ifTrue: [
+            a add: '.###.'. a add: '#...#'. a add: '....#'. a add: '...#.'.
+            a add: '..#..'. a add: '.#...'. a add: '#####'. ^a asArray ].
+        n = 3 ifTrue: [
+            a add: '.###.'. a add: '#...#'. a add: '....#'. a add: '..##.'.
+            a add: '....#'. a add: '#...#'. a add: '.###.'. ^a asArray ].
+        n = 4 ifTrue: [
+            a add: '...#.'. a add: '..##.'. a add: '.#.#.'. a add: '#..#.'.
+            a add: '#####'. a add: '...#.'. a add: '...#.'. ^a asArray ].
+        n = 5 ifTrue: [
+            a add: '#####'. a add: '#....'. a add: '####.'. a add: '....#'.
+            a add: '....#'. a add: '#...#'. a add: '.###.'. ^a asArray ].
+        n = 6 ifTrue: [
+            a add: '..##.'. a add: '.#...'. a add: '#....'. a add: '####.'.
+            a add: '#...#'. a add: '#...#'. a add: '.###.'. ^a asArray ].
+        n = 7 ifTrue: [
+            a add: '#####'. a add: '....#'. a add: '...#.'. a add: '..#..'.
+            a add: '.#...'. a add: '.#...'. a add: '.#...'. ^a asArray ].
+        n = 8 ifTrue: [
+            a add: '.###.'. a add: '#...#'. a add: '#...#'. a add: '.###.'.
+            a add: '#...#'. a add: '#...#'. a add: '.###.'. ^a asArray ].
+        a add: '.###.'. a add: '#...#'. a add: '#...#'. a add: '.####'.
+        a add: '....#'. a add: '...#.'. a add: '.##..'. ^a asArray
+    ]
+
+    glyphA [
+        | a |
+        a := OrderedCollection new.
+        a add: '..#..'. a add: '.#.#.'. a add: '#...#'. a add: '#...#'.
+        a add: '#####'. a add: '#...#'. a add: '#...#'. ^a asArray
+    ]
+
+    glyphJ [
+        | a |
+        a := OrderedCollection new.
+        a add: '....#'. a add: '....#'. a add: '....#'. a add: '....#'.
+        a add: '#...#'. a add: '#...#'. a add: '.###.'. ^a asArray
+    ]
+
+    glyphQ [
+        | a |
+        a := OrderedCollection new.
+        a add: '.###.'. a add: '#...#'. a add: '#...#'. a add: '#...#'.
+        a add: '#.#.#'. a add: '#..#.'. a add: '.##.#'. ^a asArray
+    ]
+
+    glyphK [
+        | a |
+        a := OrderedCollection new.
+        a add: '#...#'. a add: '#..#.'. a add: '#.#..'. a add: '##...'.
+        a add: '#.#..'. a add: '#..#.'. a add: '#...#'. ^a asArray
+    ]
+
+    "── the HUD ───────────────────────────────────────────────────────────"
+
+    drawHud [
+        "The text overlay, in viewport coordinates and retained between
+         frames, so it is cleared and redrawn whole — and only when the board
+         is redrawn."
+        pane textClear.
+        won
+            ifTrue: [ pane text: 'YOU WIN' x: 128 y: 112 r: 255 g: 240 b: 120 scale: 2 ]
+            ifFalse: [ ].
+        "Both lines have to fit 320 pixels: the 5x7 font steps 6 pixels a
+         character, so 53 characters is the whole width and the pane clips
+         what runs past it without a word of complaint."
+        pane text: 'DEAL ', deal printString, '  MOVES ', moves printString
+             x: 4 y: 232 r: 200 g: 230 b: 210 scale: 1.
+        pane text: 'DRAG   RIGHT UP   ESC QUIT'
+             x: 158 y: 232 r: 140 g: 180 b: 160 scale: 1.
+        ^self
+    ]
+]
