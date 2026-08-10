@@ -447,6 +447,50 @@ Object subclass: GamePane [
         ^self
     ]
 
+    "--- direct screen memory (docs/shared_screen_memory_design.md) ---
+     The fast path for a demo that computes every pixel: instead of filling a
+     ByteArray and shipping it here with blit:, ask me for the framebuffer
+     ITSELF and write into it. On Apple Silicon the memory the GPU samples is
+     ordinary memory, so `screenMemory` hands back an Alien over it and a
+     store into that Alien IS a store into the screen. No command, no copy.
+
+         pane openDirect: 320 height: 240.
+         fb := pane screenMemory.        'refetch each frame — see below'
+         s  := pane screenStride.
+         fb byteAt: (y * s) + x + 1 put: colourIndex.
+         pane present.
+
+     TWO THINGS TO GET RIGHT. The stride is NOT the width — a row is
+     `screenStride` bytes wide because the GPU rounds it up, so address
+     `fb byteAt: y * stride + x + 1` and never `y * width + x`. And refetch
+     `screenMemory` every frame: presenting rotates which buffer you are
+     writing (that rotation is what stops you drawing into the one the GPU is
+     reading), so a kept Alien goes stale."
+
+    openDirect: w height: h [
+        "Build a direct framebuffer `w` by `h` in GPU-shared memory. Send this
+         before asking for screenMemory. Colours are palette indices exactly as
+         everywhere else, so paletteAt:r:g:b: still applies."
+        <primitive: 268>
+        ^self
+    ]
+
+    screenMemory [
+        "The framebuffer as an Alien, or nil if no direct pane is open (a
+         headless VM always answers nil, so a demo can check and fall back to
+         blit:). The Alien is LENGTH-BOUNDED: writing past the end fails
+         rather than corrupting whatever follows the screen."
+        <primitive: 269>
+        ^nil
+    ]
+
+    screenStride [
+        "Bytes per row of the direct framebuffer — see the warning above. nil
+         if no direct pane is open."
+        <primitive: 270>
+        ^nil
+    ]
+
     overscan: margin [
         "Build me with a WORLD `margin` pixels bigger than my viewport on every
          side, so the view can be scrolled around inside it. Like resizeTo:by:

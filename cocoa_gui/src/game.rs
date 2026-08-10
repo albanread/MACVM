@@ -24,6 +24,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 
+use macgamepane_graphics::direct_pane::DirectPane;
 use macgamepane_graphics::indexed_pane::IndexedPane;
 use macgamepane_graphics::shader_pane::ShaderPane;
 use macgamepane_graphics::sprites::Sprites;
@@ -99,6 +100,12 @@ impl GameSink for PrimaryGameSink {
 struct NativeGame {
     win: GameWindow,
     pane: IndexedPane,
+    /// The DIRECT framebuffer, when a demo asked for one
+    /// (`GamePane>>openDirect:height:`, docs/shared_screen_memory_design.md).
+    /// `Some` replaces the indexed pane as what `present` draws: the VM has
+    /// been writing pixels straight into this buffer's shared memory, so there
+    /// is nothing to upload and nothing to composite under.
+    direct: Option<DirectPane>,
     sprites: Sprites,
     /// The topmost HUD/text layer (RGB, real 5x7 font) — always composited
     /// last. Retained between frames; a demo `TextClear`s it each frame.
@@ -182,6 +189,7 @@ fn ensure_pane() {
         *cell.borrow_mut() = Some(NativeGame {
             win,
             pane,
+            direct: None,
             sprites,
             text,
             shader: None,
@@ -263,6 +271,10 @@ fn close_window() {
     REQ_H.store(PANE_H as i64, Ordering::Release);
     REQ_FPS.store(DEFAULT_FPS, Ordering::Release);
     REQ_OVERSCAN.store(0, Ordering::Release);
+    // Retract the framebuffer BEFORE the buffers are dropped below: any Alien
+    // the demo still holds must read as "no screen" rather than as memory that
+    // is about to be freed.
+    macvm::embed::clear_screen_memory();
     // Forget where the mouse was; the next demo's first frame should not see a
     // pointer position left behind by this one.
     GAME_MOUSE_X.store(-1, Ordering::Release);
@@ -305,6 +317,27 @@ fn close_window() {
 /// `Load` (its transparent index 0 lets the shader show through), then sprites,
 /// then the text overlay on top. With no shader the pane clears the frame.
 fn present(g: &mut NativeGame) {
+    // A DIRECT pane short-circuits the whole retained path: the VM has been
+    // storing pixels into shared memory the GPU samples, so there is nothing to
+    // upload and no indexed buffer to composite. Draw it, then republish —
+    // rendering ROTATES which buffer is the write target, and the VM must be
+    // told, or its next frame would be drawn into the one being displayed.
+    if g.direct.is_some() {
+        g.text.upload();
+        let Some(drawable) = g.win.layer.next_drawable() else {
+            return;
+        };
+        let tex = drawable.texture();
+        let cb = g.win.command_queue.new_command_buffer();
+        if let Some(d) = g.direct.as_mut() {
+            d.render(cb, tex);
+        }
+        g.text.render(cb, tex);
+        cb.present_drawable(drawable);
+        cb.commit();
+        publish_direct(g);
+        return;
+    }
     g.pane.upload();
     g.text.upload();
     let Some(drawable) = g.win.layer.next_drawable() else {
@@ -326,13 +359,31 @@ fn present(g: &mut NativeGame) {
     cb.commit();
 }
 
+/// Tell the VM where the direct framebuffer is right now. Called when the pane
+/// is built and again after every present, because presenting rotates the write
+/// buffer. This is the one piece of pane state that travels by publication
+/// rather than by command — a primitive has to RETURN an address, and the
+/// command channel only runs the other way.
+fn publish_direct(g: &NativeGame) {
+    if let Some(d) = g.direct.as_ref() {
+        macvm::embed::publish_screen_memory(d.backbuffer_ptr(), d.stride(), d.height() as usize);
+    }
+}
+
 /// Apply one `GameCommand` to the pane (main thread) — the exact vocabulary
 /// game_pane.rs's `apply_command` handles. Loop control (`StartLoop`/`StopLoop`)
 /// is handled by the caller; here we only draw/present.
 fn apply(g: &mut NativeGame, cmd: &GameCommand) {
     use GameCommand as C;
     match cmd {
-        C::PaletteAt { index, r, g: gg, b } => g.pane.set_rgb(*index, *r, *gg, *b),
+        // Palette entries reach BOTH panes: a direct-mode demo still says
+        // `paletteAt:r:g:b:`, and its shader samples its own palette buffer.
+        C::PaletteAt { index, r, g: gg, b } => {
+            g.pane.set_rgb(*index, *r, *gg, *b);
+            if let Some(d) = g.direct.as_mut() {
+                d.set_rgb(*index, *r, *gg, *b);
+            }
+        }
         C::Cls { index } => g.pane.cls(*index),
         C::ClearTo { r, g: gg, b } => {
             g.pane.set_rgb(PAL_BG, *r, *gg, *b);
@@ -406,6 +457,8 @@ fn apply(g: &mut NativeGame, cmd: &GameCommand) {
         // sets a shader uniform, so a demo can pan or shake every frame for
         // the cost of one command. Clamped inside the engine.
         C::Scroll { x, y } => g.pane.set_scroll(*x, *y),
+        // Handled in `drain` — it builds the pane and publishes its address.
+        C::OpenDirect { .. } => {}
         // SetPaneSize/SetOverscan are handled in `drain` (before the pane
         // exists); loop and audio are handled there too. A stray one here is a
         // harmless no-op.
@@ -453,6 +506,42 @@ pub fn drain() {
                 if exists && SESSION_OPEN.load(Ordering::Acquire) {
                     rebuild_pane_at_requested_size();
                 }
+            }
+            // Build the direct framebuffer and publish where it is. The pane
+            // (and window) must exist first — a demo may send this as its very
+            // first command, before anything has drawn.
+            GameCommand::OpenDirect { w, h } => {
+                if !SESSION_OPEN.load(Ordering::Acquire)
+                    && !STOP_DUE.load(Ordering::Acquire)
+                    && !RESET_DUE.load(Ordering::Acquire)
+                {
+                    SESSION_OPEN.store(true, Ordering::Release);
+                    GAME_ACTIVE.store(true, Ordering::Release);
+                }
+                REQ_W.store(*w as i64, Ordering::Release);
+                REQ_H.store(*h as i64, Ordering::Release);
+                ensure_pane();
+                GAME.with(|cell| {
+                    if let Some(g) = cell.borrow_mut().as_mut() {
+                        match DirectPane::new(&g.win.device, *w, *h) {
+                            Ok(d) => {
+                                macvm::embed::publish_screen_memory(
+                                    d.backbuffer_ptr(),
+                                    d.stride(),
+                                    d.height() as usize,
+                                );
+                                eprintln!(
+                                    "macvm-cocoa: direct framebuffer {}x{} stride {}",
+                                    *w,
+                                    *h,
+                                    d.stride()
+                                );
+                                g.direct = Some(d);
+                            }
+                            Err(e) => eprintln!("macvm-cocoa: direct pane failed: {e}"),
+                        }
+                    }
+                });
             }
             // How much bigger than the viewport the world should be. Like
             // SetPaneSize this decides how the pane is BUILT, so it must

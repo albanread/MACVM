@@ -1496,6 +1496,30 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 268,
+        name: "GamePane>>openDirect:height:",
+        f: prim_game_open_direct,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 269,
+        name: "GamePane>>screenMemory",
+        f: prim_game_screen_memory,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 270,
+        name: "GamePane>>screenStride",
+        f: prim_game_screen_stride,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1915,6 +1939,64 @@ fn prim_game_scroll(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     };
     game_emit(vm, GameCommand::Scroll { x, y });
     PrimResult::Ok(args[0])
+}
+
+/// `openDirect:height:` (268): ask the host to build a DIRECT pane — a
+/// framebuffer in GPU-visible shared memory (docs/shared_screen_memory_design.md).
+/// The host answers out-of-band by publishing the buffer's address, which
+/// `screenMemory` below then reads; there is nothing to wait for here, because
+/// the demo's next act is to ask for the memory and it will be there.
+fn prim_game_open_direct(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(w), Some(h)) = (smi_i64(args[1]), smi_i64(args[2])) else {
+        return PrimResult::Fail;
+    };
+    if !(1..=4096).contains(&w) || !(1..=4096).contains(&h) {
+        return PrimResult::Fail;
+    }
+    game_emit(
+        vm,
+        GameCommand::OpenDirect {
+            w: w as u32,
+            h: h as u32,
+        },
+    );
+    PrimResult::Ok(args[0])
+}
+
+/// `screenMemory` (269): the direct framebuffer as an indirect `Alien` — a
+/// LENGTH-BOUNDED view over GPU-shared memory, so a demo writing pixels
+/// physically cannot address past the buffer it was handed (a raw pointer
+/// would lose exactly that). Fails when no direct pane is open, which is how a
+/// headless VM and a demo that never opened one both answer sensibly.
+///
+/// Re-fetch it every frame: presenting rotates which of the rotating buffers
+/// is the write target, so yesterday's Alien names the buffer the GPU is
+/// reading.
+fn prim_game_screen_memory(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    let Some((ptr, stride, height)) = crate::embed::screen_memory() else {
+        return PrimResult::Fail;
+    };
+    let bytes = stride.saturating_mul(height);
+    if bytes == 0 {
+        return PrimResult::Fail;
+    }
+    PrimResult::Ok(crate::runtime::alien::make_indirect_alien(
+        vm, ptr as u64, bytes,
+    ))
+}
+
+/// `screenStride` (270): the framebuffer's ROW STRIDE in bytes, which is NOT
+/// its width. A buffer-backed Metal texture's `bytesPerRow` is rounded up to
+/// the format's linear alignment, so a row is `stride` bytes even when only
+/// `width` of them are visible, and a demo addresses `fb[y * stride + x]`.
+/// Assuming `y * width + x` draws a sheared picture — this is the single most
+/// likely mistake against this API, which is why the stride is a first-class
+/// question rather than something to infer.
+fn prim_game_screen_stride(_vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    let Some((_, stride, _)) = crate::embed::screen_memory() else {
+        return PrimResult::Fail;
+    };
+    PrimResult::Ok(SmallInt::new(stride as i64).oop())
 }
 
 /// `linePaletteAt:index:rgb:` (261): per-scanline palette override. Colour is a
@@ -5350,6 +5432,9 @@ mod tests {
             (265, "instVarAt:put:"),
             (266, "GamePane>>overscan:"),
             (267, "GamePane>>scrollTo:y:"),
+            (268, "GamePane>>openDirect:height:"),
+            (269, "GamePane>>screenMemory"),
+            (270, "GamePane>>screenStride"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

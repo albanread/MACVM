@@ -30,7 +30,7 @@
 
 use std::cell::Cell;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::codecache::deopt_trap;
@@ -400,6 +400,13 @@ pub enum GameCommand {
     /// `SetPaneSize`, it decides how the pane is built. The scroll starts
     /// centred, i.e. at `(margin, margin)`.
     SetOverscan { margin: u32 },
+    /// Build a DIRECT pane: a framebuffer in GPU-visible shared memory that
+    /// the VM writes with ordinary byte stores instead of shipping pixels
+    /// through this channel (`GamePane>>openDirect:height:`,
+    /// docs/shared_screen_memory_design.md). The host answers by publishing
+    /// the buffer's address through [`publish_screen_memory`]; from then on
+    /// `Present` renders whatever is in it.
+    OpenDirect { w: u32, h: u32 },
     /// Move the viewport to `(x, y)` within the world (`GamePane>>scrollTo:y:`).
     /// This is a UNIFORM update, not a redraw: no pixel is touched and nothing
     /// is re-uploaded, so panning or shaking the view costs one command a
@@ -444,6 +451,69 @@ pub enum GameCommand {
         g: u8,
         b: u8,
     },
+}
+
+// ── shared screen memory (docs/shared_screen_memory_design.md) ──────────────
+//
+// The one piece of game state that does NOT travel as a command, and cannot.
+// Everything else here flows VM → host: the VM emits, the host applies. But
+// `GamePane>>screenMemory` has to *return* an address, and the address belongs
+// to the host — it is the `contents()` of a Metal buffer the main thread
+// created. A primitive on the VM thread has to read it directly.
+//
+// So the host PUBLISHES it here and the primitive READS it. Plain atomics, no
+// lock: the publisher is one thread (main, at pane creation and again after
+// every present, since the write buffer rotates), and readers only ever load.
+//
+// `generation` is the safety interlock. The S21 supervisor can kill and
+// respawn the primary while a demo holds an Alien over this memory, and a pane
+// can close underneath one. Every published buffer carries a generation; the
+// primitive stamps the generation it read into the Alien's size-0 case, and
+// `clear_screen_memory` bumps it so a stale handle reads as "no buffer" rather
+// than as freed memory. Belt and braces on top of the fact that the buffers
+// themselves are only freed on pane close, with the writing VM stopped first.
+static SCREEN_PTR: AtomicUsize = AtomicUsize::new(0);
+static SCREEN_STRIDE: AtomicUsize = AtomicUsize::new(0);
+static SCREEN_HEIGHT: AtomicUsize = AtomicUsize::new(0);
+static SCREEN_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Publish the current direct framebuffer. Called by the host on the thread
+/// that owns the Metal buffers — at pane creation, and after each present,
+/// because presenting rotates which of the buffers is the write target.
+///
+/// # Safety contract (not `unsafe`, but a contract all the same)
+/// `ptr` must stay valid and writable until [`clear_screen_memory`] is called,
+/// and the host must stop the writing VM before freeing it.
+pub fn publish_screen_memory(ptr: *mut u8, stride: usize, height: usize) {
+    SCREEN_STRIDE.store(stride, Ordering::Relaxed);
+    SCREEN_HEIGHT.store(height, Ordering::Relaxed);
+    // The pointer last, with Release: a reader that sees a non-null pointer is
+    // guaranteed to see the stride and height that go with it.
+    SCREEN_PTR.store(ptr as usize, Ordering::Release);
+}
+
+/// Retract the framebuffer — the pane closed, or is being rebuilt. Bumps the
+/// generation so any Alien still held over the old memory is dead rather than
+/// dangling.
+pub fn clear_screen_memory() {
+    SCREEN_PTR.store(0, Ordering::Release);
+    SCREEN_STRIDE.store(0, Ordering::Relaxed);
+    SCREEN_HEIGHT.store(0, Ordering::Relaxed);
+    SCREEN_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// The published framebuffer as `(ptr, stride, height)`, or `None` when no
+/// direct pane is open.
+pub(crate) fn screen_memory() -> Option<(*mut u8, usize, usize)> {
+    let p = SCREEN_PTR.load(Ordering::Acquire);
+    if p == 0 {
+        return None;
+    }
+    Some((
+        p as *mut u8,
+        SCREEN_STRIDE.load(Ordering::Relaxed),
+        SCREEN_HEIGHT.load(Ordering::Relaxed),
+    ))
 }
 
 /// Where game-primitive commands go — the game analogue of [`TranscriptSink`].
@@ -2344,6 +2414,248 @@ mod tests {
             stopped_at.is_some(),
             "MandelVM must end its dive with a StopLoop (pane stop) within 140 frames"
         );
+    }
+
+    /// The published framebuffer is PROCESS-global (it has to be — the host
+    /// publishes it from one thread and any VM thread reads it), so the tests
+    /// that publish must not run concurrently. Caught the honest way: they
+    /// raced on the first run and one saw the other's buffer.
+    static SCREEN_MEM_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn screen_memory_writes_land_in_the_hosts_buffer_with_no_commands() {
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::embed::clear_screen_memory();
+        // SM0. The whole point of shared screen memory is that a pixel write
+        // is a STORE, not a message — so this test asserts both halves: the
+        // bytes really land in the host's buffer, and the game channel stays
+        // silent while a demo fills the screen.
+        //
+        // No GPU needed. The host side of this contract is "publish a pointer
+        // and a stride"; a plain Vec is as good a publisher as a Metal buffer,
+        // which is exactly why the boundary was drawn there.
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+
+        const W: usize = 64;
+        const H: usize = 32;
+        // A stride DELIBERATELY wider than the width: this is the shape a real
+        // buffer-backed Metal texture has, and a demo that assumed y*W+x would
+        // pass on stride == width and shear on anything else.
+        const STRIDE: usize = 80;
+        let mut host_buffer = vec![0u8; STRIDE * H];
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+
+        // Nothing published yet: the primitives must answer nil, so a headless
+        // demo can detect the absence and fall back rather than fail.
+        assert_eq!(vm.eval("GamePane new screenMemory.").unwrap(), "nil");
+        assert_eq!(vm.eval("GamePane new screenStride.").unwrap(), "nil");
+
+        crate::embed::publish_screen_memory(host_buffer.as_mut_ptr(), STRIDE, H);
+
+        assert_eq!(
+            vm.eval("GamePane new screenStride.").unwrap(),
+            STRIDE.to_string(),
+            "the stride must be the ROW stride, not the width"
+        );
+
+        vm.exec("GamePane basicNew openDirect: 64 height: 32.")
+            .expect("openDirect must run");
+
+        // Fill the screen from Smalltalk: a diagonal ramp, addressed the way
+        // the documentation says to address it.
+        //
+        // `basicNew`, not `new` — `GamePane class>>new` installs a 16-colour
+        // palette, which is 16 real commands. Sending it inside the loop would
+        // emit 32,768 of them and make the silence assertion below a lie about
+        // the thing it is supposed to be proving.
+        //
+        // Both the Alien and the stride are hoisted into block arguments (a
+        // doit cannot declare top-level temporaries in this dialect), so the
+        // loop is nothing but stores.
+        captured.lock().unwrap().clear();
+        vm.exec(
+            "[ :fb :s | \
+                (1 to: 32) do: [ :row | \
+                    (1 to: 64) do: [ :colm | \
+                        fb byteAt: ((row - 1) * s) + colm \
+                           put: ((row + colm) \\\\ 251) ] ] ] \
+               value: GamePane basicNew screenMemory \
+               value: GamePane basicNew screenStride.",
+        )
+        .expect("writing the screen must run");
+
+        // Every pixel landed, at the STRIDE-addressed offset.
+        for row in 0..H {
+            for col in 0..W {
+                let want = ((row + 1 + col + 1) % 251) as u8;
+                assert_eq!(
+                    host_buffer[row * STRIDE + col],
+                    want,
+                    "pixel ({col},{row}) must land at row*stride + col"
+                );
+            }
+        }
+        // The padding between the visible width and the stride is untouched —
+        // proof the writes went where they were addressed and nowhere else.
+        for row in 0..H {
+            for pad in W..STRIDE {
+                assert_eq!(
+                    host_buffer[row * STRIDE + pad],
+                    0,
+                    "stride padding at row {row} must be untouched"
+                );
+            }
+        }
+
+        // And the channel stayed silent: filling 2,048 pixels emitted no
+        // Blit, no Pset, nothing. That is the whole thesis of SM0.
+        let cmds = captured.lock().unwrap();
+        assert!(
+            cmds.is_empty(),
+            "writing the screen must emit NO commands, got {:?}",
+            cmds.iter().take(4).collect::<Vec<_>>()
+        );
+        drop(cmds);
+
+        // Retracting it makes every handle answer nil again rather than
+        // dangling over memory the host is about to reclaim.
+        crate::embed::clear_screen_memory();
+        assert_eq!(vm.eval("GamePane new screenMemory.").unwrap(), "nil");
+        assert_eq!(vm.eval("GamePane new screenStride.").unwrap(), "nil");
+    }
+
+    #[test]
+    fn a_full_screen_direct_demo_costs_exactly_one_command_per_frame() {
+        // THE SM0 CLAIM, stated as a number. Plasma (world/45d_plasma.mst)
+        // rewrites all 76,800 pixels every frame. Through the retained path
+        // that is a `Blit` carrying the whole frame; through screen memory it
+        // is 76,800 stores into memory the GPU already sees, and the only
+        // thing left on the channel is the `Present` that says "show it".
+        //
+        // One command per frame, independent of how much changed. That is the
+        // whole point of the slice, and it is worth an assertion rather than a
+        // paragraph.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::embed::clear_screen_memory();
+
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+        const W: usize = 320;
+        const H: usize = 240;
+        let mut host = vec![0u8; W * H];
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+        crate::embed::publish_screen_memory(host.as_mut_ptr(), W, H);
+
+        vm.exec("Plasma launch.").expect("Plasma must launch");
+
+        // Now measure steady state: five frames, counted.
+        captured.lock().unwrap().clear();
+        for _ in 0..5 {
+            vm.exec("GamePane stepWithKeys: 0 mouseX: -1 y: -1 buttons: 0.")
+                .expect("a plasma frame must run");
+        }
+        let cmds = captured.lock().unwrap();
+        let presents = cmds
+            .iter()
+            .filter(|c| matches!(c, GameCommand::Present))
+            .count();
+        assert_eq!(presents, 5, "each frame presents exactly once");
+        assert_eq!(
+            cmds.len(),
+            5,
+            "five full-screen frames must cost five commands and nothing else \
+             — got {:?}",
+            cmds.iter()
+                .filter(|c| !matches!(c, GameCommand::Present))
+                .take(4)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, GameCommand::Blit { .. })),
+            "a direct demo must never blit"
+        );
+        drop(cmds);
+
+        // And it really drew: the field is not blank, and it is not flat.
+        let nonzero = host.iter().filter(|&&b| b != 0).count();
+        assert!(
+            nonzero > W * H / 2,
+            "the plasma must fill the screen, got {nonzero} non-zero pixels"
+        );
+        let mut seen = [false; 256];
+        for &b in host.iter() {
+            seen[b as usize] = true;
+        }
+        let distinct = seen.iter().filter(|&&s| s).count();
+        assert!(
+            distinct > 32,
+            "a plasma is a gradient, not a fill — got {distinct} distinct indices"
+        );
+        crate::embed::clear_screen_memory();
+    }
+
+    #[test]
+    fn screen_memory_is_length_bounded_and_cannot_scribble_past_the_screen() {
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::embed::clear_screen_memory();
+        // The safety property that justifies handing out an Alien instead of a
+        // raw pointer: a demo with an off-by-one cannot corrupt whatever the
+        // host put after the framebuffer. The write fails; it does not land.
+        const STRIDE: usize = 16;
+        const H: usize = 4;
+        let mut host = vec![0u8; STRIDE * H + 8]; // 8 bytes of canary past the end
+        let canary_at = STRIDE * H;
+        host[canary_at] = 0xAB;
+
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        crate::embed::publish_screen_memory(host.as_mut_ptr(), STRIDE, H);
+
+        // The last legal byte is index STRIDE*H (1-based) and writes fine.
+        vm.exec(&format!(
+            "GamePane new screenMemory byteAt: {} put: 99.",
+            STRIDE * H
+        ))
+        .expect("the last in-bounds byte must be writable");
+        assert_eq!(host[STRIDE * H - 1], 99);
+
+        // One past it must not LAND. Note the failure mode precisely, because
+        // it is not what you might assume: `Alien>>byteAt:put:` is
+        // `<primitive: 113> ^self`, so a refused write returns the receiver
+        // and signals NOTHING. The bounds check in `validate_access` protects
+        // the memory; it does not tell the demo. That is the existing
+        // behaviour of every Alien accessor and this is not the place to
+        // change it — but a demo cannot detect an off-by-one, so the
+        // protection is the guarantee, not the diagnostic.
+        vm.exec(&format!(
+            "GamePane new screenMemory byteAt: {} put: 1.",
+            STRIDE * H + 1
+        ))
+        .expect("an out-of-bounds write returns quietly rather than raising");
+        assert_eq!(
+            host[canary_at], 0xAB,
+            "the byte after the framebuffer must be untouched — this is the \
+             property that justifies handing out an Alien instead of a raw pointer"
+        );
+        // Far past the end, too.
+        vm.exec("GamePane new screenMemory byteAt: 100000 put: 7.")
+            .expect("a wild write returns quietly");
+        assert_eq!(host[canary_at], 0xAB, "a wild write must not land either");
+        crate::embed::clear_screen_memory();
     }
 
     #[test]

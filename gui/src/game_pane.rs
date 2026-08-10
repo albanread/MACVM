@@ -315,6 +315,11 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
         // here simply gets no overscan, and its `Scroll`s clamp to (0,0).
         // Harmless: the Cocoa GUI is where the game pane really lives.
         C::SetOverscan { .. } => return,
+        // The direct framebuffer is a Cocoa-GUI capability: this GUI builds its
+        // pane from main.rs and has no shared buffer to hand out, so nothing is
+        // published and `screenMemory` keeps answering nil. A demo written for
+        // it falls back to blit: rather than breaking.
+        C::OpenDirect { .. } => return,
         _ => {}
     }
     NATIVE.with(|cell| {
@@ -412,6 +417,7 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
             | C::PlayTune { .. }
             | C::SetPaneSize { .. }
             | C::SetOverscan { .. }
+            | C::OpenDirect { .. }
             | C::SetFrameRate { .. } => {
                 unreachable!("handled before the pane check")
             }

@@ -450,15 +450,25 @@ pub(crate) fn prim_alien_for_address_size(vm: &mut VmState, args: &[Oop]) -> Pri
     if nbytes < 0 {
         return PrimResult::Fail;
     }
-    let addr_value = addr.value();
+    PrimResult::Ok(make_indirect_alien(vm, addr.value() as u64, nbytes as usize))
+}
+
+/// Build an indirect `Alien` over an external region — the shape
+/// `forAddress:size:` hands back, factored out so other primitives can mint
+/// one without going through Smalltalk. `screenMemory`
+/// (`runtime::primitives`) uses it to wrap the GPU-shared framebuffer, which
+/// is the whole point of having a length-bounded foreign view: a demo writing
+/// pixels cannot address past the buffer it was given.
+///
+/// ALLOCATES — any caller must be declared `can_allocate: true`.
+pub(crate) fn make_indirect_alien(vm: &mut VmState, addr: u64, nbytes: usize) -> Oop {
     let klass = vm.universe.alien_klass;
     let obj = alloc::alloc_indexable_bytes(vm, klass, 0);
-    let a = AlienOop::try_from(obj.oop()).expect(
-        "prim_alien_for_address_size: freshly allocated with alien_klass must be a valid AlienOop",
-    );
-    a.set_external_addr(addr_value as u64);
-    a.set_indirect_size(nbytes as usize);
-    PrimResult::Ok(a.oop())
+    let a = AlienOop::try_from(obj.oop())
+        .expect("make_indirect_alien: freshly allocated with alien_klass must be a valid AlienOop");
+    a.set_external_addr(addr);
+    a.set_indirect_size(nbytes);
+    a.oop()
 }
 
 // --- Bootstrap: Alien's own methods, compiled from an embedded source ------

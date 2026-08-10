@@ -1,0 +1,139 @@
+"45d_plasma.mst — the direct framebuffer, proven by the hardest case for a
+ command protocol: a full-screen plasma where every pixel changes every frame
+ (docs/shared_screen_memory_design.md, SM0). Launch it from the Demos menu, or
+ a Workspace:
+
+     Plasma launch
+
+ SPACE cycles the palette, Escape quits.
+
+ WHAT THIS DEMO IS FOR. Every other demo here ships its pixels: MandelZoom and
+ Life fill a ByteArray and hand it over with `blit:`, which is one command a
+ frame and perfectly good — but it still costs three full-frame copies before
+ the GPU sees anything (out of the Smalltalk heap, through the queue, into the
+ pane's buffer, up to the texture). This demo sends NO pixels at all. It asks
+ the pane for `screenMemory` and writes into it, and because that memory is a
+ Metal shared buffer the GPU samples directly, the bytes it stores ARE the
+ screen. On Apple Silicon the graphics memory is just memory; nothing here is
+ copying it about.
+
+ The measurable claim, and the regression test that holds it: a frame of this
+ demo emits exactly ONE command — the `present` that says 'show it' — no
+ matter how many pixels changed. Filling 76,800 of them adds nothing to the
+ channel.
+
+ TWO RULES FOR WRITING DIRECT PIXELS, both easy to get wrong and both worth
+ more than a comment apiece:
+
+ 1. THE STRIDE IS NOT THE WIDTH. A row is `screenStride` bytes, because the
+    GPU rounds the row up to its own alignment. Address `y * stride + x`. If
+    you use `y * width + x` the picture shears diagonally, and it will look
+    like your maths is wrong when it is your addressing.
+
+ 2. REFETCH `screenMemory` EVERY FRAME. Presenting rotates which of three
+    buffers you are writing — that rotation is exactly what stops you drawing
+    into the buffer the GPU is currently reading — so an Alien kept from last
+    frame points at the wrong one.
+
+ The colour is a palette index, as everywhere else in this engine, so the
+ plasma's motion comes free: the field itself is static per frame and SPACE
+ just rolls the 256-entry palette underneath it."
+"I am a full-screen plasma drawn straight into GPU memory — the demo that shows
+ a pixel write does not need to be a message. I ask my pane for screenMemory
+ and store palette indices into it; nothing copies them. Launch me from the
+ Demos menu, or a Workspace: Plasma launch. SPACE cycles my palette, Escape
+ quits. I address rows by screenStride, never by width, and I refetch
+ screenMemory every frame because presenting rotates the buffer. In a headless
+ VM screenMemory answers nil and I do nothing, harmlessly."
+Object subclass: Plasma [
+    | pane w h phase palShift prevSpace |
+    <classVars: Current>
+
+    Plasma class >> launch [ ^self new start ]
+    Plasma class >> current [ ^Current ]
+
+    start [
+        Current := self.
+        w := 320.
+        h := 240.
+        pane := GamePane new.
+        pane openDirect: w height: h.
+        phase := 0.
+        palShift := 0.
+        prevSpace := false.
+        self buildPalette.
+        pane onStep: [ :frame | self stepWith: frame ]; run.
+        ^self
+    ]
+
+    buildPalette [
+        "A smooth 256-entry cycle through the spectrum. Because the pixels are
+         palette INDICES, rolling this palette animates the whole screen
+         without touching a single pixel — the oldest trick in demo graphics,
+         and it still costs nothing."
+        | k r g b |
+        k := 0.
+        [ k < 256 ] whileTrue: [
+            r := (self wave: k) .
+            g := (self wave: k + 85).
+            b := (self wave: k + 170).
+            pane paletteAt: k r: r g: g b: b.
+            k := k + 1 ].
+        ^self
+    ]
+
+    wave: k [
+        "A cheap triangle wave 0..255 over a period of 256 — a sine would be
+         prettier and this is a palette, not a physics engine."
+        | v |
+        v := k \\ 256.
+        v > 127 ifTrue: [ v := 255 - v ].
+        ^v * 2
+    ]
+
+    stepWith: frame [
+        "One frame: read SPACE, compute the field into screen memory, present.
+         `present` is the ONLY command this method emits."
+        | fb stride |
+        self readSpaceFrom: frame.
+        fb := pane screenMemory.
+        "Headless (or the web GUI, which has no shared buffer): nothing to
+         write into, so do nothing rather than fail."
+        fb isNil ifTrue: [ ^self ].
+        stride := pane screenStride.
+        self paintInto: fb stride: stride.
+        phase := phase + 2.
+        pane present.
+        ^self
+    ]
+
+    paintInto: fb stride: stride [
+        "The plasma proper: a sum of two travelling waves, one horizontal and
+         one diagonal, indexed into the palette. Written straight into GPU
+         memory one byte at a time — 76,800 stores, and not one of them is a
+         message."
+        | y x rowBase v |
+        y := 0.
+        [ y < h ] whileTrue: [
+            rowBase := y * stride.
+            x := 0.
+            [ x < w ] whileTrue: [
+                v := (self wave: x + phase)
+                        + (self wave: y + phase)
+                        + (self wave: x + y + (phase * 2)).
+                fb byteAt: rowBase + x + 1 put: ((v // 3 + palShift) \\ 256).
+                x := x + 1 ].
+            y := y + 1 ].
+        ^self
+    ]
+
+    readSpaceFrom: frame [
+        "SPACE rolls the palette — edge-triggered, or holding it would spin the
+         colours at 60 Hz and look like a fault."
+        | down |
+        down := frame keyHeld: GamePane keyA.
+        (down and: [ prevSpace not ]) ifTrue: [ palShift := (palShift + 32) \\ 256 ].
+        prevSpace := down.
+        ^self
+    ]
+]

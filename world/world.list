@@ -102,6 +102,10 @@
 # support, Microsoft's original deal numbering (deal 617 is deal 617), and the
 # real supermove rule (free+1)*2^empty. All 52 cards face up.
 45c_freecell.mst
+# Plasma: SM0 proof — a full-screen field written STRAIGHT into GPU shared
+# memory (screenMemory/screenStride), so a frame emits one command (present)
+# no matter how many pixels changed. docs/shared_screen_memory_design.md
+45d_plasma.mst
 # MandelVM: MandelZoom that dives once then stops — the standalone-window demo
 # (macvm-gui mandelvm / run-mandelvm.sh) that quits when the demo ends.
 46_mandelvm.mst
