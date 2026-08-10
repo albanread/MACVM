@@ -7,13 +7,16 @@
  parallelism is real, and visible as a faster dive.
 
  How a frame flows (all async, zero polling — §3.1's router):
-   step (frame tick):  round complete? -> blit + present + zoom + kick next
-   kickRound:          send {y0. rows. cR. cI. scale} to each worker
-                       with a continuation that copies the band into `buf`
+   step (frame tick):  round complete? -> present + zoom + kick next round
+   kickRound:          send {y0. rows. cR. cI. scale} to each worker; each
+                       writes its rows straight into the shared framebuffer
    worker:             ParallelMandel computeBand: params  (the same class,
                        loaded from the same image — pure compute, no pane)
- Replies arrive as WorkerInbox dispatches between frame ticks, so band copies
- interleave with GameStep on the one strictly-serial primary thread.
+ Replies arrive as WorkerInbox dispatches between frame ticks. Since SM2 a
+ reply carries only a row count — the pixels were written into GPU-shared
+ memory by the worker itself (docs/shared_screen_memory_design.md), so a band
+ no longer crosses the worker boundary as a pickle, is not copied into an
+ assembly buffer, and is not blitted.
 
  Launch from the Demos menu, or a Workspace:  ParallelMandel launch
  (Needs a worker-boot registration — the GUI provides one; a plain CLI run
@@ -29,7 +32,7 @@
  protocol. I need an environment that can spawn workers (the GUI provides
  one); a plain CLI run raises a clean cannot-spawn error."
 Object subclass: ParallelMandel [
-    | pane buf workers pendingBands centerR centerI scale zoomStep |
+    | pane workers pendingBands centerR centerI scale zoomStep |
 
     ParallelMandel class >> launch [
         "Spawn the band workers and start the parallel dive."
@@ -40,40 +43,62 @@ Object subclass: ParallelMandel [
 
     "── the worker half: pure compute (runs inside each worker VM) ──"
     ParallelMandel class >> computeBand: params [
-        "params = {y0. rows. centerR. centerI. scale}; answer {y0. bytes}
-         where bytes is rows*320 palette indices (row-major from y0). The
-         escape-time Double math is Mandelbrot>>escapeAtRe:im: (world/35),
+        "params = {y0. rows. centerR. centerI. scale}. Rasterize those rows
+         STRAIGHT INTO THE SCREEN and answer how many were done.
+
+         This used to build a `rows * 320` ByteArray and hand it back, which
+         the primary copied into an assembly buffer and then blitted — the band
+         crossed the worker boundary as a pickle, was copied once more into
+         `buf`, and a third time into the pane. Since SM2 it crosses nothing:
+         `screenMemory` is a process-global publication and a worker is a
+         thread in this process, so the buffer this worker writes IS the buffer
+         the GPU samples. Four workers rasterizing four bands are four threads
+         storing into disjoint rows of one screen.
+
+         Nothing synchronises them, and nothing needs to: the bands are
+         disjoint by construction, and the primary only presents once every
+         band of the round has replied — so no frame is torn and no worker is
+         still writing the buffer being shown.
+
+         The escape-time Double math is Mandelbrot>>escapeAtRe:im: (world/35),
          JIT-compiled in THIS worker's own tier-1 compiler."
-        | y0 rows cR cI sc mb stepc rmin imin bytes i ci cr n |
+        | y0 rows cR cI sc mb stepc rmin imin ci cr n fb stride |
         y0 := params at: 1.
         rows := params at: 2.
         cR := params at: 3.
         cI := params at: 4.
         sc := params at: 5.
+        "`basicNew`, not `new`: GamePane class>>new installs a 16-colour
+         palette, and a worker has no business re-sending that per band."
+        fb := GamePane basicNew screenMemory.
+        "No direct pane (headless, or the WKWebView GUI): compute nothing and
+         say so, rather than failing."
+        fb isNil ifTrue: [ ^0 ].
+        stride := GamePane basicNew screenStride.
         mb := Mandelbrot new maxIter: self maxIter.
         stepc := sc / 320.0.
         rmin := cR - (sc / 2.0).
         imin := cI - ((240.0 * stepc) / 2.0).
-        bytes := ByteArray new: rows * 320.
-        i := 1.
         y0 to: y0 + rows - 1 do: [ :py |
             ci := imin + (py asDouble * stepc).
             cr := rmin.
-            1 to: 320 do: [ :px |
+            0 to: 319 do: [ :px |
                 n := mb escapeAtRe: cr im: ci.
-                bytes at: i put: (n >= self maxIter
+                fb byteAt: (py * stride) + px + 1 put: (n >= self maxIter
                     ifTrue: [ 16 ]
                     ifFalse: [ 17 + (n \\ 239) ]).
-                i := i + 1.
                 cr := cr + stepc ] ].
-        ^Array with: y0 with: bytes
+        ^rows
     ]
 
     "── the primary half: spawn, orchestrate, assemble, show ──"
     start [
         pane := GamePane new.
+        "Ask for the direct framebuffer BEFORE the palette, so the palette
+         entries reach it: the pane is built on this command, and PaletteAt
+         only lands on a pane that exists."
+        pane openDirect: 320 height: 240.
         self buildPalette.
-        buf := ByteArray new: 320 * 240.
         centerR := 0.0 - 0.743643887037151.   "the seahorse valley, as world/45"
         centerI := 0.131825904205330.
         scale := 3.5.
@@ -117,7 +142,7 @@ Object subclass: ParallelMandel [
 
     kickRound [
         "Fan this frame out: one band request per worker, each with a
-         continuation that lands the band in `buf`. Fully async — the primary
+         continuation that simply counts it in. Fully async — the primary
          goes straight back to sleep; band replies dispatch between ticks."
         | rows |
         rows := 240 // workers size.
@@ -126,6 +151,8 @@ Object subclass: ParallelMandel [
             (workers at: k)
                 send: (self paramsForBand: (k - 1) * rows rows: rows)
                 onReply: [ :r | self bandArrived: r ] ].
+        "The continuation carries no pixels now — just the news that the band
+         is on screen."
         ^self
     ]
     paramsForBand: y0 rows: rows [
@@ -139,12 +166,9 @@ Object subclass: ParallelMandel [
         ^p
     ]
     bandArrived: r [
-        "A worker's band: copy it into the frame at its y-offset."
-        | y0 bytes base |
-        y0 := r at: 1.
-        bytes := r at: 2.
-        base := y0 * 320.
-        1 to: bytes size do: [ :i | buf at: base + i put: (bytes at: i) ].
+        "A worker finished its band. There is nothing to collect: the pixels
+         were written into the screen itself, so all that arrives is the news
+         that they are there."
         pendingBands := pendingBands - 1.
         ^self
     ]
@@ -152,9 +176,14 @@ Object subclass: ParallelMandel [
     step [
         "Frame tick: only when EVERY band of the current round has landed do
          we show the frame and kick the next round — the pane never shows a
-         torn frame, and a slow band simply lets ticks pass (no busy work)."
+         torn frame, and a slow band simply lets ticks pass (no busy work).
+
+         That rule now does double duty. It was about not showing a
+         half-assembled picture; since SM2 it is also what keeps the workers
+         off the buffer being displayed, because presenting rotates which of
+         the three buffers is the write target and the next round is kicked
+         only afterwards."
         pendingBands = 0 ifTrue: [
-            pane blit: buf.
             pane present.
             scale := scale * zoomStep.
             scale < 0.00005 ifTrue: [ scale := 3.5 ].

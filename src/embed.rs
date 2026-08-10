@@ -2460,6 +2460,26 @@ mod tests {
     /// raced on the first run and one saw the other's buffer.
     static SCREEN_MEM_LOCK: Mutex<()> = Mutex::new(());
 
+    /// A framebuffer for tests that is deliberately LEAKED.
+    ///
+    /// The host has a real teardown protocol: retract the publication, stop the
+    /// writing VM, *then* free the buffer. A test cannot easily manage the
+    /// middle step — `terminate` ASKS a worker to stop, but a worker mid-band
+    /// finishes that band first, and by then the test has returned and its
+    /// `Vec` is gone. That is a genuine use-after-free, and it crashed the
+    /// suite with `SIGSEGV far 0x1010101010101018 FOREIGN` in whatever
+    /// unrelated test happened to run next — a symptom with no visible
+    /// connection to its cause.
+    ///
+    /// Leaking side-steps it honestly: a straggling worker writes into memory
+    /// that is still valid, and a few hundred kilobytes never returned is
+    /// nothing to a test binary. The lifetime RULE still has a home — it is
+    /// the host's `close_window`, which retracts before it frees. What is
+    /// being tested here is the screen contract, not the teardown order.
+    fn leaked_screen(len: usize) -> &'static mut [u8] {
+        Box::leak(vec![0u8; len].into_boxed_slice())
+    }
+
     /// Retract whatever this test published, WHATEVER happens to it.
     ///
     /// A test publishes a pointer into a `Vec` it owns; when the test returns
@@ -2506,7 +2526,7 @@ mod tests {
         // buffer-backed Metal texture has, and a demo that assumed y*W+x would
         // pass on stride == width and shear on anything else.
         const STRIDE: usize = 80;
-        let mut host_buffer = vec![0u8; STRIDE * H];
+        let host_buffer = leaked_screen(STRIDE * H);
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut vm = boot_test_vm(JitMode::Threshold(10));
@@ -2592,6 +2612,88 @@ mod tests {
     }
 
     #[test]
+    fn worker_vms_write_disjoint_bands_of_one_shared_screen() {
+        // SM2, and the reason shared screen memory is a capability rather than
+        // an optimisation. Workers are `thread::spawn`ed VMs in THIS process
+        // (src/runtime/workers.rs) and the framebuffer is published in a
+        // process-global — so a worker that asks for `screenMemory` gets the
+        // very same buffer the primary did, with nothing added to make that
+        // work. Several of them writing disjoint bands is therefore just
+        // several of them writing: no tile pickled back to the primary, no
+        // copy into an assembly buffer, no blit.
+        //
+        // Each worker fills its band with its own id, so a mistake shows up as
+        // the wrong stripe rather than as a plausible picture.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _published = PublishedMemory;
+
+        const W: usize = 64;
+        const H: usize = 32;
+        let host = leaked_screen(W * H);
+
+        let mut vm = boot_worker_primary();
+        crate::embed::publish_screen_memory(host.as_mut_ptr(), W, H);
+
+        // The band filler lives INSIDE the worker's init source: a worker
+        // boots its own copy of world/, so a class defined only in the primary
+        // would not exist there.
+        let worker_src = "Worker onMessage: [:m | \
+             | id y0 rows fb stride | \
+             id := m payload at: 1. y0 := m payload at: 2. rows := m payload at: 3. \
+             fb := GamePane basicNew screenMemory. \
+             stride := GamePane basicNew screenStride. \
+             fb isNil ifFalse: [ \
+                 y0 to: y0 + rows - 1 do: [ :y | \
+                     0 to: 63 do: [ :x | fb byteAt: (y * stride) + x + 1 put: id ] ] ]. \
+             Worker reply: rows ]";
+
+        vm.exec(&format!("WkTest w1: (Worker spawn: '{worker_src}')."))
+            .expect("spawn band worker 1");
+        vm.exec(&format!("WkTest w2: (Worker spawn: '{worker_src}')."))
+            .expect("spawn band worker 2");
+
+        // Fan both bands out at once: they write the SAME buffer concurrently,
+        // each owning half the rows.
+        vm.exec("WkTest reset.").expect("reset the scoreboard");
+        vm.exec(
+            "WkTest w1 send: (Array with: 11 with: 0 with: 16) \
+               onReply: [:r | WkTest bump: r = 16 ].",
+        )
+        .expect("dispatch band 1");
+        vm.exec(
+            "WkTest w2 send: (Array with: 22 with: 16 with: 16) \
+               onReply: [:r | WkTest bump: r = 16 ].",
+        )
+        .expect("dispatch band 2");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 400) and: [ WkTest count < 2 ] ].")
+            .expect("await both bands");
+        assert_eq!(
+            vm.eval("WkTest count").expect("count").trim(),
+            "2",
+            "both worker bands must complete"
+        );
+
+        // Terminate before `host` dies: these workers hold an Alien over it,
+        // and a worker still writing through that view after the Vec is freed
+        // is a use-after-free (see the ParallelMandel test's own note).
+        vm.exec("WkTest w1 terminate. WkTest w2 terminate.")
+            .expect("terminate the band workers");
+
+        // The screen is exactly the two bands — written by two different VMs
+        // into one buffer, with nothing copied between them.
+        for y in 0..H {
+            let want = if y < 16 { 11u8 } else { 22u8 };
+            for x in 0..W {
+                assert_eq!(
+                    host[y * W + x],
+                    want,
+                    "row {y} must hold the id of the worker that owns it"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn text_plane_writes_are_stores_not_commands() {
         // SM1. The flood Minesweeper hit was one `Text` command per number,
         // every frame. Written into the text plane the same HUD costs nothing
@@ -2609,7 +2711,7 @@ mod tests {
         }
         const COLS: usize = 53;
         const ROWS: usize = 30;
-        let mut grid = vec![0u8; COLS * ROWS * 4];
+        let grid = leaked_screen(COLS * ROWS * 4);
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut vm = boot_test_vm(JitMode::Threshold(10));
@@ -2687,13 +2789,13 @@ mod tests {
         }
         const W: usize = 320;
         const H: usize = 240;
-        let mut host = vec![0u8; W * H];
+        let host = leaked_screen(W * H);
         // Publish the TEXT plane as well, so the measurement covers what the
         // demo really does: a full-screen field AND a live HUD rewritten from
         // scratch every frame. Both are stores; neither is a command.
         const COLS: usize = 53;
         const ROWS: usize = 30;
-        let mut grid = vec![0u8; COLS * ROWS * 4];
+        let grid = leaked_screen(COLS * ROWS * 4);
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut vm = boot_test_vm(JitMode::Threshold(10));
@@ -2769,7 +2871,7 @@ mod tests {
         // host put after the framebuffer. The write fails; it does not land.
         const STRIDE: usize = 16;
         const H: usize = 4;
-        let mut host = vec![0u8; STRIDE * H + 8]; // 8 bytes of canary past the end
+        let host = leaked_screen(STRIDE * H + 8); // 8 bytes of canary past the end
         let canary_at = STRIDE * H;
         host[canary_at] = 0xAB;
 
@@ -3508,7 +3610,7 @@ mod tests {
         let _published = PublishedMemory;
         const COLS: usize = 53;
         const ROWS: usize = 30;
-        let mut grid = vec![0u8; COLS * ROWS * 4];
+        let grid = leaked_screen(COLS * ROWS * 4);
         crate::embed::publish_text_memory(grid.as_mut_ptr(), COLS, ROWS);
 
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -5184,24 +5286,25 @@ mod tests {
 
     #[test]
     fn parallel_mandel_computes_a_full_frame_across_worker_vms() {
-        // The M4 capstone, headless: ParallelMandel fans one frame out to 4
-        // worker VMs (a band each), the continuations assemble `buf`, and the
-        // completed round blits. Drive the two doit streams a GUI would run —
-        // frame ticks + inbox dispatches — until the blit lands, then assert
-        // EVERY band really computed (no band left zero) and the image is a
-        // recognizable set (filled interior + many-banded exterior), i.e. the
-        // work genuinely happened in the workers.
-        struct Raster(Arc<Mutex<Option<Vec<u8>>>>);
-        impl GameSink for Raster {
-            fn emit(&mut self, cmd: GameCommand) {
-                if let GameCommand::Blit { data } = cmd {
-                    *self.0.lock().unwrap() = Some(data);
-                }
-            }
-        }
-        // JIT ON both sides: a band is ~19k escape-time iterations — the
-        // debug INTERPRETER needs ~8s+ per band (the MandelZoom test compiles
-        // for the same reason); each worker's own tier-1 JIT makes it seconds.
+        // The M4 capstone, headless — REWRITTEN FOR SM2. This used to wait for
+        // a `Blit`: the workers pickled a band each back to the primary, which
+        // assembled them into a buffer and shipped the whole frame as one
+        // command. Since SM2 there is no blit, because there is no assembly:
+        // each worker writes its own rows straight into the shared
+        // framebuffer, and the reply carries only a row count.
+        //
+        // So the assertion moves to the thing that now matters — the SCREEN
+        // itself. Four worker VMs, four disjoint bands, one buffer, and the
+        // picture has to come out whole.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _published = PublishedMemory;
+        const W: usize = 320;
+        const H: usize = 240;
+        let host = leaked_screen(W * H);
+
+        // JIT ON both sides: a band is ~19k escape-time iterations — the debug
+        // INTERPRETER needs ~8s+ per band (the MandelZoom test compiles for the
+        // same reason); each worker's own tier-1 JIT makes it seconds.
         let mut vm = boot_test_vm(JitMode::Threshold(10));
         vm.set_worker_boot(Arc::new(|| {
             VmHandle::boot(
@@ -5213,48 +5316,60 @@ mod tests {
                 Path::new("world"),
             )
         }));
-        let frame = Arc::new(Mutex::new(None));
-        vm.set_game_sink(Box::new(Raster(frame.clone())));
+        crate::embed::publish_screen_memory(host.as_mut_ptr(), W, H);
         vm.exec("ParallelMandel launch.")
             .expect("ParallelMandel launch must run cleanly");
         // Interleave ticks and dispatches (the GUI's timer + WorkerInbox), with
-        // a real wait for the workers' first boot+compute.
+        // a real wait for the workers' first boot+compute. Done when every row
+        // has been written — palette 0 is never a colour computeBand: writes.
         for _ in 0..1200 {
             vm.exec("Worker dispatchInbox.").expect("dispatch");
             vm.exec("GamePane stepWithKeys: 0.").expect("tick");
-            if frame.lock().unwrap().is_some() {
+            if !host.iter().any(|&p| p == 0) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        let got = frame.lock().unwrap().clone();
-        let Some(pixels) = got else {
-            panic!("no frame blitted — the parallel round never completed");
-        };
-        assert_eq!(pixels.len(), 320 * 240);
-        // Every band computed: an unanswered band would still be all zeros
-        // (palette 0 is never written by computeBand:).
+
+        // Every band computed. An unanswered band would still be all zeros,
+        // and — the point of this test — a band written by the WRONG worker,
+        // or into the wrong rows, shows up as a hole just the same.
         for band in 0..4 {
-            let rows = &pixels[band * 60 * 320..(band + 1) * 60 * 320];
+            let rows = &host[band * 60 * W..(band + 1) * 60 * W];
             let zeros = rows.iter().filter(|&&p| p == 0).count();
             assert!(
                 zeros == 0,
-                "band {band} has {zeros} unwritten pixels — its worker never answered"
+                "band {band} has {zeros} unwritten pixels — its worker never \
+                 answered, or wrote somewhere else"
             );
         }
         // And it is really the set (same shape checks as the MandelZoom test).
-        let inside = pixels.iter().filter(|&&p| p == 16).count() as f64;
+        let inside = host.iter().filter(|&&p| p == 16).count() as f64;
         let mut seen = [false; 256];
-        for &p in &pixels {
+        for &p in host.iter() {
             seen[p as usize] = true;
         }
         let exterior = seen.iter().skip(17).filter(|&&s| s).count();
-        let total = (320 * 240) as f64;
+        let total = (W * H) as f64;
         assert!(
             inside > total * 0.10 && inside < total * 0.60,
             "interior fraction off: {inside}/{total}"
         );
         assert!(exterior > 20, "too few escape bands: {exterior}");
+
+        // STOP THE DEMO BEFORE THE BUFFER DIES. ParallelMandel's four workers
+        // are live VMs holding an Alien over `host`; when this function
+        // returns, `host` is freed and anything still writing through that
+        // Alien is a use-after-free. It is not theoretical — leaving them
+        // running crashed the suite with
+        // `SIGSEGV far 0x1010101010101018 FOREIGN`, in whatever test happened
+        // to run next.
+        //
+        // `GamePane reset` runs the demo's own `onReset:` hook, which is
+        // exactly what terminates the workers — the same order the host keeps
+        // (`close_window` retracts the publication and stops the demo before
+        // the Metal buffers go).
+        vm.exec("GamePane reset.").expect("stop the demo and its workers");
     }
 
     #[test]
