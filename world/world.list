@@ -94,6 +94,10 @@
 # support was built for (SPACE pauses, left draws, right erases; blit: per
 # frame, toroidal 80x60 grid; docs/gamepane_design.md).
 45a_life.mst
+# Minesweeper: the classic, on the pane's two mouse buttons — left reveals,
+# right flags. Reads the buttons on their EDGE (one click, one square), the
+# opposite of Life's level-triggered painting; first click always safe.
+45b_minesweeper.mst
 # MandelVM: MandelZoom that dives once then stops — the standalone-window demo
 # (macvm-gui mandelvm / run-mandelvm.sh) that quits when the demo ends.
 46_mandelvm.mst

@@ -1476,6 +1476,26 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    // The game pane's scrolling viewport. Kept HERE, at the end, because this
+    // table is binary-searched by `prim_by_id` and so must stay sorted by id —
+    // filing these next to the other GamePane primitives (which stop at 263)
+    // put them before 264/265 and made every id past them unfindable.
+    PrimDesc {
+        id: 266,
+        name: "GamePane>>overscan:",
+        f: prim_game_set_overscan,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 267,
+        name: "GamePane>>scrollTo:y:",
+        f: prim_game_scroll,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1867,6 +1887,33 @@ fn prim_game_set_frame_rate(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         return PrimResult::Fail;
     }
     game_emit(vm, GameCommand::SetFrameRate { fps: fps as u32 });
+    PrimResult::Ok(args[0])
+}
+
+/// `overscan:` (266): build the pane with a world `margin` pixels larger than
+/// the viewport on every side, so the view can be scrolled around inside it.
+/// Sent before drawing, like `resizeTo:by:`. Capped at 256 — the world costs
+/// memory and a bigger one than that is a different feature (a tile map), not
+/// overscan.
+fn prim_game_set_overscan(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(margin) = smi_i64(args[1]) else {
+        return PrimResult::Fail;
+    };
+    if !(0..=256).contains(&margin) {
+        return PrimResult::Fail;
+    }
+    game_emit(vm, GameCommand::SetOverscan { margin: margin as u32 });
+    PrimResult::Ok(args[0])
+}
+
+/// `scrollTo:y:` (267): move the viewport within the world. A uniform update —
+/// no pixels are touched — so a demo can pan or shake the view every frame
+/// without redrawing anything. The engine clamps to the world's bounds.
+fn prim_game_scroll(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(x), Some(y)) = (smi_i64(args[1]), smi_i64(args[2])) else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::Scroll { x, y });
     PrimResult::Ok(args[0])
 }
 
@@ -5301,6 +5348,8 @@ mod tests {
             (263, "Sound class>>playEffect:"),
             (264, "Worker class>>primEvalDoitQuiet:"),
             (265, "instVarAt:put:"),
+            (266, "GamePane>>overscan:"),
+            (267, "GamePane>>scrollTo:y:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

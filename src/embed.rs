@@ -394,6 +394,18 @@ pub enum GameCommand {
     /// Resets to 60 when the game window closes so it can't leak into the next
     /// demo.
     SetFrameRate { fps: u32 },
+    /// Give the pane a WORLD larger than its viewport by `margin` pixels on
+    /// every side (`GamePane>>overscan:`), so the viewport can be scrolled
+    /// around inside it. Must be sent before the pane is drawn — like
+    /// `SetPaneSize`, it decides how the pane is built. The scroll starts
+    /// centred, i.e. at `(margin, margin)`.
+    SetOverscan { margin: u32 },
+    /// Move the viewport to `(x, y)` within the world (`GamePane>>scrollTo:y:`).
+    /// This is a UNIFORM update, not a redraw: no pixel is touched and nothing
+    /// is re-uploaded, so panning or shaking the view costs one command a
+    /// frame instead of a whole frame's worth of pixels. Clamped by the engine
+    /// to the world, so a demo cannot scroll off its own edge.
+    Scroll { x: i64, y: i64 },
     /// Draw `text` at `(x, y)` on the always-topmost text layer in RGB, each
     /// glyph pixel blocked `scale`x`scale` (`GamePane>>text:x:y:r:g:b:scale:`).
     Text {
@@ -2396,6 +2408,617 @@ mod tests {
             vm.eval("GamePane keyHeld: GamePane keyLeft.").unwrap(),
             "false"
         );
+    }
+
+    /// Drive one edge-triggered click at a BOARD SQUARE: a frame with the
+    /// button down (Minesweeper acts on the down edge), then one with it
+    /// released so the next click is an edge again. Square (cx,cy) maps to the
+    /// pane pixel at its centre, exactly as a real click would land.
+    fn minesweeper_click(vm: &mut VmHandle, cx: i64, cy: i64, button_mask: i64) {
+        let px = 16 + cx * 16 + 8;
+        let py = 30 + cy * 16 + 8;
+        vm.exec(&format!(
+            "GamePane stepWithKeys: 0 mouseX: {px} y: {py} buttons: {button_mask}."
+        ))
+        .expect("a click frame must run");
+        vm.exec(&format!(
+            "GamePane stepWithKeys: 0 mouseX: {px} y: {py} buttons: 0."
+        ))
+        .expect("a release frame must run");
+    }
+
+    /// The first click floods, and on an open board that flood can reach any
+    /// corner — so a test that wants a still-hidden square has to go and find
+    /// one rather than assume where it is.
+    fn minesweeper_find_hidden(vm: &mut VmHandle) -> (i64, i64) {
+        for y in 0..12i64 {
+            for x in 0..18i64 {
+                if vm
+                    .eval(&format!("Minesweeper current stateAtX: {x} y: {y}."))
+                    .unwrap()
+                    == "0"
+                {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("the board must still have a hidden square after one click");
+    }
+
+    #[test]
+    fn minesweeper_actually_draws_its_numbers_flags_and_mines() {
+        // Every piece of this board is pixel art stamped into the blit buffer,
+        // and the first version of it drew NOTHING — `String>>at:` hands back a
+        // fresh Character rather than the canonical one, so the art's `==`
+        // comparison was false for every pixel. No error, no missing method:
+        // just a board with no numbers, no flags and no mines on it. Nothing
+        // short of looking at the pixels catches that, so this test looks.
+        //
+        // The pane has 16px of overscan, so the blit is 352x272 and the board
+        // origin is (32, 46) in world pixels.
+        const W: usize = 352;
+        const H: usize = 272;
+        struct Raster(Arc<Mutex<Vec<u8>>>);
+        impl GameSink for Raster {
+            fn emit(&mut self, cmd: GameCommand) {
+                if let GameCommand::Blit { data } = cmd {
+                    let mut b = self.0.lock().unwrap();
+                    let n = data.len().min(b.len());
+                    b[..n].copy_from_slice(&data[..n]);
+                }
+            }
+        }
+        let buf = Arc::new(Mutex::new(vec![0u8; W * H]));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(Raster(buf.clone())));
+        vm.exec("Minesweeper launchWithSeed: 4242.").unwrap();
+        minesweeper_click(&mut vm, 9, 6, 1);
+
+        // The blit must be the full overscanned world, not the viewport.
+        assert_eq!(
+            buf.lock().unwrap().len(),
+            W * H,
+            "the buffer is the world, including its overscan border"
+        );
+
+        // Find a revealed square showing a count, and assert its digit colour
+        // (palette 21 + n) actually appears inside that square.
+        let mut checked_number = false;
+        for y in 0..12i64 {
+            for x in 0..18i64 {
+                let shown = vm
+                    .eval(&format!("Minesweeper current stateAtX: {x} y: {y}."))
+                    .unwrap()
+                    == "1";
+                let n: u8 = vm
+                    .eval(&format!("Minesweeper current countAtX: {x} y: {y}."))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                if !shown || n == 0 {
+                    continue;
+                }
+                let pixels = buf.lock().unwrap();
+                let want = 21 + n;
+                let mut found = 0;
+                for dy in 0..16usize {
+                    for dx in 0..16usize {
+                        let px = (46 + y as usize * 16 + dy) * W + 32 + x as usize * 16 + dx;
+                        if pixels[px] == want {
+                            found += 1;
+                        }
+                    }
+                }
+                assert!(
+                    found > 0,
+                    "square ({x},{y}) shows a {n} but no palette-{want} pixel was drawn in it"
+                );
+                checked_number = true;
+                break;
+            }
+            if checked_number {
+                break;
+            }
+        }
+        assert!(checked_number, "the opened region must show some numbers");
+
+        // A flag must put red (palette 20) pixels into its square.
+        let (fx, fy) = minesweeper_find_hidden(&mut vm);
+        minesweeper_click(&mut vm, fx, fy, 2);
+        {
+            let pixels = buf.lock().unwrap();
+            let mut red = 0;
+            for dy in 0..16usize {
+                for dx in 0..16usize {
+                    let px = (46 + fy as usize * 16 + dy) * W + 32 + fx as usize * 16 + dx;
+                    if pixels[px] == 20 {
+                        red += 1;
+                    }
+                }
+            }
+            assert!(red > 0, "a flagged square must actually draw a red flag");
+        }
+
+        // And a mine, once one is hit, must put black (palette 19) pixels down.
+        let mut mine = None;
+        'outer: for y in 0..12i64 {
+            for x in 0..18i64 {
+                if vm
+                    .eval(&format!("Minesweeper current mineAtX: {x} y: {y}."))
+                    .unwrap()
+                    == "true"
+                {
+                    mine = Some((x, y));
+                    break 'outer;
+                }
+            }
+        }
+        let (mx, my) = mine.expect("a dealt board has mines");
+        minesweeper_click(&mut vm, mx, my, 1);
+        let pixels = buf.lock().unwrap();
+        let mut black = 0;
+        for dy in 0..16usize {
+            for dx in 0..16usize {
+                let px = (46 + my as usize * 16 + dy) * W + 32 + mx as usize * 16 + dx;
+                if pixels[px] == 19 {
+                    black += 1;
+                }
+            }
+        }
+        assert!(black > 0, "the mine you hit must actually be drawn");
+    }
+
+    #[test]
+    fn minesweeper_shakes_by_scrolling_the_view_not_by_redrawing_it() {
+        // The explosion moves the picture with Scroll commands into the pane's
+        // overscan — a shader uniform — rather than by redrawing the board at
+        // an offset. That is the whole reason `overscan:`/`scrollTo:y:` exist,
+        // and the difference between one command a frame and a 95KB blit a
+        // frame for half a second.
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+        vm.exec("Minesweeper launchWithSeed: 4242.").unwrap();
+        // The pane must have been asked for a border to shake into.
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| matches!(c, GameCommand::SetOverscan { margin: 16 })),
+            "the demo must request overscan before drawing"
+        );
+
+        minesweeper_click(&mut vm, 9, 6, 1);
+        let mut mine = None;
+        'outer: for y in 0..12i64 {
+            for x in 0..18i64 {
+                if vm
+                    .eval(&format!("Minesweeper current mineAtX: {x} y: {y}."))
+                    .unwrap()
+                    == "true"
+                {
+                    mine = Some((x, y));
+                    break 'outer;
+                }
+            }
+        }
+        let (mx, my) = mine.expect("a dealt board has mines");
+        minesweeper_click(&mut vm, mx, my, 1); // BOOM
+
+        captured.lock().unwrap().clear();
+        for _ in 0..30 {
+            vm.exec("GamePane stepWithKeys: 0 mouseX: -1 y: -1 buttons: 0.")
+                .expect("a shaking frame must run");
+        }
+        let cmds = captured.lock().unwrap();
+        let scrolls: Vec<(i64, i64)> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                GameCommand::Scroll { x, y } => Some((*x, *y)),
+                _ => None,
+            })
+            .collect();
+        let blits = cmds
+            .iter()
+            .filter(|c| matches!(c, GameCommand::Blit { .. }))
+            .count();
+        assert!(
+            scrolls.len() >= 25,
+            "the shake must scroll nearly every frame, got {} scrolls",
+            scrolls.len()
+        );
+        assert_eq!(
+            blits, 0,
+            "the shake must NOT redraw — that is the point of scrolling it"
+        );
+        // It genuinely moves, and stays inside the 0..32 the world allows.
+        assert!(
+            scrolls.iter().any(|&(x, _)| x != 16),
+            "the view must actually move off centre"
+        );
+        assert!(
+            scrolls.iter().all(|&(x, y)| (0..=32).contains(&x) && (0..=32).contains(&y)),
+            "the shake must stay inside the overscan border"
+        );
+    }
+
+    #[test]
+    fn minesweeper_sounds_the_click_the_flag_and_the_explosion() {
+        // Sound presets (world/43_gamepane.mst): click 7, explode 4, blip 9.
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+        let sounds = |c: &Arc<Mutex<Vec<GameCommand>>>| -> Vec<u8> {
+            c.lock()
+                .unwrap()
+                .iter()
+                .filter_map(|cmd| match cmd {
+                    GameCommand::PlaySound { preset } => Some(*preset),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+        vm.exec("Minesweeper launchWithSeed: 4242.").unwrap();
+
+        captured.lock().unwrap().clear();
+        minesweeper_click(&mut vm, 9, 6, 1); // opens a region
+        assert_eq!(sounds(&captured), vec![7], "a reveal must click, once");
+
+        let (hx, hy) = minesweeper_find_hidden(&mut vm);
+        captured.lock().unwrap().clear();
+        minesweeper_click(&mut vm, hx, hy, 2); // flag
+        assert_eq!(sounds(&captured), vec![9], "a flag must blip, once");
+
+        // Clicking an already-open square must stay silent — no chatter.
+        captured.lock().unwrap().clear();
+        minesweeper_click(&mut vm, 9, 6, 1);
+        assert!(
+            sounds(&captured).is_empty(),
+            "re-clicking an open square must make no sound"
+        );
+
+        // And the bang.
+        let mut mine = None;
+        'outer: for y in 0..12i64 {
+            for x in 0..18i64 {
+                if vm
+                    .eval(&format!("Minesweeper current mineAtX: {x} y: {y}."))
+                    .unwrap()
+                    == "true"
+                {
+                    mine = Some((x, y));
+                    break 'outer;
+                }
+            }
+        }
+        let (mx, my) = mine.expect("a dealt board has mines");
+        captured.lock().unwrap().clear();
+        minesweeper_click(&mut vm, mx, my, 1);
+        assert_eq!(
+            sounds(&captured),
+            vec![4],
+            "hitting a mine must explode, and must NOT also click"
+        );
+    }
+
+    #[test]
+    fn minesweeper_idle_frames_stay_quiet_on_the_game_channel() {
+        // Guards a real bug this demo shipped with for an hour: `drawText` ran
+        // every frame, and because the text overlay is RETAINED that re-sent one
+        // Text command per revealed number at 60Hz — thousands of commands a
+        // second for a picture that had not changed. A board nobody is touching
+        // must cost about one Present per frame and nothing else.
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+        vm.exec("Minesweeper launchWithSeed: 4242.").unwrap();
+        minesweeper_click(&mut vm, 9, 6, 1); // open a big region of numbers
+
+        captured.lock().unwrap().clear();
+        for _ in 0..60 {
+            vm.exec("GamePane stepWithKeys: 0 mouseX: -1 y: -1 buttons: 0.")
+                .expect("an idle frame must run");
+        }
+        let cmds = captured.lock().unwrap();
+        let presents = cmds
+            .iter()
+            .filter(|c| matches!(c, GameCommand::Present))
+            .count();
+        assert_eq!(presents, 60, "every idle frame must still present");
+        // One second of frames redraws at most once (the clock ticking over):
+        // one Blit, and one Text per revealed number plus the HUD. Anything
+        // near 60 redraws is the flood this test exists to catch.
+        let blits = cmds
+            .iter()
+            .filter(|c| matches!(c, GameCommand::Blit { .. }))
+            .count();
+        assert!(
+            blits <= 2,
+            "60 idle frames must redraw at most once or twice, got {blits} blits"
+        );
+    }
+
+    #[test]
+    fn minesweeper_first_click_is_always_safe_and_opens_a_region() {
+        // The rule that makes the game playable: mines are not dealt until the
+        // first click, and then never on that square or its neighbours — so
+        // the opening move can never lose, and always opens into space rather
+        // than a lone number. Checked across many seeds because "safe" is a
+        // statement about every deal, not a lucky one.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        for seed in [1i64, 7, 12345, 999_983, 2_147_483_646] {
+            vm.exec(&format!("Minesweeper launchWithSeed: {seed}."))
+                .expect("Minesweeper must launch");
+            assert_eq!(
+                vm.eval("Minesweeper current isDealt.").unwrap(),
+                "false",
+                "seed {seed}: no mine may be placed before the first click"
+            );
+            minesweeper_click(&mut vm, 9, 6, 1);
+            assert_eq!(
+                vm.eval("Minesweeper current isOver.").unwrap(),
+                "false",
+                "seed {seed}: the FIRST click must never end the game"
+            );
+            assert_eq!(
+                vm.eval("Minesweeper current isDealt.").unwrap(),
+                "true",
+                "seed {seed}: the click must deal the mines"
+            );
+            // Safe means the whole 3x3 is clear, which is what guarantees the
+            // click opens a region instead of revealing a single number.
+            for dy in -1..=1i64 {
+                for dx in -1..=1i64 {
+                    assert_eq!(
+                        vm.eval(&format!(
+                            "Minesweeper current mineAtX: {} y: {}.",
+                            9 + dx,
+                            6 + dy
+                        ))
+                        .unwrap(),
+                        "false",
+                        "seed {seed}: ({},{}) is next to the first click and must be safe",
+                        9 + dx,
+                        6 + dy
+                    );
+                }
+            }
+            // The flood opened more than the one square that was clicked.
+            let shown: i64 = vm
+                .eval("Minesweeper current revealedCount.")
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                shown > 1,
+                "seed {seed}: an empty first click must flood outward, opened only {shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn minesweeper_deals_exactly_thirty_two_mines_and_counts_neighbours_right() {
+        // The board's own arithmetic: the right number of mines, and every
+        // square's number equal to the mines actually touching it. Recomputing
+        // the counts here independently is the point — it checks the game's
+        // countNeighbours rather than trusting it.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.exec("Minesweeper launchWithSeed: 4242.").unwrap();
+        minesweeper_click(&mut vm, 9, 6, 1);
+
+        let mut grid = [[false; 12]; 18]; // [x][y]
+        let mut total = 0;
+        for y in 0..12i64 {
+            for x in 0..18i64 {
+                let is_mine = vm
+                    .eval(&format!("Minesweeper current mineAtX: {x} y: {y}."))
+                    .unwrap()
+                    == "true";
+                grid[x as usize][y as usize] = is_mine;
+                if is_mine {
+                    total += 1;
+                }
+            }
+        }
+        assert_eq!(total, 32, "the board must hold exactly 32 mines");
+
+        for y in 0..12i64 {
+            for x in 0..18i64 {
+                if grid[x as usize][y as usize] {
+                    continue; // a mine square's own count is not shown
+                }
+                let mut expect = 0;
+                for dy in -1..=1i64 {
+                    for dx in -1..=1i64 {
+                        let (nx, ny) = (x + dx, y + dy);
+                        if (dx != 0 || dy != 0)
+                            && (0..18).contains(&nx)
+                            && (0..12).contains(&ny)
+                            && grid[nx as usize][ny as usize]
+                        {
+                            expect += 1;
+                        }
+                    }
+                }
+                let got = vm
+                    .eval(&format!("Minesweeper current countAtX: {x} y: {y}."))
+                    .unwrap();
+                assert_eq!(
+                    got,
+                    expect.to_string(),
+                    "({x},{y}) should touch {expect} mines"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn minesweeper_right_click_toggles_a_flag_and_left_click_ignores_it() {
+        // The two buttons doing two different jobs — the reason this demo
+        // exists. Also the rule that stops a misclick losing a game you had
+        // deliberately flagged: a flagged square does not reveal.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.exec("Minesweeper launchWithSeed: 4242.").unwrap();
+        minesweeper_click(&mut vm, 9, 6, 1); // deal, and open a region
+
+        let (hx, hy) = minesweeper_find_hidden(&mut vm);
+        let before: i64 = vm
+            .eval("Minesweeper current minesLeft.")
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        minesweeper_click(&mut vm, hx, hy, 2); // right = flag
+        assert_eq!(
+            vm.eval(&format!("Minesweeper current stateAtX: {hx} y: {hy}."))
+                .unwrap(),
+            "2",
+            "the right button must plant a flag"
+        );
+        assert_eq!(
+            vm.eval("Minesweeper current minesLeft.")
+                .unwrap()
+                .parse::<i64>()
+                .unwrap(),
+            before - 1,
+            "planting a flag must decrement the counter"
+        );
+
+        // A left click on a flagged square must do nothing at all.
+        minesweeper_click(&mut vm, hx, hy, 1);
+        assert_eq!(
+            vm.eval(&format!("Minesweeper current stateAtX: {hx} y: {hy}."))
+                .unwrap(),
+            "2",
+            "a flagged square must not reveal — that is what the flag is for"
+        );
+
+        // Right-clicking again lifts it.
+        minesweeper_click(&mut vm, hx, hy, 2);
+        assert_eq!(
+            vm.eval(&format!("Minesweeper current stateAtX: {hx} y: {hy}."))
+                .unwrap(),
+            "0",
+            "right-clicking a flag must lift it"
+        );
+        assert_eq!(
+            vm.eval("Minesweeper current minesLeft.")
+                .unwrap()
+                .parse::<i64>()
+                .unwrap(),
+            before,
+            "lifting the flag must restore the counter"
+        );
+    }
+
+    #[test]
+    fn minesweeper_clicks_are_edge_triggered_not_level_triggered() {
+        // The distinction this demo is built to show. Life reads the button's
+        // LEVEL (hold and drag paints); Minesweeper must read its EDGE, or one
+        // held button would flag-toggle 60 times a second and reveal the whole
+        // board in a heartbeat.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.exec("Minesweeper launchWithSeed: 4242.").unwrap();
+        minesweeper_click(&mut vm, 9, 6, 1);
+
+        // HOLD the right button over one square for many frames: exactly one
+        // flag should result, not one per frame.
+        let (hx, hy) = minesweeper_find_hidden(&mut vm);
+        let px = 16 + hx * 16 + 8;
+        let py = 30 + hy * 16 + 8;
+        for _ in 0..30 {
+            vm.exec(&format!(
+                "GamePane stepWithKeys: 0 mouseX: {px} y: {py} buttons: 2."
+            ))
+            .expect("a held-button frame must run");
+        }
+        assert_eq!(
+            vm.eval(&format!("Minesweeper current stateAtX: {hx} y: {hy}."))
+                .unwrap(),
+            "2",
+            "30 frames of a HELD right button must leave exactly one flag"
+        );
+        assert_eq!(
+            vm.eval("Minesweeper current minesLeft.").unwrap(),
+            "31",
+            "a held button must not toggle the flag once per frame"
+        );
+    }
+
+    #[test]
+    fn minesweeper_hitting_a_mine_ends_the_game_and_space_deals_a_new_board() {
+        // Losing, and starting again. Finding a mine to click means asking the
+        // board where one is — which is fine, since the point is what happens
+        // AFTER you click it.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.exec("Minesweeper launchWithSeed: 4242.").unwrap();
+        minesweeper_click(&mut vm, 9, 6, 1);
+
+        let mut mine = None;
+        'outer: for y in 0..12i64 {
+            for x in 0..18i64 {
+                if vm
+                    .eval(&format!("Minesweeper current mineAtX: {x} y: {y}."))
+                    .unwrap()
+                    == "true"
+                {
+                    mine = Some((x, y));
+                    break 'outer;
+                }
+            }
+        }
+        let (mx, my) = mine.expect("a dealt board must have mines");
+        minesweeper_click(&mut vm, mx, my, 1);
+        assert_eq!(
+            vm.eval("Minesweeper current isOver.").unwrap(),
+            "true",
+            "clicking a mine must end the game"
+        );
+        assert_eq!(vm.eval("Minesweeper current hasWon.").unwrap(), "false");
+
+        // Further clicks after the end must not change anything.
+        let revealed_at_end = vm.eval("Minesweeper current revealedCount.").unwrap();
+        minesweeper_click(&mut vm, 0, 0, 1);
+        assert_eq!(
+            vm.eval("Minesweeper current revealedCount.").unwrap(),
+            revealed_at_end,
+            "a finished game must ignore further clicks"
+        );
+
+        // SPACE (game key A, bit 4) deals a fresh board, on the edge.
+        vm.exec("GamePane stepWithKeys: 16 mouseX: -1 y: -1 buttons: 0.")
+            .expect("space frame");
+        assert_eq!(
+            vm.eval("Minesweeper current isOver.").unwrap(),
+            "false",
+            "SPACE must deal a new board"
+        );
+        assert_eq!(
+            vm.eval("Minesweeper current isDealt.").unwrap(),
+            "false",
+            "the new board must again wait for a safe first click"
+        );
+        assert_eq!(vm.eval("Minesweeper current minesLeft.").unwrap(), "32");
     }
 
     #[test]

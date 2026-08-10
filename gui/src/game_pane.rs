@@ -310,6 +310,11 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
         // `start`, before StartLoop schedules the timer, so it just takes effect
         // when the timer is created; a mid-loop change restarts the timer.
         C::SetFrameRate { fps } => return set_req_fps(*fps),
+        // Overscan decides how the pane is BUILT, and the web GUI builds its
+        // pane in main.rs rather than from a command — so a demo asking for it
+        // here simply gets no overscan, and its `Scroll`s clamp to (0,0).
+        // Harmless: the Cocoa GUI is where the game pane really lives.
+        C::SetOverscan { .. } => return,
         _ => {}
     }
     NATIVE.with(|cell| {
@@ -334,6 +339,9 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
             C::FillRect { x, y, w, h, index } => n.pane.fill_rect(*x, *y, *w, *h, *index),
             C::Disc { cx, cy, r, index } => n.pane.disc(*cx, *cy, *r, *index),
             C::Blit { data } => n.pane.blit(data),
+            // A uniform update, not a redraw. Clamps to (0,0) here, since this
+            // GUI's pane has no overscan to scroll into.
+            C::Scroll { x, y } => n.pane.set_scroll(*x, *y),
             C::DefineSprite { id, rows } => {
                 if let Some(def) = n.sprites.define_sprite(rows) {
                     let inst = n.sprites.place(def, 0.0, 0.0);
@@ -403,6 +411,7 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
             | C::PlayEffect { .. }
             | C::PlayTune { .. }
             | C::SetPaneSize { .. }
+            | C::SetOverscan { .. }
             | C::SetFrameRate { .. } => {
                 unreachable!("handled before the pane check")
             }

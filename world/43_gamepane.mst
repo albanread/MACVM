@@ -447,6 +447,34 @@ Object subclass: GamePane [
         ^self
     ]
 
+    overscan: margin [
+        "Build me with a WORLD `margin` pixels bigger than my viewport on every
+         side, so the view can be scrolled around inside it. Like resizeTo:by:
+         this decides how I am BUILT — send it before drawing anything. The
+         view starts centred, at scrollTo: margin y: margin, so it can move
+         either way. Drawing coordinates are then WORLD coordinates: with a
+         margin of 16 the top-left of the visible area is (16, 16).
+
+         The point of the margin is scrollTo:y: below — pixels you have already
+         drawn, sitting just off-screen, ready to be scrolled into view for
+         free."
+        <primitive: 266>
+        ^self
+    ]
+
+    scrollTo: x y: y [
+        "Move the viewport to (x, y) in the world. This does NOT redraw: it
+         sets a shader uniform, so nothing is rasterized and nothing is
+         re-uploaded — panning or shaking the view costs one command a frame
+         rather than a frame's worth of pixels. Clamped to the world, so you
+         cannot scroll off your own edge. Needs `overscan:` to have any room to
+         move in (with no overscan the world IS the viewport and every scroll
+         clamps to 0,0). Minesweeper's explosion shake is this and nothing
+         else."
+        <primitive: 267>
+        ^self
+    ]
+
     frameRate: fps [
         "Request the frame timer's rate in frames-per-second (1..120). The
          default is 60; a demo whose logic was tuned for a slower rate asks for

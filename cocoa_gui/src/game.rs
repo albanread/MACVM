@@ -123,6 +123,12 @@ static REQ_H: AtomicI64 = AtomicI64::new(PANE_H as i64);
 /// the next demo.
 const DEFAULT_FPS: i64 = 60;
 static REQ_FPS: AtomicI64 = AtomicI64::new(DEFAULT_FPS);
+/// The requested overscan margin (`GamePane>>overscan:`): how many pixels
+/// larger than the VIEWPORT the pane's WORLD is, on every side. 0 = the world
+/// is exactly the viewport, which is how every pane was built before this and
+/// what pins `set_scroll` to a no-op. Read when the pane is created, and reset
+/// on window close so it cannot leak into the next demo.
+static REQ_OVERSCAN: AtomicI64 = AtomicI64::new(0);
 
 thread_local! {
     static GAME: std::cell::RefCell<Option<NativeGame>> = const { std::cell::RefCell::new(None) };
@@ -146,9 +152,18 @@ fn ensure_pane() {
             eprintln!("macvm-cocoa: no Metal device — game pane unavailable");
             return;
         };
-        let Ok(pane) = IndexedPane::new(&win.device, w, h, w, h) else {
+        // The WORLD may be larger than the viewport (`GamePane>>overscan:`),
+        // which is what makes `Scroll` mean anything: with world == viewport
+        // the engine clamps every scroll to (0,0). A demo that asks for
+        // overscan starts centred in it, so it can scroll either way.
+        let margin = REQ_OVERSCAN.load(Ordering::Acquire).clamp(0, 256) as u32;
+        let Ok(mut pane) = IndexedPane::new(&win.device, w + 2 * margin, h + 2 * margin, w, h)
+        else {
             return;
         };
+        if margin > 0 {
+            pane.set_scroll(margin as i64, margin as i64);
+        }
         let Ok(sprites) = Sprites::new(&win.device) else {
             return;
         };
@@ -247,6 +262,7 @@ fn close_window() {
     REQ_W.store(PANE_W as i64, Ordering::Release);
     REQ_H.store(PANE_H as i64, Ordering::Release);
     REQ_FPS.store(DEFAULT_FPS, Ordering::Release);
+    REQ_OVERSCAN.store(0, Ordering::Release);
     // Forget where the mouse was; the next demo's first frame should not see a
     // pointer position left behind by this one.
     GAME_MOUSE_X.store(-1, Ordering::Release);
@@ -386,9 +402,15 @@ fn apply(g: &mut NativeGame, cmd: &GameCommand) {
             g.pane.set_line_rgb(*line, *index, *r, *gg, *b);
         }
         C::Present => present(g),
-        // SetPaneSize is handled in `drain` (before the pane exists); loop and
-        // audio are handled there too. A stray one here is a harmless no-op.
+        // Move the viewport within the world. Deliberately NOT a redraw: it
+        // sets a shader uniform, so a demo can pan or shake every frame for
+        // the cost of one command. Clamped inside the engine.
+        C::Scroll { x, y } => g.pane.set_scroll(*x, *y),
+        // SetPaneSize/SetOverscan are handled in `drain` (before the pane
+        // exists); loop and audio are handled there too. A stray one here is a
+        // harmless no-op.
         C::SetPaneSize { .. }
+        | C::SetOverscan { .. }
         | C::SetFrameRate { .. }
         | C::StartLoop
         | C::StopLoop
@@ -427,6 +449,16 @@ pub fn drain() {
             GameCommand::SetPaneSize { w, h } => {
                 REQ_W.store(*w as i64, Ordering::Release);
                 REQ_H.store(*h as i64, Ordering::Release);
+                let exists = GAME.with(|cell| cell.borrow().is_some());
+                if exists && SESSION_OPEN.load(Ordering::Acquire) {
+                    rebuild_pane_at_requested_size();
+                }
+            }
+            // How much bigger than the viewport the world should be. Like
+            // SetPaneSize this decides how the pane is BUILT, so it must
+            // arrive before the pane exists; a demo sends it during start.
+            GameCommand::SetOverscan { margin } => {
+                REQ_OVERSCAN.store(*margin as i64, Ordering::Release);
                 let exists = GAME.with(|cell| cell.borrow().is_some());
                 if exists && SESSION_OPEN.load(Ordering::Acquire) {
                     rebuild_pane_at_requested_size();

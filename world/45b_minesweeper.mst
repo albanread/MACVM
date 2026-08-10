@@ -1,0 +1,641 @@
+"45b_minesweeper.mst — Minesweeper in the native Metal game pane
+ (docs/gamepane_design.md). Launch it from the Demos menu, or a Workspace:
+
+     Minesweeper launch
+     Minesweeper launchWithSeed: 12345    'the same board every time'
+
+ LEFT click reveals a square, RIGHT click plants or lifts a flag, SPACE deals a
+ new board and Escape quits. An 18x12 field with 32 mines, at 16 pixels a
+ square.
+
+ This is the demo the pane's two mouse buttons were made for, and it reads the
+ pointer the OTHER way round from Life. Life wants the button's LEVEL — hold
+ and drag and it paints a stroke of cells. Minesweeper wants the EDGE: one
+ click must reveal exactly one square, so it compares each button against what
+ it saw last frame and acts only on the frame the button goes DOWN. Both
+ patterns come off the same GameFrame; which one a game wants is a question
+ about the game, not about the engine.
+
+ THE FIRST CLICK IS ALWAYS SAFE. The mines are not dealt until you have
+ clicked, and then they are dealt around that square and its eight neighbours —
+ so the first click always opens into empty space rather than ending the game
+ on move one. That is what real Minesweeper does, and a demo that can kill you
+ instantly is a bad advertisement for anything.
+
+ Hit a mine and the screen SHAKES. The board is 288x192 inside a 320x240 pane,
+ so there is a margin all round it doing nothing — the shake happens into that
+ overscan, which is why the whole field can lurch about for half a second
+ without a square sliding off the edge or the picture needing to be scaled.
+ The bang, the clicks and the flags all make a noise (Sound explode/click/blip,
+ and powerup when the field is cleared).
+
+ Drawing: the board is composed into one reused ByteArray of palette indices
+ and handed over in a single `blit:`, recomposed only when something changed —
+ which for Minesweeper is 'only when you click', so a board just sitting there
+ costs nothing. That is not just thrift: the text overlay is RETAINED between
+ frames, so redrawing it every frame re-sent one message per revealed number
+ sixty times a second — thousands of commands a second down the VM→GUI channel
+ for a picture that had not changed. The mine and the flag are pixel art stamped into that buffer
+ (see mineArt/flagArt); the digits are drawn by the pane's own 5x7 text overlay
+ on top, one message per revealed number, in the colours the original used —
+ 1 blue, 2 green, 3 red, 4 navy, and so on.
+
+ In a headless VM every game primitive silently fails, so loading this class
+ outside the GUI is harmless — which is how its regression test drives it."
+"I am Minesweeper, played in the native game pane: an 18x12 field of 32 mines.
+ Launch me from the Demos menu, or a Workspace: Minesweeper launch (or
+ Minesweeper launchWithSeed: 12345 for a board you can replay). LEFT click
+ reveals a square, RIGHT click flags one, SPACE deals a new board, Escape
+ quits. My first click is always safe — I deal the mines around wherever you
+ clicked, so the opening move always opens a space. Revealing an empty square
+ floods outward to its neighbours the way the original does. I read the mouse
+ buttons on their EDGE (one click, one square), which is the opposite of Life's
+ level-triggered painting, and both come off the same GameFrame. Harmless to
+ load in a headless VM (every game primitive silently fails there)."
+Object subclass: Minesweeper [
+    | pane cols rows cell x0 y0 mines state counts buf
+      dealt over won flags revealed rng ticks startTick endTick
+      prevLeft prevRight prevSpace dirty lastSecond shake margin worldW worldH |
+    <classVars: Current>
+
+    "Cell state — `state` holds one of these per square."
+    Minesweeper class >> hidden   [ ^0 ]
+    Minesweeper class >> shown    [ ^1 ]
+    Minesweeper class >> flagged  [ ^2 ]
+
+    "Palette slots. The original's colours, loaded over the default set so the
+     board looks like the thing it is a port of rather than like whatever
+     happened to be in the palette."
+    Minesweeper class >> cFace    [ ^16 ]   "192,192,192 — the square's face"
+    Minesweeper class >> cLight   [ ^17 ]   "255,255,255 — raised bevel"
+    Minesweeper class >> cDark    [ ^18 ]   "128,128,128 — sunken bevel, grid"
+    Minesweeper class >> cBlack   [ ^19 ]   "the mine, the flag's pole"
+    Minesweeper class >> cRed     [ ^20 ]   "the flag, and the mine you hit"
+    Minesweeper class >> cWhite   [ ^21 ]   "the mine's highlight"
+    "22..29 are the counts 1..8, in the colours the original used. They are
+     palette slots rather than RGB because the numbers are drawn INTO the
+     scrolling buffer with everything else — see drawNumber:atX:y:."
+    Minesweeper class >> cNumber  [ ^21 ]   "count n uses cNumber + n"
+
+    Minesweeper class >> launch [
+        "Deal a fresh board from the wall clock, so no two games are alike."
+        ^self launchWithSeed: (Time millisecondClockValue \\ 2147483646) + 1
+    ]
+
+    Minesweeper class >> launchWithSeed: aSeed [
+        "Deal a board from a known seed — the same seed always deals the same
+         mines, which is what makes this game testable and what lets you replay
+         one you liked."
+        ^self new startWithSeed: aSeed
+    ]
+
+    Minesweeper class >> current [
+        "The game most recently launched, so a Workspace can question it while
+         it runs — `Minesweeper current minesLeft` — and so the regression test
+         can reach the board."
+        ^Current
+    ]
+
+    startWithSeed: aSeed [
+        Current := self.
+        pane := GamePane new.
+        cols := 18.
+        rows := 12.
+        cell := 16.
+        "Ask for a world 16 pixels bigger than the viewport on every side. That
+         border is what the explosion shakes INTO: scrolling the view across it
+         costs one command a frame and redraws nothing, where moving the board
+         by redrawing it would rasterize the whole picture sixty times a second
+         for no reason. Send it before drawing anything — it decides how the
+         pane is built."
+        margin := 16.
+        pane overscan: margin.
+        worldW := 320 + (margin * 2).
+        worldH := 240 + (margin * 2).
+        "Drawing is now in WORLD coordinates, so everything shifts by the
+         margin: at rest the view sits at (margin, margin) and what used to be
+         pane (0,0) is world (16,16)."
+        x0 := margin + ((320 - (cols * cell)) // 2).
+        y0 := margin + 30.
+        buf := ByteArray new: worldW * worldH.
+        self buildPalette.
+        self dealWithSeed: aSeed.
+        pane onStep: [ :frame | self stepWith: frame ]; run.
+        ^self
+    ]
+
+    dealWithSeed: aSeed [
+        "A new board: everything hidden, no mines placed yet. The mines wait
+         for the first click (see plantAround:y:) so that click can be safe."
+        rng := Random newWithSeed: aSeed.
+        mines := ByteArray new: cols * rows.
+        state := ByteArray new: cols * rows.
+        counts := ByteArray new: cols * rows.
+        dealt := false.
+        over := false.
+        won := false.
+        flags := 0.
+        revealed := 0.
+        ticks := 0.
+        startTick := 0.
+        endTick := 0.
+        prevLeft := false.
+        prevRight := false.
+        prevSpace := false.
+        dirty := true.
+        lastSecond := -1.
+        shake := 0.
+        "A new board always looks straight ahead — a deal arriving mid-shake
+         must not leave the view parked off-centre."
+        pane scrollTo: margin y: margin.
+        ^self
+    ]
+
+    buildPalette [
+        "The original's grey face, its white and dark-grey bevels, and the
+         three colours the mine and flag are drawn from."
+        pane paletteAt: Minesweeper cFace  r: 192 g: 192 b: 192.
+        pane paletteAt: Minesweeper cLight r: 255 g: 255 b: 255.
+        pane paletteAt: Minesweeper cDark  r: 128 g: 128 b: 128.
+        pane paletteAt: Minesweeper cBlack r: 0   g: 0   b: 0.
+        pane paletteAt: Minesweeper cRed   r: 220 g: 40  b: 40.
+        pane paletteAt: Minesweeper cWhite r: 255 g: 255 b: 255.
+        "The counts, 1..8 — blue, green, red, navy, maroon, teal, black, grey."
+        pane paletteAt: 22 r: 40  g: 80  b: 255.
+        pane paletteAt: 23 r: 30  g: 150 b: 40.
+        pane paletteAt: 24 r: 235 g: 50  b: 50.
+        pane paletteAt: 25 r: 30  g: 30  b: 160.
+        pane paletteAt: 26 r: 150 g: 30  b: 30.
+        pane paletteAt: 27 r: 20  g: 150 b: 150.
+        pane paletteAt: 28 r: 20  g: 20  b: 20.
+        pane paletteAt: 29 r: 90  g: 90  b: 90.
+        ^self
+    ]
+
+    "--- the field ---"
+
+    indexX: x y: y [ ^(y * cols) + x + 1 ]
+
+    onBoardX: x y: y [ ^x >= 0 and: [ x < cols and: [ y >= 0 and: [ y < rows ] ] ] ]
+
+    mineAtX: x y: y [ ^(mines at: (self indexX: x y: y)) = 1 ]
+
+    stateAtX: x y: y [ ^state at: (self indexX: x y: y) ]
+
+    countAtX: x y: y [ ^counts at: (self indexX: x y: y) ]
+
+    minesLeft [
+        "What the counter shows: total mines less flags planted. It can go
+         negative if you over-flag, exactly as the original's does."
+        ^32 - flags
+    ]
+
+    isOver [ ^over ]
+    hasWon [ ^won ]
+    isDealt [ ^dealt ]
+    revealedCount [ "How many squares have been opened so far." ^revealed ]
+
+    plantAround: sx y: sy [
+        "Deal 32 mines, refusing the clicked square and its eight neighbours so
+         the opening click always lands in open space. Called once, on the
+         first reveal."
+        | placed x y i |
+        placed := 0.
+        [ placed < 32 ] whileTrue: [
+            x := (rng next * cols) truncated min: cols - 1.
+            y := (rng next * rows) truncated min: rows - 1.
+            i := self indexX: x y: y.
+            "Not already a mine, and not in the safe 3x3 around the first click."
+            ((mines at: i) = 0 and: [ ((x - sx) abs > 1) or: [ (y - sy) abs > 1 ] ])
+                ifTrue: [ mines at: i put: 1. placed := placed + 1 ] ].
+        self countNeighbours.
+        dealt := true.
+        startTick := ticks.
+        ^self
+    ]
+
+    countNeighbours [
+        "Fill in each square's neighbouring-mine count, once, when the mines
+         are dealt — the numbers never change after that."
+        | n |
+        0 to: rows - 1 do: [ :y |
+            0 to: cols - 1 do: [ :x |
+                n := 0.
+                -1 to: 1 do: [ :dy |
+                    -1 to: 1 do: [ :dx |
+                        ((dx = 0 and: [ dy = 0 ]) not
+                            and: [ (self onBoardX: x + dx y: y + dy)
+                                and: [ self mineAtX: x + dx y: y + dy ] ])
+                                    ifTrue: [ n := n + 1 ] ] ].
+                counts at: (self indexX: x y: y) put: n ] ].
+        ^self
+    ]
+
+    "--- playing ---"
+
+    revealX: x y: y [
+        "Reveal one square. A mine ends the game; an empty square (no
+         neighbouring mines) floods outward to its neighbours. The flood is an
+         explicit worklist rather than recursion — a big empty region would
+         otherwise recurse as deep as the board is large."
+        | work px py i |
+        (self onBoardX: x y: y) ifFalse: [ ^self ].
+        dealt ifFalse: [ self plantAround: x y: y ].
+        (self stateAtX: x y: y) = Minesweeper hidden ifFalse: [ ^self ].
+        (self mineAtX: x y: y) ifTrue: [ ^self loseAtX: x y: y ].
+        work := OrderedCollection new.
+        work add: (Array with: x with: y).
+        [ work isEmpty ] whileFalse: [
+            | pair |
+            pair := work removeFirst.
+            px := pair at: 1.
+            py := pair at: 2.
+            i := self indexX: px y: py.
+            (state at: i) = Minesweeper hidden ifTrue: [
+                state at: i put: Minesweeper shown.
+                revealed := revealed + 1.
+                "Only an empty square spreads; a numbered one is a wall."
+                (counts at: i) = 0 ifTrue: [
+                    -1 to: 1 do: [ :dy |
+                        -1 to: 1 do: [ :dx |
+                            ((self onBoardX: px + dx y: py + dy)
+                                and: [ (self stateAtX: px + dx y: py + dy)
+                                        = Minesweeper hidden ])
+                                ifTrue: [ work add: (Array with: px + dx with: py + dy) ] ] ] ] ] ].
+        "One click, one sound — this is reached only when a square actually
+         opened, so a click on empty space or an already-open square stays
+         silent rather than chattering. The mine case never gets here; it
+         returned above with the explosion instead."
+        Sound click play.
+        dirty := true.
+        self checkWon.
+        ^self
+    ]
+
+    flagX: x y: y [
+        "Plant or lift a flag. A revealed square cannot be flagged — there is
+         nothing left to be unsure about."
+        | i s |
+        (self onBoardX: x y: y) ifFalse: [ ^self ].
+        i := self indexX: x y: y.
+        s := state at: i.
+        s = Minesweeper shown ifTrue: [ ^self ].
+        s = Minesweeper flagged
+            ifTrue: [ state at: i put: Minesweeper hidden. flags := flags - 1 ]
+            ifFalse: [ state at: i put: Minesweeper flagged. flags := flags + 1 ].
+        Sound blip play.
+        dirty := true.
+        ^self
+    ]
+
+    loseAtX: x y: y [
+        "You hit one. Show every mine, and remember which one it was so it can
+         be drawn on red."
+        state at: (self indexX: x y: y) put: Minesweeper shown.
+        over := true.
+        won := false.
+        endTick := ticks.
+        "Half a second of rattle, and the bang. Both are no-ops in a headless
+         VM, so the regression tests never hear a thing."
+        shake := 30.
+        Sound explode play.
+        dirty := true.
+        ^self
+    ]
+
+    checkWon [
+        "Won when every square that is NOT a mine has been revealed — flags do
+         not enter into it, exactly as in the original."
+        revealed = ((cols * rows) - 32) ifTrue: [
+            over := true.
+            won := true.
+            endTick := ticks.
+            Sound powerup play ].
+        ^self
+    ]
+
+    elapsedSeconds [
+        "Seconds since the first click, frozen when the game ends. Counted in
+         frames rather than read off the clock, so it cannot disagree with what
+         is on screen."
+        | stop |
+        dealt ifFalse: [ ^0 ].
+        stop := over ifTrue: [ endTick ] ifFalse: [ ticks ].
+        ^(stop - startTick) // 60
+    ]
+
+    "--- input ---"
+
+    "The pointer arrives in VIEWPORT pixels while the board is drawn in WORLD
+     pixels, so the hit test has to put the scroll back: world = viewport +
+     scroll, and the view sits at (margin, margin) whenever the board is
+     playable. It is only ever elsewhere during the explosion shake, and clicks
+     are ignored once the game is over — so this is exact, not approximate."
+    cellXFor: px [ ^(px + margin - x0) // cell ]
+    cellYFor: py [ ^(py + margin - y0) // cell ]
+
+    readMouseFrom: frame [
+        "EDGE-triggered, unlike Life: act on the frame a button goes down, not
+         while it is held. Held would reveal a square every frame the button
+         was down, which is a click that eats the whole board."
+        | left right cx cy |
+        left := frame mouseDown.
+        right := frame mouseRightDown.
+        (frame mouseInPane and: [ over not ]) ifTrue: [
+            cx := self cellXFor: frame mouseX.
+            cy := self cellYFor: frame mouseY.
+            (left and: [ prevLeft not ]) ifTrue: [ self revealX: cx y: cy ].
+            (right and: [ prevRight not ]) ifTrue: [ self flagX: cx y: cy ] ].
+        prevLeft := left.
+        prevRight := right.
+        ^self
+    ]
+
+    readSpaceFrom: frame [
+        "SPACE deals a new board — on the edge, again, or holding it would
+         reshuffle 60 times a second."
+        | down |
+        down := frame keyHeld: GamePane keyA.
+        (down and: [ prevSpace not ]) ifTrue: [
+            | seed |
+            seed := (Time millisecondClockValue \\ 2147483646) + 1.
+            self dealWithSeed: seed.
+            prevSpace := true.
+            ^self ].
+        prevSpace := down.
+        ^self
+    ]
+
+    "--- the frame ---"
+
+    stepWith: frame [
+        "One frame: read the input, redraw if anything changed, and present.
+         `present` runs every frame — it is the one moment the GUI shows the
+         pane — but the redraw above it does NOT, and that distinction is
+         load-bearing here. The text overlay is RETAINED, so redrawing it every
+         frame re-sent a message per revealed number, sixty times a second:
+         about six thousand commands a second down the VM→GUI channel for a
+         board that had not changed. Now the board redraws only when something
+         actually happens — a click, the clock ticking over, or the explosion
+         shaking the screen."
+        ticks := ticks + 1.
+        self readSpaceFrom: frame.
+        self readMouseFrom: frame.
+        self advanceShake.
+        "The clock is the one thing that changes without input, so it is the
+         one thing allowed to dirty the frame on its own — once a second."
+        self elapsedSeconds = lastSecond ifFalse: [
+            lastSecond := self elapsedSeconds.
+            dirty := true ].
+        dirty ifTrue: [ self paint. self drawHud. dirty := false ].
+        pane present.
+        ^self
+    ]
+
+    advanceShake [
+        "The explosion's screen shake, spent one frame at a time. The board is
+         288x192 inside a 320x240 pane, so there is a margin all round it doing
+         nothing — the shake happens INTO that overscan, which is why the board
+         can lurch about without a single square sliding off the edge or the
+         picture having to be scaled.
+
+         The offset alternates every frame on x and every other frame on y, so
+         it reads as a violent rattle rather than a smooth slide, and the
+         amplitude decays with the remaining frames so it settles rather than
+         stopping dead."
+        | amp dx dy |
+        shake = 0 ifTrue: [ ^self ].
+        shake := shake - 1.
+        amp := (shake * 12) // 30.
+        dx := (shake \\ 2) = 0 ifTrue: [ amp ] ifFalse: [ 0 - amp ].
+        dy := (shake \\ 4) < 2 ifTrue: [ amp ] ifFalse: [ 0 - amp ].
+        "One command, no redraw: `dirty` is deliberately NOT set. The board is
+         already drawn; all that moves is where the viewport looks."
+        pane scrollTo: margin + dx y: margin + dy.
+        ^self
+    ]
+
+    "--- drawing ---"
+
+    fill: px y: py width: w height: h color: c [
+        "Fill a rectangle of WORLD pixels straight into the frame buffer."
+        | idx |
+        0 to: h - 1 do: [ :dy |
+            idx := ((py + dy) * worldW) + px + 1.
+            0 to: w - 1 do: [ :dx | buf at: idx + dx put: c ] ].
+        ^self
+    ]
+
+    paint [
+        "Compose the whole world: background, then every square, then blit it
+         in one command. The background covers the overscan border too, so
+         whatever the shake scrolls into view is the same grey as the rest and
+         not uninitialised memory."
+        | s |
+        self fill: 0 y: 0 width: worldW height: worldH color: Minesweeper cDark.
+        0 to: rows - 1 do: [ :y |
+            0 to: cols - 1 do: [ :x |
+                s := self stateAtX: x y: y.
+                s = Minesweeper shown
+                    ifTrue: [ self paintShownX: x y: y ]
+                    ifFalse: [ self paintHiddenX: x y: y flagged: s = Minesweeper flagged ] ] ].
+        pane blit: buf.
+        ^self
+    ]
+
+    paintHiddenX: x y: y flagged: isFlagged [
+        "An unclicked square: the raised look — face, white along the top and
+         left, dark grey along the bottom and right. Two pixels of bevel is
+         what reads as 'button' at this size."
+        | px py |
+        px := x0 + (x * cell).
+        py := y0 + (y * cell).
+        self fill: px y: py width: cell height: cell color: Minesweeper cFace.
+        self fill: px y: py width: cell height: 2 color: Minesweeper cLight.
+        self fill: px y: py width: 2 height: cell color: Minesweeper cLight.
+        self fill: px y: py + cell - 2 width: cell height: 2 color: Minesweeper cDark.
+        self fill: px + cell - 2 y: py width: 2 height: cell color: Minesweeper cDark.
+        "When the game is lost, every mine shows — even under a flag, which is
+         how you find out the flag was wrong."
+        (over and: [ self mineAtX: x y: y ])
+            ifTrue: [ ^self stamp: self mineArt at: px + 2 y: py + 2 ].
+        isFlagged ifTrue: [ self stamp: self flagArt at: px + 2 y: py + 2 ].
+        ^self
+    ]
+
+    paintShownX: x y: y [
+        "A revealed square: flat, with one dark pixel along the top and left as
+         the grid line. A revealed mine is the one you hit — it gets a red
+         ground so it is obvious which move ended it."
+        | px py |
+        px := x0 + (x * cell).
+        py := y0 + (y * cell).
+        (self mineAtX: x y: y)
+            ifTrue: [ self fill: px y: py width: cell height: cell color: Minesweeper cRed ]
+            ifFalse: [ self fill: px y: py width: cell height: cell color: Minesweeper cFace ].
+        self fill: px y: py width: cell height: 1 color: Minesweeper cDark.
+        self fill: px y: py width: 1 height: cell color: Minesweeper cDark.
+        (self mineAtX: x y: y)
+            ifTrue: [ self stamp: self mineArt at: px + 2 y: py + 2 ]
+            ifFalse: [
+                (self countAtX: x y: y) > 0
+                    ifTrue: [ self drawNumber: (self countAtX: x y: y) atX: x y: y ] ].
+        ^self
+    ]
+
+    stamp: art at: px y: py [
+        "Draw pixel art — an Array of equal-length row Strings — into the frame
+         buffer. `.` is transparent, so the art keeps the square underneath it;
+         every other character names a colour through colourFor:."
+        | row c |
+        1 to: art size do: [ :r |
+            row := art at: r.
+            1 to: row size do: [ :cIdx |
+                c := self colourFor: (row at: cIdx).
+                c = 0 ifFalse: [
+                    buf at: ((py + r - 1) * worldW) + px + cIdx put: c ] ] ].
+        ^self
+    ]
+
+    colourFor: aChar [
+        "Art characters to palette slots; 0 means leave the pixel alone.
+
+         `=`, NOT `==`. String>>at: hands back a fresh Character rather than the
+         canonical one out of Character's table, so identity is false even for
+         the same character and every piece of art silently drew nothing —
+         no mine, no flag, no number, and no error to say so."
+        aChar = $K ifTrue: [ ^Minesweeper cBlack ].
+        aChar = $W ifTrue: [ ^Minesweeper cWhite ].
+        aChar = $R ifTrue: [ ^Minesweeper cRed ].
+        ^0
+    ]
+
+    mineArt [
+        "The mine, 12x12: a round black body with spikes north, south, east,
+         west and on the four diagonals, and a white highlight up and to the
+         left — the shape everyone recognises. Built as rows of characters so
+         it can be read and edited as a picture in the Browser."
+        | a |
+        a := OrderedCollection new.
+        a add: '.....KK.....'.
+        a add: '.....KK.....'.
+        a add: '..K..KK..K..'.
+        a add: '...KKKKKK...'.
+        a add: '..KWWKKKKK..'.
+        a add: 'KKKWWKKKKKKK'.
+        a add: 'KKKKKKKKKKKK'.
+        a add: '..KKKKKKKK..'.
+        a add: '...KKKKKK...'.
+        a add: '..K..KK..K..'.
+        a add: '.....KK.....'.
+        a add: '.....KK.....'.
+        ^a asArray
+    ]
+
+    flagArt [
+        "The flag, 12x12: a red pennant on a black staff standing on a base."
+        | a |
+        a := OrderedCollection new.
+        a add: '......K.....'.
+        a add: '....RRK.....'.
+        a add: '..RRRRK.....'.
+        a add: 'RRRRRRK.....'.
+        a add: '..RRRRK.....'.
+        a add: '....RRK.....'.
+        a add: '......K.....'.
+        a add: '......K.....'.
+        a add: '......K.....'.
+        a add: '....KKKKK...'.
+        a add: '...KKKKKKK..'.
+        a add: '............'.
+        ^a asArray
+    ]
+
+    "--- the numbers, drawn INTO the scrolling buffer ---
+     Not with the pane's text overlay, which was the obvious first choice and
+     the wrong one. That overlay lives in VIEWPORT coordinates and does not
+     scroll, so the moment the explosion shakes the view every number would
+     stay nailed to the glass while its square slid out from under it. Drawing
+     them into the same buffer as the board means the whole picture moves
+     together, for free, and costs no per-number command at all."
+
+    drawNumber: n atX: x y: y [
+        "One digit, centred in its square: a 5x7 glyph doubled is 10x14 in a
+         16-pixel cell, so 3 across and 1 down centres it."
+        self stampGlyph: (self digitArt: n)
+             at: x0 + (x * cell) + 3
+             y: y0 + (y * cell) + 1
+             color: Minesweeper cNumber + n
+    ]
+
+    stampGlyph: rows at: px y: py color: c [
+        "Draw a 5x7 glyph at double size — every set pixel becomes a 2x2 block,
+         which is what makes a 5x7 font legible at this cell size."
+        | row |
+        1 to: rows size do: [ :r |
+            row := rows at: r.
+            1 to: row size do: [ :cIdx |
+                "`=` not `==` — see colourFor:."
+                (row at: cIdx) = $# ifTrue: [
+                    self fill: px + ((cIdx - 1) * 2)
+                         y: py + ((r - 1) * 2)
+                         width: 2 height: 2 color: c ] ] ].
+        ^self
+    ]
+
+    digitArt: n [
+        "The counts 1..8 as 5x7 pixel art — the same shapes the pane's own font
+         uses, kept here so the numbers can live in the scrolling buffer."
+        | a |
+        a := OrderedCollection new.
+        n = 1 ifTrue: [
+            a add: '..#..'. a add: '.##..'. a add: '..#..'. a add: '..#..'.
+            a add: '..#..'. a add: '..#..'. a add: '.###.'. ^a asArray ].
+        n = 2 ifTrue: [
+            a add: '.###.'. a add: '#...#'. a add: '....#'. a add: '...#.'.
+            a add: '..#..'. a add: '.#...'. a add: '#####'. ^a asArray ].
+        n = 3 ifTrue: [
+            a add: '.###.'. a add: '#...#'. a add: '....#'. a add: '..##.'.
+            a add: '....#'. a add: '#...#'. a add: '.###.'. ^a asArray ].
+        n = 4 ifTrue: [
+            a add: '...#.'. a add: '..##.'. a add: '.#.#.'. a add: '#..#.'.
+            a add: '#####'. a add: '...#.'. a add: '...#.'. ^a asArray ].
+        n = 5 ifTrue: [
+            a add: '#####'. a add: '#....'. a add: '####.'. a add: '....#'.
+            a add: '....#'. a add: '#...#'. a add: '.###.'. ^a asArray ].
+        n = 6 ifTrue: [
+            a add: '..##.'. a add: '.#...'. a add: '#....'. a add: '####.'.
+            a add: '#...#'. a add: '#...#'. a add: '.###.'. ^a asArray ].
+        n = 7 ifTrue: [
+            a add: '#####'. a add: '....#'. a add: '...#.'. a add: '..#..'.
+            a add: '.#...'. a add: '.#...'. a add: '.#...'. ^a asArray ].
+        a add: '.###.'. a add: '#...#'. a add: '#...#'. a add: '.###.'.
+        a add: '#...#'. a add: '#...#'. a add: '.###.'. ^a asArray
+    ]
+
+    drawHud [
+        "Mines remaining on the left, the clock on the right, and whatever the
+         game has to say in the middle. This IS the text overlay, so it is in
+         viewport coordinates and does not move when the explosion shakes the
+         board — which is what you want from a HUD: the readout stays put while
+         the world lurches. The overlay is RETAINED, so it is cleared and
+         redrawn whole, and only when something changed."
+        | status r g b |
+        pane textClear.
+        pane text: 'MINES ', self minesLeft printString
+             x: 8 y: 8 r: 235 g: 240 b: 255 scale: 2.
+        pane text: 'TIME ', self elapsedSeconds printString
+             x: 232 y: 8 r: 235 g: 240 b: 255 scale: 2.
+        over
+            ifTrue: [
+                won
+                    ifTrue: [ status := 'CLEARED'. r := 80. g := 255. b := 120 ]
+                    ifFalse: [ status := 'BOOM'. r := 255. g := 70. b := 70 ] ]
+            ifFalse: [ status := ''. r := 0. g := 0. b := 0 ].
+        status isEmpty ifFalse: [
+            pane text: status x: 130 y: 8 r: r g: g b: b scale: 2 ].
+        pane text: 'LEFT REVEAL   RIGHT FLAG   SPACE NEW   ESC QUIT'
+             x: 4 y: 228 r: 150 g: 165 b: 200 scale: 1.
+        ^self
+    ]
+]
