@@ -1520,6 +1520,30 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 271,
+        name: "GamePane>>textMemory",
+        f: prim_game_text_memory,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 272,
+        name: "GamePane>>textCols",
+        f: prim_game_text_cols,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 273,
+        name: "GamePane>>textRows",
+        f: prim_game_text_rows,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1997,6 +2021,43 @@ fn prim_game_screen_stride(_vm: &mut VmState, _args: &[Oop]) -> PrimResult {
         return PrimResult::Fail;
     };
     PrimResult::Ok(SmallInt::new(stride as i64).oop())
+}
+
+/// `textMemory` (271): the text plane's cell grid as an indirect `Alien` —
+/// `cols * rows` cells of four bytes, `[char, fg, bg, flags]`, laid out row by
+/// row. Writing a character is a store; there is no command, which is why a HUD
+/// redrawn every frame costs nothing at all (SM1,
+/// docs/shared_screen_memory_design.md).
+///
+/// Unlike `screenMemory` this does NOT rotate — one grid, in place — so an
+/// Alien may be kept for the life of the pane. Fails when no pane is open.
+fn prim_game_text_memory(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    let Some((ptr, cols, rows)) = crate::embed::text_memory() else {
+        return PrimResult::Fail;
+    };
+    let bytes = cols.saturating_mul(rows).saturating_mul(4);
+    if bytes == 0 {
+        return PrimResult::Fail;
+    }
+    PrimResult::Ok(crate::runtime::alien::make_indirect_alien(
+        vm, ptr as u64, bytes,
+    ))
+}
+
+/// `textCols` (272) / `textRows` (273): the text plane's grid size in cells.
+/// Cell `(col, row)` starts at byte `(row * cols + col) * 4`.
+fn prim_game_text_cols(_vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    let Some((_, cols, _)) = crate::embed::text_memory() else {
+        return PrimResult::Fail;
+    };
+    PrimResult::Ok(SmallInt::new(cols as i64).oop())
+}
+
+fn prim_game_text_rows(_vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    let Some((_, _, rows)) = crate::embed::text_memory() else {
+        return PrimResult::Fail;
+    };
+    PrimResult::Ok(SmallInt::new(rows as i64).oop())
 }
 
 /// `linePaletteAt:index:rgb:` (261): per-scanline palette override. Colour is a
@@ -5435,6 +5496,9 @@ mod tests {
             (268, "GamePane>>openDirect:height:"),
             (269, "GamePane>>screenMemory"),
             (270, "GamePane>>screenStride"),
+            (271, "GamePane>>textMemory"),
+            (272, "GamePane>>textCols"),
+            (273, "GamePane>>textRows"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

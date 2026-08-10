@@ -103,7 +103,22 @@ Object subclass: Plasma [
         stride := pane screenStride.
         self paintInto: fb stride: stride.
         phase := phase + 2.
+        self drawHud.
         pane present.
+        ^self
+    ]
+
+    drawHud [
+        "A HUD on the TEXT PLANE, rewritten from scratch EVERY frame — which
+         is the point. Through the old text overlay this was a command per
+         string per frame, and the defence against that cost was remembering
+         to redraw only when something changed. Here it is four stores per
+         character into shared memory, so redrawing everything always is
+         simply cheaper than deciding whether to."
+        pane textPut: 'DIRECT GPU MEMORY' at: 1 row: 1 color: GamePane white.
+        pane textPut: 'FRAME ', phase printString at: 1 row: 2 color: GamePane yellow.
+        pane textPut: 'SPACE CYCLES PALETTE   ESC QUITS'
+             at: 1 row: 28 color: GamePane lightGrey.
         ^self
     ]
 

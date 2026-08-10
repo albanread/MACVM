@@ -491,6 +491,84 @@ Object subclass: GamePane [
         ^nil
     ]
 
+    "--- the text plane (docs/shared_screen_memory_design.md SM1) ---
+     The text overlay, seen as a SCREEN BUFFER instead of a chain of commands.
+     A grid of cells in shared memory: four bytes each — character, foreground
+     colour, background colour, flags — that the GPU turns into glyphs. Writing
+     a character is a STORE, so a HUD redrawn every frame costs nothing, and
+     there is no rule to remember about only redrawing when something changed.
+     That rule existed because `text:x:y:...` sends a command per string; this
+     sends none at all.
+
+         pane textPut: 'SCORE 100' at: 0 row: 0 color: GamePane white.
+         pane textClearPlane.
+
+     Character 0 means an UNUSED cell and draws nothing — not a black square —
+     so the plane is invisible until you write into it, and clearing a cell
+     really does remove it.
+
+     Cells are 6x8 pixels (the 5x7 font plus a pixel of leading), so a 320x240
+     pane is 53x30 cells. That grid is the limit as well as the point: glyphs
+     land on cell boundaries, so this is for text SCREENS — HUDs, menus, help
+     pages, consoles. Text that must sit at an arbitrary pixel offset (a digit
+     centred in a 16-pixel square, a card's rank inside its corner) stays pixel
+     art in the picture itself."
+
+    textMemory [
+        "The cell grid as an Alien — `textCols * textRows` cells of 4 bytes,
+         row by row. nil when no pane is open. Unlike screenMemory this never
+         moves, so it is safe to keep."
+        <primitive: 271>
+        ^nil
+    ]
+    textCols [ "Grid width in cells; nil with no pane." <primitive: 272> ^nil ]
+    textRows [ "Grid height in cells; nil with no pane." <primitive: 273> ^nil ]
+
+    textAt: col row: row put: aCharacter color: fg back: bg flags: fl [
+        "Write one cell. Silently ignores anything off the grid, so a HUD that
+         runs long clips instead of failing."
+        | tm base |
+        tm := self textMemory.
+        tm isNil ifTrue: [ ^self ].
+        (col >= 0 and: [ row >= 0 and: [ col < self textCols and: [ row < self textRows ] ] ])
+            ifFalse: [ ^self ].
+        base := ((row * self textCols) + col) * 4.
+        tm byteAt: base + 1 put: aCharacter asInteger.
+        tm byteAt: base + 2 put: fg.
+        tm byteAt: base + 3 put: bg.
+        tm byteAt: base + 4 put: fl.
+        ^self
+    ]
+
+    textPut: aString at: col row: row color: fg [
+        "Write a string in `fg` over whatever is behind it (transparent
+         background) — the common case, and the one a HUD wants."
+        ^self textPut: aString at: col row: row color: fg back: 0 flags: 1
+    ]
+
+    textPut: aString at: col row: row color: fg back: bg flags: fl [
+        "Write a string cell by cell. One store per character and not one
+         command, however often it is called."
+        | tm |
+        tm := self textMemory.
+        tm isNil ifTrue: [ ^self ].
+        1 to: aString size do: [ :i |
+            self textAt: col + i - 1 row: row
+                 put: (aString at: i) color: fg back: bg flags: fl ].
+        ^self
+    ]
+
+    textClearPlane [
+        "Blank every cell — the plane goes invisible again. Cheap: it is a
+         memory wipe, not a redraw."
+        | tm n |
+        tm := self textMemory.
+        tm isNil ifTrue: [ ^self ].
+        n := self textCols * self textRows * 4.
+        1 to: n do: [ :i | tm byteAt: i put: 0 ].
+        ^self
+    ]
+
     overscan: margin [
         "Build me with a WORLD `margin` pixels bigger than my viewport on every
          side, so the view can be scrolled around inside it. Like resizeTo:by:

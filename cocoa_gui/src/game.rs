@@ -29,6 +29,7 @@ use macgamepane_graphics::indexed_pane::IndexedPane;
 use macgamepane_graphics::shader_pane::ShaderPane;
 use macgamepane_graphics::sprites::Sprites;
 use macgamepane_graphics::text_overlay::TextOverlay;
+use macgamepane_graphics::text_plane::TextPlane;
 use macgamepane_graphics::window::GameWindow;
 use macvm::embed::{GameCommand, GameSink};
 use metal::MTLLoadAction;
@@ -110,6 +111,11 @@ struct NativeGame {
     /// The topmost HUD/text layer (RGB, real 5x7 font) — always composited
     /// last. Retained between frames; a demo `TextClear`s it each frame.
     text: TextOverlay,
+    /// The TEXT PLANE (SM1): a cell grid in shared memory the VM writes with
+    /// stores instead of `Text` commands. Always present, always composited
+    /// last; an untouched grid is all char-0 cells and draws nothing, so it
+    /// costs a demo that ignores it exactly nothing.
+    text_plane: Option<TextPlane>,
     /// The layer-0 background fragment shader, created lazily on the first
     /// `Shader` command (`None` = no shader; the indexed pane clears the frame).
     shader: Option<ShaderPane>,
@@ -186,10 +192,18 @@ fn ensure_pane() {
             objc::send1_bool(window, objc::sel("setReleasedWhenClosed:"), false);
             objc::send1_id(window, objc::sel("setDelegate:"), game_window_delegate());
         }
+        // The text plane is built with the pane and lives as long as it. An
+        // untouched grid draws nothing, so this is free for every demo that
+        // does not use it, and instantly there for every demo that does.
+        let text_plane = TextPlane::new(&win.device, w, h).ok();
+        if let Some(tp) = text_plane.as_ref() {
+            macvm::embed::publish_text_memory(tp.cells_ptr(), tp.cols() as usize, tp.rows() as usize);
+        }
         *cell.borrow_mut() = Some(NativeGame {
             win,
             pane,
             direct: None,
+            text_plane,
             sprites,
             text,
             shader: None,
@@ -275,6 +289,7 @@ fn close_window() {
     // the demo still holds must read as "no screen" rather than as memory that
     // is about to be freed.
     macvm::embed::clear_screen_memory();
+    macvm::embed::clear_text_memory();
     // Forget where the mouse was; the next demo's first frame should not see a
     // pointer position left behind by this one.
     GAME_MOUSE_X.store(-1, Ordering::Release);
@@ -332,6 +347,9 @@ fn present(g: &mut NativeGame) {
         if let Some(d) = g.direct.as_mut() {
             d.render(cb, tex);
         }
+        if let Some(tp) = g.text_plane.as_mut() {
+            tp.render(cb, tex);
+        }
         g.text.render(cb, tex);
         cb.present_drawable(drawable);
         cb.commit();
@@ -354,6 +372,9 @@ fn present(g: &mut NativeGame) {
     g.pane.render(cb, tex, pane_load);
     g.sprites
         .render(cb, tex, 0.0, 0.0, g.w as f64, g.h as f64);
+    if let Some(tp) = g.text_plane.as_mut() {
+        tp.render(cb, tex);
+    }
     g.text.render(cb, tex);
     cb.present_drawable(drawable);
     cb.commit();

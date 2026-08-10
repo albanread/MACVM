@@ -516,6 +516,44 @@ pub(crate) fn screen_memory() -> Option<(*mut u8, usize, usize)> {
     ))
 }
 
+// The TEXT plane, published exactly like the pixel one above (SM1). A grid of
+// four-byte cells — `[char, fg, bg, flags]` — that the VM writes with stores
+// instead of sending `Text` commands. Char 0 means an unused cell and draws
+// nothing, so the plane is invisible until something is put in it.
+static TEXT_PTR: AtomicUsize = AtomicUsize::new(0);
+static TEXT_COLS: AtomicUsize = AtomicUsize::new(0);
+static TEXT_ROWS: AtomicUsize = AtomicUsize::new(0);
+
+/// Publish the text cell grid. Unlike the framebuffer this does NOT rotate —
+/// there is one grid and it stays put — so the host publishes once when the
+/// pane is built and retracts on close.
+pub fn publish_text_memory(ptr: *mut u8, cols: usize, rows: usize) {
+    TEXT_COLS.store(cols, Ordering::Relaxed);
+    TEXT_ROWS.store(rows, Ordering::Relaxed);
+    TEXT_PTR.store(ptr as usize, Ordering::Release);
+}
+
+/// Retract the text grid — the pane closed.
+pub fn clear_text_memory() {
+    TEXT_PTR.store(0, Ordering::Release);
+    TEXT_COLS.store(0, Ordering::Relaxed);
+    TEXT_ROWS.store(0, Ordering::Relaxed);
+}
+
+/// The published text grid as `(ptr, cols, rows)`, or `None` when no pane is
+/// open.
+pub(crate) fn text_memory() -> Option<(*mut u8, usize, usize)> {
+    let p = TEXT_PTR.load(Ordering::Acquire);
+    if p == 0 {
+        return None;
+    }
+    Some((
+        p as *mut u8,
+        TEXT_COLS.load(Ordering::Relaxed),
+        TEXT_ROWS.load(Ordering::Relaxed),
+    ))
+}
+
 /// Where game-primitive commands go — the game analogue of [`TranscriptSink`].
 /// `Send` because the GUI's sink hands commands across the worker-to-main
 /// thread channel, exactly like the transcript sink hands text.
@@ -2422,9 +2460,30 @@ mod tests {
     /// raced on the first run and one saw the other's buffer.
     static SCREEN_MEM_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Retract whatever this test published, WHATEVER happens to it.
+    ///
+    /// A test publishes a pointer into a `Vec` it owns; when the test returns
+    /// that `Vec` is freed, and anything still pointing at it is a dangling
+    /// write waiting to happen. Clearing at the end of the test body is not
+    /// enough, because a failed assertion unwinds straight past it — which is
+    /// exactly what went wrong: one test left `TEXT_PTR` aimed at a freed
+    /// buffer, a later test's HUD wrote through it, and the suite died with
+    /// SIGTRAP two tests further on with nothing to connect the two.
+    ///
+    /// A drop guard cannot be skipped. It is the test-scale version of the
+    /// real rule the host follows: retract the pointer BEFORE the memory goes.
+    struct PublishedMemory;
+    impl Drop for PublishedMemory {
+        fn drop(&mut self) {
+            crate::embed::clear_screen_memory();
+            crate::embed::clear_text_memory();
+        }
+    }
+
     #[test]
     fn screen_memory_writes_land_in_the_hosts_buffer_with_no_commands() {
         let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _published = PublishedMemory;
         crate::embed::clear_screen_memory();
         // SM0. The whole point of shared screen memory is that a pixel write
         // is a STORE, not a message — so this test asserts both halves: the
@@ -2533,6 +2592,79 @@ mod tests {
     }
 
     #[test]
+    fn text_plane_writes_are_stores_not_commands() {
+        // SM1. The flood Minesweeper hit was one `Text` command per number,
+        // every frame. Written into the text plane the same HUD costs nothing
+        // on the channel at all — so there is no longer a rule to remember
+        // about redrawing only when something changed.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _published = PublishedMemory;
+        crate::embed::clear_text_memory();
+
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+        const COLS: usize = 53;
+        const ROWS: usize = 30;
+        let mut grid = vec![0u8; COLS * ROWS * 4];
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+
+        // No pane: everything answers nil, so a headless demo degrades.
+        assert_eq!(vm.eval("GamePane basicNew textMemory.").unwrap(), "nil");
+        assert_eq!(vm.eval("GamePane basicNew textCols.").unwrap(), "nil");
+
+        crate::embed::publish_text_memory(grid.as_mut_ptr(), COLS, ROWS);
+        assert_eq!(vm.eval("GamePane basicNew textCols.").unwrap(), "53");
+        assert_eq!(vm.eval("GamePane basicNew textRows.").unwrap(), "30");
+
+        captured.lock().unwrap().clear();
+        vm.exec(
+            "GamePane basicNew textPut: 'SCORE 100' at: 2 row: 1 color: 23.",
+        )
+        .expect("writing text must run");
+
+        // The cells really hold it, at (col 2, row 1), one cell per character.
+        let base = ((1 * COLS) + 2) * 4;
+        for (i, ch) in b"SCORE 100".iter().enumerate() {
+            let at = base + i * 4;
+            assert_eq!(grid[at], *ch, "cell {i} must hold the character");
+            assert_eq!(grid[at + 1], 23, "foreground colour");
+            assert_eq!(grid[at + 3], 1, "transparent background by default");
+        }
+        // The cell before the string is untouched — char 0, which draws
+        // nothing, which is what keeps an unused plane invisible.
+        assert_eq!(grid[((1 * COLS) + 1) * 4], 0);
+
+        // And not one command was emitted to do it.
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "writing text must emit NO commands — that is the whole slice"
+        );
+
+        // Off-grid writes clip rather than corrupt or fail.
+        vm.exec("GamePane basicNew textPut: 'XXXXX' at: 51 row: 29 color: 24.")
+            .expect("a string running off the edge must clip");
+        vm.exec("GamePane basicNew textPut: 'Y' at: 0 row: 99 color: 24.")
+            .expect("a row past the end must be ignored");
+        assert_eq!(grid[(29 * COLS + 52) * 4], b'X', "the last cell in range");
+
+        // Clearing blanks it.
+        vm.exec("GamePane basicNew textClearPlane.")
+            .expect("clear must run");
+        assert!(
+            grid.iter().all(|&b| b == 0),
+            "textClearPlane must blank every cell"
+        );
+        crate::embed::clear_text_memory();
+    }
+
+    #[test]
     fn a_full_screen_direct_demo_costs_exactly_one_command_per_frame() {
         // THE SM0 CLAIM, stated as a number. Plasma (world/45d_plasma.mst)
         // rewrites all 76,800 pixels every frame. Through the retained path
@@ -2544,6 +2676,7 @@ mod tests {
         // whole point of the slice, and it is worth an assertion rather than a
         // paragraph.
         let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _published = PublishedMemory;
         crate::embed::clear_screen_memory();
 
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
@@ -2555,11 +2688,18 @@ mod tests {
         const W: usize = 320;
         const H: usize = 240;
         let mut host = vec![0u8; W * H];
+        // Publish the TEXT plane as well, so the measurement covers what the
+        // demo really does: a full-screen field AND a live HUD rewritten from
+        // scratch every frame. Both are stores; neither is a command.
+        const COLS: usize = 53;
+        const ROWS: usize = 30;
+        let mut grid = vec![0u8; COLS * ROWS * 4];
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut vm = boot_test_vm(JitMode::Threshold(10));
         vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
         crate::embed::publish_screen_memory(host.as_mut_ptr(), W, H);
+        crate::embed::publish_text_memory(grid.as_mut_ptr(), COLS, ROWS);
 
         vm.exec("Plasma launch.").expect("Plasma must launch");
 
@@ -2606,12 +2746,23 @@ mod tests {
             distinct > 32,
             "a plasma is a gradient, not a fill — got {distinct} distinct indices"
         );
-        crate::embed::clear_screen_memory();
+        // The HUD really was written, into the text grid, for free.
+        // Row 1, from column 1 — where drawHud puts it.
+        let hud: Vec<u8> = (1..COLS)
+            .map(|c| grid[((1 * COLS) + c) * 4])
+            .take_while(|&b| b != 0)
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&hud),
+            "DIRECT GPU MEMORY",
+            "the HUD must land in the text plane"
+        );
     }
 
     #[test]
     fn screen_memory_is_length_bounded_and_cannot_scribble_past_the_screen() {
         let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _published = PublishedMemory;
         crate::embed::clear_screen_memory();
         // The safety property that justifies handing out an Alien instead of a
         // raw pointer: a demo with an off-by-one cannot corrupt whatever the
@@ -3350,6 +3501,16 @@ mod tests {
                 self.0.lock().unwrap().push(cmd);
             }
         }
+        // Publish a text plane, so the HUD really is rewritten every one of
+        // these frames. Without it `textMemory` is nil, drawHud does nothing,
+        // and the silence below would be the silence of a HUD that never ran.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _published = PublishedMemory;
+        const COLS: usize = 53;
+        const ROWS: usize = 30;
+        let mut grid = vec![0u8; COLS * ROWS * 4];
+        crate::embed::publish_text_memory(grid.as_mut_ptr(), COLS, ROWS);
+
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut vm = boot_test_vm(JitMode::Threshold(10));
         vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
@@ -3361,22 +3522,36 @@ mod tests {
             vm.exec("GamePane stepWithKeys: 0 mouseX: -1 y: -1 buttons: 0.")
                 .expect("an idle frame must run");
         }
+        // The HUD did run, every frame, into the grid.
+        let hud: Vec<u8> = (1..COLS)
+            .map(|c| grid[c * 4])
+            .take_while(|&b| b != 0)
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&hud),
+            "MINES 32",
+            "the HUD must be live in the text plane while these frames run"
+        );
         let cmds = captured.lock().unwrap();
         let presents = cmds
             .iter()
             .filter(|c| matches!(c, GameCommand::Present))
             .count();
         assert_eq!(presents, 60, "every idle frame must still present");
-        // One second of frames redraws at most once (the clock ticking over):
-        // one Blit, and one Text per revealed number plus the HUD. Anything
-        // near 60 redraws is the flood this test exists to catch.
-        let blits = cmds
+        // TIGHTENED BY SM1. This used to allow one or two blits a second,
+        // because the clock ticking over dirtied the whole frame just to
+        // update the seconds. The HUD now lives in the text plane, where
+        // rewriting it is stores rather than commands, so an idle board is
+        // completely silent: sixty frames, sixty presents, and NOTHING else on
+        // the channel.
+        let others: Vec<&GameCommand> = cmds
             .iter()
-            .filter(|c| matches!(c, GameCommand::Blit { .. }))
-            .count();
+            .filter(|c| !matches!(c, GameCommand::Present))
+            .collect();
         assert!(
-            blits <= 2,
-            "60 idle frames must redraw at most once or twice, got {blits} blits"
+            others.is_empty(),
+            "60 idle frames must emit presents and nothing else, got {:?}",
+            others.iter().take(4).collect::<Vec<_>>()
         );
     }
 

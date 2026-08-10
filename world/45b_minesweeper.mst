@@ -32,13 +32,21 @@
  Drawing: the board is composed into one reused ByteArray of palette indices
  and handed over in a single `blit:`, recomposed only when something changed —
  which for Minesweeper is 'only when you click', so a board just sitting there
- costs nothing. That is not just thrift: the text overlay is RETAINED between
- frames, so redrawing it every frame re-sent one message per revealed number
- sixty times a second — thousands of commands a second down the VM→GUI channel
- for a picture that had not changed. The mine and the flag are pixel art stamped into that buffer
- (see mineArt/flagArt); the digits are drawn by the pane's own 5x7 text overlay
- on top, one message per revealed number, in the colours the original used —
- 1 blue, 2 green, 3 red, 4 navy, and so on.
+ costs nothing. The mine, the flag AND the counts are all pixel art stamped
+ into that buffer (mineArt/flagArt/digitArt), in the colours the original used:
+ 1 blue, 2 green, 3 red, 4 navy and so on. They live in the picture rather than
+ in a text layer for a specific reason — the explosion shakes the board by
+ SCROLLING it, and a fixed text layer would leave every number nailed to the
+ glass while its square slid out from under it.
+
+ The HUD is the opposite case and lives in the TEXT PLANE
+ (docs/shared_screen_memory_design.md SM1): a grid of cells in shared memory
+ that the VM writes with stores. It is deliberately viewport-fixed, so the
+ readout holds still while the field lurches, and it is rewritten from scratch
+ every single frame because that now costs nothing to send. It did not always:
+ this demo's first version redrew a command-based overlay every frame, which
+ re-sent one message per revealed number sixty times a second. That bug is the
+ reason the text plane exists, and it cannot recur — a store is not a message.
 
  In a headless VM every game primitive silently fails, so loading this class
  outside the GUI is harmless — which is how its regression test drives it."
@@ -55,7 +63,7 @@
 Object subclass: Minesweeper [
     | pane cols rows cell x0 y0 mines state counts buf
       dealt over won flags revealed rng ticks startTick endTick
-      prevLeft prevRight prevSpace dirty lastSecond shake margin worldW worldH |
+      prevLeft prevRight prevSpace dirty shake margin worldW worldH |
     <classVars: Current>
 
     "Cell state — `state` holds one of these per square."
@@ -143,7 +151,6 @@ Object subclass: Minesweeper [
         prevRight := false.
         prevSpace := false.
         dirty := true.
-        lastSecond := -1.
         shake := 0.
         "A new board always looks straight ahead — a deal arriving mid-shake
          must not leave the view parked off-centre."
@@ -382,12 +389,18 @@ Object subclass: Minesweeper [
         self readSpaceFrom: frame.
         self readMouseFrom: frame.
         self advanceShake.
-        "The clock is the one thing that changes without input, so it is the
-         one thing allowed to dirty the frame on its own — once a second."
-        self elapsedSeconds = lastSecond ifFalse: [
-            lastSecond := self elapsedSeconds.
-            dirty := true ].
-        dirty ifTrue: [ self paint. self drawHud. dirty := false ].
+        "The BOARD is repainted only when it changed — that is a blit, and a
+         blit is a real command carrying a real frame. The HUD is drawn every
+         single frame regardless, because since SM1 it is stores into the text
+         plane and costs nothing to send.
+
+         Separating the two is what makes an idle board completely silent. The
+         clock ticking over used to dirty the whole frame once a second purely
+         so the seconds would update; now the seconds live somewhere that is
+         free to rewrite, and a board nobody is touching emits exactly one
+         command per frame: the present that shows it."
+        dirty ifTrue: [ self paint. dirty := false ].
+        self drawHud.
         pane present.
         ^self
     ]
@@ -615,27 +628,34 @@ Object subclass: Minesweeper [
 
     drawHud [
         "Mines remaining on the left, the clock on the right, and whatever the
-         game has to say in the middle. This IS the text overlay, so it is in
-         viewport coordinates and does not move when the explosion shakes the
-         board — which is what you want from a HUD: the readout stays put while
-         the world lurches. The overlay is RETAINED, so it is cleared and
-         redrawn whole, and only when something changed."
-        | status r g b |
-        pane textClear.
-        pane text: 'MINES ', self minesLeft printString
-             x: 8 y: 8 r: 235 g: 240 b: 255 scale: 2.
-        pane text: 'TIME ', self elapsedSeconds printString
-             x: 232 y: 8 r: 235 g: 240 b: 255 scale: 2.
-        over
-            ifTrue: [
-                won
-                    ifTrue: [ status := 'CLEARED'. r := 80. g := 255. b := 120 ]
-                    ifFalse: [ status := 'BOOM'. r := 255. g := 70. b := 70 ] ]
-            ifFalse: [ status := ''. r := 0. g := 0. b := 0 ].
-        status isEmpty ifFalse: [
-            pane text: status x: 130 y: 8 r: r g: g b: b scale: 2 ].
-        pane text: 'LEFT REVEAL   RIGHT FLAG   SPACE NEW   ESC QUIT'
-             x: 4 y: 228 r: 150 g: 165 b: 200 scale: 1.
+         game has to say between them — now on the TEXT PLANE
+         (docs/shared_screen_memory_design.md SM1) rather than the command-
+         based overlay this used to send.
+
+         The difference is the whole slice. Every string here USED to be a
+         command, so redrawing the HUD had a cost and the code had to earn it
+         by proving something had changed — and the first version of this
+         method forgot to, which is how it came to re-send a command per
+         revealed number sixty times a second. These are stores into a shared
+         cell grid. Rewriting the whole HUD every frame is now cheaper than
+         deciding whether to, and that class of bug cannot happen here at all.
+
+         Still viewport-fixed, so it holds still while the explosion shakes
+         the board: the text plane does not scroll with the picture, which is
+         exactly what this HUD wanted."
+        | status ink |
+        pane textClearPlane.
+        pane textPut: 'MINES ', self minesLeft printString
+             at: 1 row: 0 color: GamePane white.
+        pane textPut: 'TIME ', self elapsedSeconds printString
+             at: 40 row: 0 color: GamePane white.
+        over ifTrue: [
+            won
+                ifTrue: [ status := 'CLEARED'. ink := GamePane green ]
+                ifFalse: [ status := 'BOOM'. ink := GamePane red ].
+            pane textPut: status at: 22 row: 0 color: ink ].
+        pane textPut: 'LEFT REVEAL  RIGHT FLAG  SPACE NEW  ESC QUIT'
+             at: 1 row: 29 color: GamePane lightGrey.
         ^self
     ]
 ]
