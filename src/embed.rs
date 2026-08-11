@@ -2707,6 +2707,83 @@ mod tests {
     }
 
     #[test]
+    fn a_non_local_return_escapes_through_a_perform_frame() {
+        // REGRESSION. `perform:` dispatches through `run_method_reentrant` — a
+        // nested interpreter loop — and a nested run is an UNWIND BOUNDARY: an
+        // NLR escaping it comes back as `NLR_SENTINEL` with the target parked
+        // in `vm.nlr_state`. The primitive used to answer that sentinel as an
+        // ORDINARY VALUE, which silently swallowed the unwind.
+        //
+        // What that looked like from Smalltalk: a handler ran, and then the
+        // protected block CARRIED ON. `[ x perform: #boom. log add: #after ]
+        // on: Error do: [...]` logged the handler AND `#after`, where a direct
+        // send logged the handler alone. It hit every reflective dispatch —
+        // SUnit invokes each test with `perform:`, so a failing test was
+        // recorded as both PASS and FAIL, which is how this was found.
+        //
+        // The fix relays the parked NLR into the outer activation, which is
+        // what `continue_unwind` already documents for its other boundary.
+        let mut vm = boot_test_vm(JitMode::Off);
+        vm.exec(
+            "Object subclass: NlrProbe [ \
+                 boom [ ^Error new signal: 'boom' ] \
+                 boomWith: x [ ^Error new signal: 'boom' ] \
+                 NlrProbe class >> trace: aBlock [ \
+                     | log | \
+                     log := OrderedCollection new. \
+                     [ aBlock value. log add: #after ] \
+                         on: Error do: [ :e | log add: #handler ]. \
+                     ^log printString ] ]",
+        )
+        .expect("the probe must compile");
+
+        // The baseline: a direct send abandons the protected block.
+        assert_eq!(
+            vm.eval("NlrProbe trace: [ NlrProbe new boom ].").unwrap(),
+            "'OrderedCollection (#handler )'",
+            "a direct send must abandon the rest of the protected block"
+        );
+        // And a perform: must behave identically — this is the bug.
+        assert_eq!(
+            vm.eval("NlrProbe trace: [ NlrProbe new perform: #boom ].").unwrap(),
+            "'OrderedCollection (#handler )'",
+            "an unwind must cross a perform: frame, not stop at it"
+        );
+        assert_eq!(
+            vm.eval(
+                "NlrProbe trace: [ NlrProbe new perform: #boomWith: \
+                                      withArguments: (Array with: 1) ]."
+            )
+            .unwrap(),
+            "'OrderedCollection (#handler )'",
+            "perform:withArguments: too"
+        );
+        // A perform: that does NOT unwind must still answer normally — the
+        // relay must not intercept ordinary returns.
+        assert_eq!(
+            vm.eval("3 perform: #+ withArguments: (Array with: 4).").unwrap(),
+            "7",
+            "an ordinary perform: must still answer its value"
+        );
+
+        // The doit primitive is the SAME boundary and had the SAME hole —
+        // found by auditing the other primitives that answer a nested run's
+        // result. This one is the Workspace's Do It button, so a swallowed
+        // unwind meant a handler ran and the protected block carried on.
+        assert_eq!(
+            vm.eval("Worker primEvalDoit: '3 + 4'.").unwrap(),
+            "7",
+            "an ordinary doit must still answer its value"
+        );
+        assert_eq!(
+            vm.eval("NlrProbe trace: [ Worker primEvalDoit: 'nil frobnicateWildly' ].")
+                .unwrap(),
+            "'OrderedCollection (#handler )'",
+            "an unwind must cross a doit frame too"
+        );
+    }
+
+    #[test]
     fn the_palette_is_memory_too_and_costs_no_commands() {
         // SM4, and the end of the arc: the palette was the last bulk state
         // still travelling as commands. A copper effect rewrites what a colour

@@ -2277,7 +2277,19 @@ fn prim_eval_doit(vm: &mut VmState, args: &[Oop]) -> PrimResult {
                 // nil — the `#doIt` convention. No allocation between compile
                 // and run, so `m` needs no extra rooting.
                 let recv = vm.universe.nil_obj;
-                crate::interpreter::run_method_reentrant(vm, m, recv, &[])
+                let value = crate::interpreter::run_method_reentrant(vm, m, recv, &[]);
+                // An unwind that escapes the nested run must keep unwinding —
+                // it does NOT become this doit's value, and the REMAINING
+                // items of the selection must not run. See
+                // `relay_reentrant_nlr`: found alongside the `perform:` bug,
+                // and the same defect. What it looked like from the Workspace:
+                // `[ Worker primEvalDoit: 'nil frobnicate' ] on: Error do: [...]`
+                // ran the handler and then carried on inside the protected
+                // block, because the sentinel came back as an ordinary value.
+                if value.raw() == crate::oops::layout::NLR_SENTINEL {
+                    return relay_reentrant_nlr(vm, value);
+                }
+                value
             }
             // A class definition from the Workspace: install it (no nested doit
             // run — `install_class_def` only compiles methods), answer nil.
@@ -4162,7 +4174,50 @@ fn prim_perform_with_arguments(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         .expect("rooted method survived the scope");
     let argv: Vec<Oop> = arg_hs.iter().map(|h| h.get(vm)).collect();
     let result = crate::interpreter::run_method_reentrant(vm, m, recv, &argv);
-    PrimResult::Ok(result)
+    relay_reentrant_nlr(vm, result)
+}
+
+/// A nested interpreter run (`run_method_reentrant`) is an UNWIND BOUNDARY, and
+/// this is how a primitive gets an escaping non-local return across it.
+///
+/// `run_method` answers [`NLR_SENTINEL`](crate::oops::layout::NLR_SENTINEL)
+/// when an NLR is escaping its whole activation, parking the target home and
+/// value in `vm.nlr_state`. A primitive that returns that sentinel as an
+/// ORDINARY value silently swallows the unwind: the caller carries on with a
+/// bogus result and the `^` never reaches its home.
+///
+/// That was a real, observable bug. `perform:` swallowed it, so
+/// `[ x perform: #boom. log add: #after ] on: Error do: [ ... ]` logged BOTH
+/// the handler and `#after` — the handler ran, its `return:` unwound as far as
+/// the perform frame, and execution then resumed inside the protected block.
+/// A direct send logged the handler alone. It reproduced identically with
+/// `MACVM_JIT=off`, so it was the interpreter, and it affected every
+/// reflective dispatch: SUnit's `perform:`-driven test invocation, and the
+/// worker RPC's `perform:withArguments:`.
+///
+/// The cure is the one `continue_unwind` already documents for the other
+/// boundary it knows about (`ENTRY_FRAME_SENTINEL`): park and escape on the
+/// inner side, then RESUME the unwind on the outer side, where there is a real
+/// frame pointer again. By the time this runs, `run_method_reentrant` has
+/// already restored the outer activation and `vm.regs`, so `continue_unwind`
+/// sees exactly the frames the unwind still has to cross.
+fn relay_reentrant_nlr(vm: &mut VmState, result: Oop) -> PrimResult {
+    if result.raw() != crate::oops::layout::NLR_SENTINEL {
+        return PrimResult::Ok(result);
+    }
+    let Some(state) = vm.nlr_state.take() else {
+        // The sentinel with nothing parked would mean the escape protocol was
+        // violated upstream; answering it as a value is the one thing that is
+        // certainly wrong, so say so rather than propagate a bogus oop.
+        panic!("relay_reentrant_nlr: NLR sentinel with no parked nlr_state");
+    };
+    let step = crate::interpreter::unwind::continue_unwind(
+        vm,
+        state.home,
+        state.value,
+        state.closure,
+    );
+    PrimResult::Nlr(step)
 }
 
 fn prim_all_classes(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
