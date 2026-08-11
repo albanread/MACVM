@@ -120,6 +120,10 @@
 # memory - a count per pixel mapped through the palette, so the image
 # develops like a photographic plate.
 45g_attractor.mst
+# Julia: a live Julia set animated by moving its constant - all 76,800 pixels
+# recomputed every frame into GPU memory, and palette cycling that recolours
+# the screen without touching a pixel. One command a frame.
+45h_julia.mst
 # MandelVM: MandelZoom that dives once then stops — the standalone-window demo
 # (macvm-gui mandelvm / run-mandelvm.sh) that quits when the demo ends.
 46_mandelvm.mst

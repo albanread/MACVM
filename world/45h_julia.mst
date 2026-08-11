@@ -1,0 +1,174 @@
+"45h_julia.mst — a live Julia set, animated by moving its constant, drawn
+ straight into GPU memory (docs/DIRECT_SCREEN.md). Launch it from the Demos
+ menu, or a Workspace:
+
+     Julia launch
+
+ SPACE cycles the palette, Escape quits.
+
+ The Julia set of a complex number c is the set of starting points whose orbit
+ under z -> z^2 + c stays bounded. Move c and the shape does not merely change,
+ it TRANSFORMS — connected to dust and back, growing and shedding filaments —
+ which is why an animated Julia is worth far more than a still one. c walks a
+ slow circle just outside the Mandelbrot set's main cardioid, the region where
+ the sets are most interesting and least stable.
+
+ Every one of the 76,800 pixels is recomputed every frame. There is nothing to
+ cache, nothing incremental, and nothing small to send: this is exactly the
+ case retained-mode drawing is bad at and shared screen memory exists for. The
+ escape count goes straight into `screenMemory` as a palette index and the
+ frame costs ONE command — the `present` that shows it.
+
+ It uses the other half of the design too. The picture is escape COUNTS, never
+ colours, so cycling the palette recolours the whole screen without touching a
+ pixel — 240 entries written straight into the palette buffer (SM4), which is
+ also no commands at all. Between the two, an entire animated fractal costs the
+ VM->GUI channel one message a frame.
+
+ In a headless VM screenMemory answers nil and the demo does nothing."
+"I am a live Julia set: z -> z^2 + c, with c walking a slow circle so the
+ shape continuously transforms. Launch me from the Demos menu, or a Workspace:
+ Julia launch. SPACE cycles my palette, Escape quits. I recompute all 76,800
+ pixels every frame straight into GPU memory, and because I store escape COUNTS
+ rather than colours, recolouring me touches no pixel at all. A whole animated
+ fractal for one command a frame. Harmless in a headless VM."
+Object subclass: Julia [
+    | pane w h maxIter angle shift prevSpace |
+    <classVars: Current>
+
+    Julia class >> launch [ ^self new start ]
+    Julia class >> current [ ^Current ]
+
+    "Escape limit. Lower than MandelZoom's 150 because every pixel is redone
+     every frame here — a Julia does not zoom in, it moves, so there is no
+     scale at which the interior stops costing the full count."
+    Julia class >> maxIterations [ ^72 ]
+
+    start [
+        Current := self.
+        w := 320.
+        h := 240.
+        maxIter := Julia maxIterations.
+        angle := 0.0.
+        shift := 0.
+        prevSpace := false.
+        pane := GamePane new.
+        pane openDirect: w height: h.
+        self buildPalette.
+        pane onStep: [ :frame | self stepWith: frame ]; run.
+        ^self
+    ]
+
+    buildPalette [
+        "Interior black, exterior a cyclic band keyed by escape count. Written
+         through the ordinary command path because it happens ONCE at launch —
+         the palette buffer is the same memory either way, and a hundred
+         commands at startup are not worth optimising."
+        | k |
+        pane paletteAt: 0 r: 0 g: 0 b: 0.
+        k := 1.
+        [ k < 256 ] whileTrue: [
+            pane paletteAt: k
+                 r: (self band: k + shift)
+                 g: (self band: k + shift + 85)
+                 b: (self band: k + shift + 170).
+            k := k + 1 ].
+        ^self
+    ]
+
+    band: n [
+        "A triangle wave over 0..255 — three of them, offset, make a smooth
+         cyclic spectrum."
+        | v |
+        v := n \\ 256.
+        v > 127 ifTrue: [ v := 255 - v ].
+        ^v * 2
+    ]
+
+    cyclePalette [
+        "Recolour the WHOLE screen without touching a pixel: the picture is
+         escape counts, so changing what a count means changes everything. 240
+         entries written straight into the palette buffer (SM4) — no commands,
+         and no pixel read or written anywhere."
+        | base |
+        shift := shift + 24.
+        base := pane paletteGlobalBase.
+        base isNil ifTrue: [ ^self ].
+        1 to: 239 do: [ :k |
+            pane paletteMemoryAt: base + k
+                 put: (((self band: k + shift) bitShift: 16)
+                     + ((self band: k + shift + 85) bitShift: 8)
+                     + (self band: k + shift + 170)) ].
+        ^self
+    ]
+
+    "── the frame ────────────────────────────────────────────────────────"
+
+    constant [
+        "c walks a circle of radius 0.7885 — the classic tour, which passes
+         through the shapes people recognise: the dendrite, the rabbit, the
+         dragon, and the dust where the set stops being connected."
+        ^Array with: 0.7885 * angle cos with: 0.7885 * angle sin
+    ]
+
+    stepWith: frame [
+        | fb stride c |
+        self readSpaceFrom: frame.
+        fb := pane screenMemory.
+        fb isNil ifTrue: [ ^self ].
+        stride := pane screenStride.
+        c := self constant.
+        self renderInto: fb stride: stride cr: (c at: 1) ci: (c at: 2).
+        "A slow walk: fast enough to see it transform, slow enough to watch
+         any one shape."
+        angle := angle + 0.008.
+        pane present.
+        ^self
+    ]
+
+    renderInto: fb stride: stride cr: cr ci: ci [
+        "The escape-time loop, once per pixel, every frame. z starts AT the
+         pixel (that is what makes it a Julia rather than a Mandelbrot, where
+         z starts at zero and c is the pixel), and the count it escapes at is
+         written straight to the screen as a palette index."
+        | scale zr zi zr2 zi2 n idx rowBase y0 |
+        scale := 3.2 / w asDouble.
+        0 to: h - 1 do: [ :py |
+            rowBase := py * stride.
+            y0 := (py asDouble - (h asDouble / 2.0)) * scale.
+            0 to: w - 1 do: [ :px |
+                zr := (px asDouble - (w asDouble / 2.0)) * scale.
+                zi := y0.
+                n := 0.
+                zr2 := zr * zr.
+                zi2 := zi * zi.
+                [ n < maxIter and: [ zr2 + zi2 < 4.0 ] ] whileTrue: [
+                    zi := (2.0 * zr * zi) + ci.
+                    zr := zr2 - zi2 + cr.
+                    zr2 := zr * zr.
+                    zi2 := zi * zi.
+                    n := n + 1 ].
+                "SPREAD the count across the colour band, and NOT linearly.
+                 Escape counts are wildly non-uniform: most of this view is
+                 gone in one or two iterations, so `n \\ 239` crowded nearly
+                 every exterior pixel into three adjacent palette slots and the
+                 screen came out one flat colour. Scaling linearly by maxIter
+                 barely helped, for the same reason. A SQUARE ROOT does, by
+                 giving the crowded low counts most of the band - the standard
+                 answer, and visibly the right one here."
+                idx := n >= maxIter
+                    ifTrue: [ 0 ]
+                    ifFalse: [ 16 + ((n asDouble sqrt / maxIter asDouble sqrt)
+                                        * 239.0) truncated ].
+                fb byteAt: rowBase + px + 1 put: idx ] ].
+        ^self
+    ]
+
+    readSpaceFrom: frame [
+        | down |
+        down := frame keyHeld: GamePane keyA.
+        (down and: [ prevSpace not ]) ifTrue: [ self cyclePalette ].
+        prevSpace := down.
+        ^self
+    ]
+]
