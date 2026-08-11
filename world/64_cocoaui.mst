@@ -1076,6 +1076,7 @@ Object subclass: CocoaUI [
         pairs add: (Array with: 'FreeCell' with: 'FreeCell launch').
         pairs add: (Array with: 'Plasma (direct GPU memory)' with: 'Plasma launch').
         pairs add: (Array with: 'Text Pages' with: 'TextPages launch').
+        pairs add: (Array with: 'Copper Bars' with: 'Copper launch').
         pairs add: (Array with: 'MandelZoom' with: 'MandelZoom launch').
         pairs add: (Array with: 'Parallel Mandelbrot' with: 'ParallelMandel launch').
         pairs add: (Array with: 'Worms' with: 'Worms launch').

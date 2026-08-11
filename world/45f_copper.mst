@@ -1,0 +1,198 @@
+"45f_copper.mst — Copper bars: the oldest trick in the raster book, and the
+ exact opposite of the direct framebuffer (docs/DIRECT_SCREEN.md). Launch it
+ from the Demos menu, or a Workspace:
+
+     Copper launch
+
+ SPACE changes the colour scheme, Escape quits.
+
+ THE POINT. The screen is filled ONCE, on the first frame, with palette index 1
+ — every one of the 76,800 pixels. After that NO PIXEL IS EVER TOUCHED AGAIN.
+ What moves is not the picture but the meaning of the colour: each frame
+ rewrites what index 1 IS on each of the 240 scanlines, and three bars appear
+ to ride up and down the screen.
+
+ This is what the per-scanline palette is for, and nothing else in the world
+ demonstrates it — Galaxigans uses it for one tractor beam, which shows the
+ mechanism but not the idea. On real hardware this was the copper: a
+ raster-locked coprocessor that rewrote colour registers between scanlines,
+ giving machines with no spare memory bandwidth full-screen animation for
+ almost nothing. It works here for the same reason: the pane is INDEXED, so a
+ colour lookup happens per pixel in the shader, and changing the table changes
+ every pixel that refers to it.
+
+ Set beside Plasma (world/45d) the pair make the whole point about where cost
+ lives. Plasma stores 76,800 bytes a frame and sends no commands. Copper stores
+ nothing at all and sends 240 — one per scanline. Two extremes of the same
+ engine, and both are cheap for completely different reasons.
+
+ The honest cost, since this file is about cost: 240 `linePaletteAt:` commands
+ a frame IS the technique's price through this API, and unlike the pixels there
+ is no shared-memory path for the line palette yet. It is small — a palette
+ poke carries five small integers, where a blit carries a frame — but it is not
+ free, and if it ever needs to be, the answer is the same one the pixels got.
+
+ Colours 2..15 are per-line too, so the same trick could drive fourteen
+ independent bands; this demo uses one and varies its colour, which is what
+ makes the bars read as bars rather than as a gradient. In a headless VM every
+ game primitive silently fails, so loading this class is harmless."
+"I am the copper-bars demo: three colour bars riding up and down a screen that
+ is never redrawn. Launch me from the Demos menu, or a Workspace: Copper
+ launch. I fill every pixel once with palette index 1 and then never touch a
+ pixel again — each frame I only rewrite what index 1 MEANS on each of the 240
+ scanlines, which is how home computers with no memory bandwidth to spare got
+ full-screen animation. SPACE changes my colour scheme, Escape quits. I am the
+ opposite extreme from Plasma, which stores every pixel every frame and sends
+ no commands at all."
+Object subclass: Copper [
+    | pane t sineTable scheme prevSpace painted |
+    <classVars: Current>
+
+    Copper class >> launch [ ^self new start ]
+    Copper class >> current [ ^Current ]
+
+    "Screen height, and how many entries the sine table holds. A table rather
+     than `sin` per scanline: this runs 240 times a frame, and the values
+     repeat — the demo-scene answer, and it keeps the inner loop integer."
+    Copper class >> height [ ^240 ]
+    Copper class >> tableSize [ ^512 ]
+
+    start [
+        Current := self.
+        pane := GamePane new.
+        t := 0.
+        scheme := 1.
+        prevSpace := false.
+        painted := false.
+        self buildSineTable.
+        pane onStep: [ :frame | self stepWith: frame ]; run.
+        ^self
+    ]
+
+    buildSineTable [
+        "A sine table scaled to the screen height, built once. Entry `i` is
+         `sin(2*pi*i/512)` mapped to 0..height-1, so a bar's centre is a table
+         lookup and an add."
+        | n half |
+        n := Copper tableSize.
+        sineTable := Array new: n.
+        half := (Copper height - 40) / 2.0.
+        1 to: n do: [ :i |
+            sineTable at: i put:
+                (((i - 1) asDouble * 6.283185307179586 / n asDouble) sin
+                    * half + half + 20.0) truncated ].
+        ^self
+    ]
+
+    sineAt: i [ ^sineTable at: (i \\ Copper tableSize) + 1 ]
+
+    "── the three bars ───────────────────────────────────────────────────"
+
+    barCentre: which [
+        "Where bar `which` sits this frame. Three different speeds and phases,
+         so they cross rather than travel together."
+        which = 1 ifTrue: [ ^self sineAt: t ].
+        which = 2 ifTrue: [ ^self sineAt: (t * 2) + 170 ].
+        ^self sineAt: (t * 3) + 340
+    ]
+
+    barHalfHeight [ ^14 ]
+
+    "── the colour scheme ────────────────────────────────────────────────
+     Each bar contributes a colour that is brightest at its centre and fades
+     to nothing at its edge; the scanline's colour is the sum, clamped. That
+     summing is why overlapping bars go white rather than simply occluding."
+
+    schemeCount [ ^3 ]
+    currentScheme [ ^scheme ]
+
+    barColour: which [
+        "The (r g b) a bar contributes at full strength, per scheme."
+        | s |
+        s := scheme.
+        s = 1 ifTrue: [
+            which = 1 ifTrue: [ ^Array with: 255 with: 60 with: 60 ].
+            which = 2 ifTrue: [ ^Array with: 60 with: 255 with: 90 ].
+            ^Array with: 80 with: 120 with: 255 ].
+        s = 2 ifTrue: [
+            which = 1 ifTrue: [ ^Array with: 255 with: 200 with: 40 ].
+            which = 2 ifTrue: [ ^Array with: 255 with: 110 with: 20 ].
+            ^Array with: 200 with: 40 with: 90 ].
+        which = 1 ifTrue: [ ^Array with: 200 with: 200 with: 220 ].
+        which = 2 ifTrue: [ ^Array with: 120 with: 140 with: 200 ].
+        ^Array with: 60 with: 70 with: 130
+    ]
+
+    backdropAt: y [
+        "A slow vertical gradient behind the bars, so the screen is never flat
+         even where no bar is."
+        | v |
+        v := 12 + (y // 12).
+        ^Array with: v with: v with: (v + 14)
+    ]
+
+    lineColour: y [
+        "The colour index 1 should MEAN on scanline `y`: the backdrop plus each
+         bar's contribution, faded by distance from that bar's centre."
+        | rgb r g b d w c |
+        rgb := self backdropAt: y.
+        r := rgb at: 1. g := rgb at: 2. b := rgb at: 3.
+        1 to: 3 do: [ :which |
+            d := (y - (self barCentre: which)) abs.
+            d < self barHalfHeight ifTrue: [
+                "Linear falloff, squared for a rounder-looking core."
+                w := self barHalfHeight - d.
+                w := w * w // self barHalfHeight.
+                c := self barColour: which.
+                r := r + ((c at: 1) * w // self barHalfHeight).
+                g := g + ((c at: 2) * w // self barHalfHeight).
+                b := b + ((c at: 3) * w // self barHalfHeight) ] ].
+        r > 255 ifTrue: [ r := 255 ].
+        g > 255 ifTrue: [ g := 255 ].
+        b > 255 ifTrue: [ b := 255 ].
+        ^(r bitShift: 16) + (g bitShift: 8) + b
+    ]
+
+    "── the frame ────────────────────────────────────────────────────────"
+
+    stepWith: frame [
+        "One frame: fill the screen ONCE, then only ever rewrite the line
+         palette. `painted` is the whole demo in one flag — after the first
+         frame sets it, no pixel is written again for the rest of the run."
+        self readSpaceFrom: frame.
+        painted ifFalse: [
+            "Every pixel becomes per-line colour index 1, once and for all."
+            pane cls: 1.
+            painted := true.
+            self drawHud ].
+        0 to: Copper height - 1 do: [ :y |
+            pane linePaletteAt: y index: 1 rgb: (self lineColour: y) ].
+        t := t + 3.
+        pane present.
+        ^self
+    ]
+
+    drawHud [
+        "On the text plane, so it costs nothing and — more to the point — does
+         NOT need redrawing when the bars move, because the bars are not
+         pixels."
+        pane textPut: 'COPPER BARS' at: 1 row: 0 color: GamePane white.
+        pane textPut: 'the screen is filled once, then never redrawn'
+             at: 1 row: 1 color: GamePane lightGrey.
+        "53 cells wide, so this line has to fit in 52 from column 1 - the
+         plane clips rather than wrapping, silently."
+        pane textPut: '240 POKES A FRAME  SPACE RECOLOURS  ESC QUITS'
+             at: 1 row: 28 color: GamePane lightGrey.
+        ^self
+    ]
+
+    readSpaceFrom: frame [
+        | down |
+        down := frame keyHeld: GamePane keyA.
+        (down and: [ prevSpace not ]) ifTrue: [
+            scheme := scheme + 1.
+            scheme > self schemeCount ifTrue: [ scheme := 1 ] ].
+        prevSpace := down.
+        ^self
+    ]
+]

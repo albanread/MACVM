@@ -112,6 +112,10 @@
 # TextPages: the SM3 proof - four pages composed once, each shown by a single
 # memcpy into the text plane; turning a page sends no commands at all.
 45e_textpages.mst
+# Copper: the per-scanline palette, which nothing else demonstrates - the
+# screen is filled ONCE and never redrawn; only what colour index 1 MEANS on
+# each of 240 scanlines changes. The opposite extreme from Plasma.
+45f_copper.mst
 # MandelVM: MandelZoom that dives once then stops — the standalone-window demo
 # (macvm-gui mandelvm / run-mandelvm.sh) that quits when the demo ends.
 46_mandelvm.mst
