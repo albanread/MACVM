@@ -1,0 +1,235 @@
+"45g_attractor.mst — a de Jong strange attractor, drawn by DENSITY into direct
+ GPU memory (docs/DIRECT_SCREEN.md). Launch it from the Demos menu, or a
+ Workspace:
+
+     Attractor launch
+
+ SPACE jumps to a new set of parameters, Escape quits.
+
+ The de Jong map is four lines of arithmetic:
+
+     x' = sin(a*y) - cos(b*x)
+     y' = sin(c*x) - cos(d*y)
+
+ Iterate it from any starting point and the orbit never repeats, never
+ diverges, and never fills the plane evenly — it settles onto a shape whose
+ whole character comes from four numbers. Nothing about those four lines
+ suggests what comes out, which is the reason to draw it.
+
+ DENSITY, NOT PLOTTING. A single orbit point is one pixel and tells you
+ nothing; what the eye wants is how OFTEN the orbit passes through each place.
+ So this keeps a count per pixel, adds a few thousand points a frame, and maps
+ the counts through the palette — bright where the orbit lingers, dark where it
+ merely passes. The picture therefore develops, the way a photographic plate
+ does, rather than appearing at once.
+
+ It runs a slow drift through parameter space, so the shape is continually
+ becoming a different shape. SPACE jumps somewhere new outright.
+
+ On the engine: the counts live in an ordinary ByteArray and the mapped image
+ goes into `screenMemory` — one store per pixel, no command, no copy. The full
+ screen is written every frame rather than only the changed pixels, because
+ presenting rotates between three buffers and each one needs the whole picture.
+ In a headless VM screenMemory answers nil and the demo does nothing."
+"I am a de Jong strange attractor drawn by density: I keep a count per pixel,
+ add a few thousand orbit points a frame, and map the counts through the
+ palette, so the image develops like a photographic plate instead of appearing
+ at once. Four numbers decide the whole shape, and I drift slowly through them
+ so it keeps becoming something else. Launch me from the Demos menu, or a
+ Workspace: Attractor launch. SPACE jumps to new parameters, Escape quits. My
+ pixels go straight into GPU memory. Harmless in a headless VM."
+Object subclass: Attractor [
+    | pane density w h a b c d x y rng drift prevSpace frames |
+    <classVars: Current>
+
+    Attractor class >> launch [ ^self new start ]
+    Attractor class >> current [ ^Current ]
+
+    "Orbit points added per frame. High enough that the picture develops
+     quickly, low enough that a frame stays a frame — every point costs four
+     transcendentals."
+    Attractor class >> pointsPerFrame [ ^6000 ]
+
+    start [
+        Current := self.
+        w := 320.
+        h := 240.
+        pane := GamePane new.
+        pane openDirect: w height: h.
+        self buildPalette.
+        density := ByteArray new: w * h.
+        rng := Random newWithSeed: (Time millisecondClockValue \\ 2147483646) + 1.
+        drift := 0.
+        prevSpace := false.
+        frames := 0.
+        self newParameters.
+        pane onStep: [ :frame | self stepWith: frame ]; run.
+        ^self
+    ]
+
+    buildPalette [
+        "Index 0 is the background; 1..255 ramp from deep blue through magenta
+         to white, so density reads as heat. The ramp is the whole colouring —
+         no pixel ever carries a colour, only a count."
+        | k r g b2 |
+        pane paletteAt: 0 r: 4 g: 4 b: 12.
+        k := 1.
+        [ k < 256 ] whileTrue: [
+            k < 128
+                ifTrue: [
+                    "deep blue -> magenta"
+                    r := k * 2. g := k // 3. b2 := 90 + (k * 5 // 4) ]
+                ifFalse: [
+                    "magenta -> hot white"
+                    r := 255. g := (k - 128) * 2. b2 := 255 ].
+            r > 255 ifTrue: [ r := 255 ].
+            g > 255 ifTrue: [ g := 255 ].
+            b2 > 255 ifTrue: [ b2 := 255 ].
+            pane paletteAt: k r: r g: g b: b2.
+            k := k + 1 ].
+        ^self
+    ]
+
+    newParameters [
+        "Four numbers in -2.5..2.5 — but not just ANY four. A good part of that
+         space converges to a fixed point, and a fixed point draws a single
+         bright speck in the middle of a black screen, which is what the first
+         version of this demo did. So the candidate is PROBED first (see
+         spreads) and rejected if its orbit does not actually go anywhere.
+
+         Bounded tries, not a loop that might never end: after enough refusals
+         take the last one and let the drift carry it somewhere better."
+        | tries |
+        tries := 0.
+        [ tries < 40 ] whileTrue: [
+            a := (rng next * 5.0) - 2.5.
+            b := (rng next * 5.0) - 2.5.
+            c := (rng next * 5.0) - 2.5.
+            d := (rng next * 5.0) - 2.5.
+            self spreads ifTrue: [ tries := 999 ] ifFalse: [ tries := tries + 1 ] ].
+        x := 0.1.
+        y := 0.1.
+        self clearDensity.
+        ^self
+    ]
+
+    spreads [
+        "Does this parameter set actually produce an attractor? Iterate a
+         little and measure how far the orbit wanders. A converged orbit sits
+         still and spans nothing; a real one covers most of -2..2."
+        | px py nx ny minx maxx miny maxy |
+        px := 0.1. py := 0.1.
+        minx := 99.0. maxx := -99.0. miny := 99.0. maxy := -99.0.
+        1 to: 600 do: [ :i |
+            nx := (a * py) sin - (b * px) cos.
+            ny := (c * px) sin - (d * py) cos.
+            px := nx. py := ny.
+            i > 100 ifTrue: [
+                px < minx ifTrue: [ minx := px ].
+                px > maxx ifTrue: [ maxx := px ].
+                py < miny ifTrue: [ miny := py ].
+                py > maxy ifTrue: [ maxy := py ] ] ].
+        ^(maxx - minx) > 1.2 and: [ (maxy - miny) > 1.2 ]
+    ]
+
+    clearDensity [
+        1 to: density size do: [ :i | density at: i put: 0 ].
+        ^self
+    ]
+
+    parameters [ "The four numbers, for a Workspace to read." ^Array with: a with: b with: c with: d ]
+
+    "── the orbit ────────────────────────────────────────────────────────"
+
+    addPoints [
+        "Iterate the map and count where it lands. The orbit is continuous
+         between frames — `x` and `y` carry over — so the picture keeps
+         building rather than restarting."
+        | nx ny px py idx v |
+        1 to: Attractor pointsPerFrame do: [ :i |
+            nx := (a * y) sin - (b * x) cos.
+            ny := (c * x) sin - (d * y) cos.
+            x := nx.
+            y := ny.
+            "The map's range is about -2..2; centre it and fit the screen."
+            px := ((x + 2.0) * 78.0) truncated.
+            py := ((y + 2.0) * 58.0) truncated.
+            (px >= 0 and: [ px < w and: [ py >= 0 and: [ py < h ] ] ]) ifTrue: [
+                idx := (py * w) + px + 1.
+                v := density at: idx.
+                "Saturate rather than wrap: a hot spot must stay hot, and
+                 wrapping would make the brightest places flicker to black."
+                v < 255 ifTrue: [ density at: idx put: v + 1 ] ] ].
+        ^self
+    ]
+
+    fade [
+        "Halve every count. Without this the picture saturates to a white
+         blob after a few seconds and the drift stops being visible; with it,
+         old detail decays as new detail arrives and the shape appears to
+         glide."
+        | v |
+        1 to: density size do: [ :i |
+            v := density at: i.
+            v > 0 ifTrue: [ density at: i put: v - (v // 16) - 1 ] ].
+        ^self
+    ]
+
+    "── the frame ────────────────────────────────────────────────────────"
+
+    stepWith: frame [
+        | fb stride |
+        self readSpaceFrom: frame.
+        fb := pane screenMemory.
+        fb isNil ifTrue: [ ^self ].
+        stride := pane screenStride.
+        frames := frames + 1.
+        self addPoints.
+        "Fade occasionally, not every frame: often enough that the picture
+         breathes, rarely enough that it is not most of the frame's work."
+        frames \\ 20 = 0 ifTrue: [ self fade ].
+        self driftParameters.
+        self paintInto: fb stride: stride.
+        pane present.
+        ^self
+    ]
+
+    driftParameters [
+        "A slow wander through parameter space, so the shape is always
+         becoming another shape rather than sitting still."
+        drift := drift + 1.
+        a := a + 0.0007.
+        d := d - 0.0005.
+        ^self
+    ]
+
+    paintInto: fb stride: stride [
+        "Map counts to palette indices, straight into GPU memory. The whole
+         screen every frame: presenting rotates between three buffers, so each
+         one needs the complete picture, not a difference."
+        | rowD rowF v |
+        0 to: h - 1 do: [ :py |
+            rowD := py * w.
+            rowF := py * stride.
+            0 to: w - 1 do: [ :px |
+                v := density at: rowD + px + 1.
+                "GAIN. A pixel the orbit visits a handful of times a second
+                 holds a count in the low tens, and mapped straight onto a
+                 0..255 ramp that is indistinguishable from black — which is
+                 exactly how this looked before. Multiply into the ramp, and
+                 clamp, so the first visit is already visible."
+                v > 0 ifTrue: [
+                    v := v * 12.
+                    v > 255 ifTrue: [ v := 255 ] ].
+                fb byteAt: rowF + px + 1 put: v ] ].
+        ^self
+    ]
+
+    readSpaceFrom: frame [
+        | down |
+        down := frame keyHeld: GamePane keyA.
+        (down and: [ prevSpace not ]) ifTrue: [ self newParameters ].
+        prevSpace := down.
+        ^self
+    ]
+]
