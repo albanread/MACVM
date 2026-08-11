@@ -15,3 +15,4 @@
 # SUnit testing itself. First, because a framework that mis-reports a failure
 # says green when it should say red and everything downstream believes it.
 t10_sunit_tests.mst
+t11_vm_semantics_tests.mst

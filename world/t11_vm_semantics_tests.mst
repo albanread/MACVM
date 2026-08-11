@@ -1,0 +1,234 @@
+"t11_vm_semantics_tests.mst — the language guarantees everything else assumes.
+
+ These are not tests of the library; they are tests of the VM, written in
+ Smalltalk so they run wherever the image runs — the command line, the Tests
+ tab, and a user's own machine after a change none of us reviewed.
+
+ Every case here is a bug that was REAL in this VM, found on 2026-08-11, and
+ silent: each one produced a plausible wrong answer rather than a crash. That
+ is the argument for keeping them at THIS level rather than only in Rust. A
+ Smalltalker who breaks one of these has broken their own program in a way
+ that will not look like a VM bug when it surfaces three layers up — as one of
+ them did, arriving as `nil does not understand add:` inside a test runner.
+
+ They are also deliberately cheap: no timing, no sleeping, no I/O. A suite
+ that is slow is a suite people stop running."
+
+"── unwinding ─────────────────────────────────────────────────────────────"
+
+"I raise from inside a variety of dispatch shapes, so a test can check that
+ the unwind reaches the handler and ABANDONS the rest of the protected block."
+Object subclass: UnwindProbe [
+    boom [ ^Error new signal: 'boom' ]
+    boomWith: x [ ^Error new signal: 'boom' ]
+    quiet [ ^#quiet ]
+
+    UnwindProbe class >> trace: aBlock [
+        "Answer the log of what actually ran. `#after` in the log means the
+         protected block CARRIED ON past a raise — the failure this file
+         exists to catch."
+        | log |
+        log := OrderedCollection new.
+        [ aBlock value. log add: #after ]
+            on: Error do: [ :e | log add: #handler ].
+        ^log
+    ]
+]
+
+TestCase subclass: UnwindTest [
+
+    testADirectSendAbandonsTheProtectedBlock [
+        "The baseline every other case is compared against."
+        self assert: (UnwindProbe trace: [ UnwindProbe new boom ]) asArray
+             equals: (Array with: #handler)
+    ]
+
+    testAnUnwindCrossesAPerformFrame [
+        "REGRESSION. `perform:` dispatches through a NESTED interpreter loop,
+         and a nested run is an unwind boundary. The escaping non-local return
+         used to come back as an ordinary value, so the handler ran and then
+         the protected block carried on — logging #handler AND #after where a
+         direct send logs #handler alone. Every reflective dispatch had it;
+         SUnit invokes each test with `perform:`, so one failing test was
+         recorded as both a pass and a failure."
+        self assert: (UnwindProbe trace: [ UnwindProbe new perform: #boom ]) asArray
+             equals: (Array with: #handler)
+             description: 'an unwind must not stop at a perform: frame'
+    ]
+
+    testAnUnwindCrossesAPerformWithArgumentsFrame [
+        self assert: (UnwindProbe trace: [
+                UnwindProbe new perform: #boomWith: withArguments: (Array with: 1) ]) asArray
+             equals: (Array with: #handler)
+    ]
+
+    testAnUnwindCrossesNestedPerformFrames [
+        "Two boundaries deep — the relay must keep relaying, not just survive
+         the first crossing."
+        self assert: (UnwindProbe trace: [
+                UnwindProbe new perform: #perform: withArguments: (Array with: #boom) ]) asArray
+             equals: (Array with: #handler)
+    ]
+
+    testAnOrdinaryPerformStillAnswersItsValue [
+        "The other half, and the one a careless fix breaks: relaying an unwind
+         must not intercept an ordinary return."
+        self assert: (3 perform: #+ withArguments: (Array with: 4)) equals: 7.
+        self assert: (UnwindProbe new perform: #quiet) equals: #quiet
+    ]
+
+    testTheHandlerRunsBeforeTheStackUnwinds [
+        "Signalling is TWO-PASS, and the order below is the observable proof.
+         The handler runs FIRST, on top of the still-live signalling context —
+         which is precisely what makes `resume:` and `retry` possible at all.
+         Only when the handler decides to return does the stack unwind, and
+         only then do `ensure:` blocks fire.
+
+         So the log reads #handler then #ensured. A one-pass implementation
+         (unwind first, then handle) would read them the other way round and
+         could not offer `resume:`. Written down here because the order looks
+         backwards until you know why it is that way — I asserted the wrong
+         one first."
+        | log |
+        log := OrderedCollection new.
+        [ [ UnwindProbe new boom ] ensure: [ log add: #ensured ] ]
+            on: Error do: [ :e | log add: #handler ].
+        self assert: log asArray equals: (Array with: #handler with: #ensured)
+    ]
+
+    testEnsureStillRunsWhenSomethingRaises [
+        "Whatever the order, the ensure block must not be SKIPPED."
+        | ran |
+        ran := false.
+        [ [ UnwindProbe new boom ] ensure: [ ran := true ] ]
+            on: Error do: [ :e | nil ].
+        self assert: ran
+    ]
+
+    testEnsureRunsOnTheOrdinaryPathToo [
+        | log |
+        log := OrderedCollection new.
+        [ log add: #body ] ensure: [ log add: #ensured ].
+        self assert: log asArray equals: (Array with: #body with: #ensured)
+    ]
+]
+
+"── construction ──────────────────────────────────────────────────────────"
+
+"The commonest constructor idiom in Smalltalk, and the one that broke."
+Object subclass: SuperNewProbe [
+    | a b |
+    SuperNewProbe class >> new [ ^super new initProbe ]
+    initProbe [ a := 7. b := 'set'. ^self ]
+    a [ ^a ]
+    b [ ^b ]
+]
+
+"The same shape with the override named something else — a control, since the
+ bug needed the method's own selector to be the one it super-sends."
+Object subclass: MakeProbe [
+    | a |
+    MakeProbe class >> make [ ^super new initProbe ]
+    initProbe [ a := 7. ^self ]
+    a [ ^a ]
+]
+
+"No override at all: `new` is inherited. This must keep working — the fix
+ touches how an nmethod is keyed, and keying is what ordinary sends use too."
+Object subclass: PlainProbe [
+    | a |
+    setA [ a := 3. ^self ]
+    a [ ^a ]
+]
+
+TestCase subclass: ConstructionTest [
+
+    testSuperNewInitInitializesEveryInstance [
+        "REGRESSION, and a silent wrong answer. An nmethod is keyed by
+         (receiver klass, selector), and a send site links to whatever that
+         key answers — so the key is a claim about what a send REACHES.
+         `super new` runs the inherited `new` with a receiver whose klass is
+         the SUBCLASS metaclass, so the inherited method got installed under
+         the very key `SuperNewProbe new` looks up, and every later
+         `SuperNewProbe new` skipped the override and answered an allocated
+         but UNINITIALIZED instance.
+
+         It began exactly on the call that crossed the JIT threshold, so the
+         COUNT matters as much as the assertion: breakage starts on call
+         number `threshold` and a shorter loop passes vacuously. 1500 clears
+         the default threshold (1000) with room to spare, and costs
+         microseconds — a guard that only works on the low thresholds a
+         developer happens to use is not a guard."
+        | bad |
+        bad := 0.
+        1 to: 1500 do: [ :i |
+            | o |
+            o := SuperNewProbe new.
+            (o a = 7 and: [ o b = 'set' ]) ifFalse: [ bad := bad + 1 ] ].
+        self assert: bad equals: 0
+             description: 'every instance must run the override and be initialized'
+    ]
+
+    testTheSameShapeUnderADifferentSelector [
+        | bad |
+        bad := 0.
+        1 to: 1500 do: [ :i | (MakeProbe make a) = 7 ifFalse: [ bad := bad + 1 ] ].
+        self assert: bad equals: 0
+    ]
+
+    testAnInheritedNewStillWorks [
+        | bad |
+        bad := 0.
+        1 to: 1500 do: [ :i | (PlainProbe new setA a) = 3 ifFalse: [ bad := bad + 1 ] ].
+        self assert: bad equals: 0
+             description: 'the non-overriding case must be untouched'
+    ]
+
+    testEachInstanceIsItsOwn [
+        "Cheap, and it would catch a customization that shared state."
+        | one two |
+        one := SuperNewProbe new.
+        two := SuperNewProbe new.
+        self deny: one == two.
+        self assert: one a equals: two a
+    ]
+]
+
+"── blocks and non-local return ───────────────────────────────────────────"
+
+Object subclass: NlrProbe [
+    "`^` from inside a block returns from the HOME method, not the block."
+    firstOver: n in: aCollection [
+        aCollection do: [ :each | each > n ifTrue: [ ^each ] ].
+        ^nil
+    ]
+    countingUpTo: n [
+        | seen |
+        seen := 0.
+        1 to: 1000 do: [ :i | seen := seen + 1. i = n ifTrue: [ ^seen ] ].
+        ^0
+    ]
+]
+
+TestCase subclass: NonLocalReturnTest [
+
+    testABlockReturnLeavesTheHomeMethod [
+        self assert: (NlrProbe new firstOver: 3 in: #(1 2 3 4 5)) equals: 4.
+        self assert: (NlrProbe new firstOver: 99 in: #(1 2 3)) equals: nil
+    ]
+
+    testANonLocalReturnStopsTheLoopItIsIn [
+        self assert: (NlrProbe new countingUpTo: 5) equals: 5
+    ]
+
+    testANonLocalReturnRunsEnsureBlocksOnTheWayOut [
+        | log |
+        log := OrderedCollection new.
+        self assert: (self returningThrough: log) equals: #early.
+        self assert: log asArray equals: (Array with: #ensured)
+    ]
+    returningThrough: log [
+        [ ^#early ] ensure: [ log add: #ensured ].
+        ^#late
+    ]
+]
