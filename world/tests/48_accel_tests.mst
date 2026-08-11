@@ -6,21 +6,6 @@
  result (the one trap the bindings exist to encode exactly once)."
 
 TestCase subclass: AccelTests [
-    runAll [
-        self runTest: #testLifecycleAndAccess do: [ self testLifecycleAndAccess ].
-        self runTest: #testElementwiseWithAsymmetricOperands do: [ self testElementwiseWithAsymmetricOperands ].
-        self runTest: #testScalarOpsAndRamp do: [ self testScalarOpsAndRamp ].
-        self runTest: #testReductions do: [ self testReductions ].
-        self runTest: #testTranscendentals do: [ self testTranscendentals ].
-        self runTest: #testCopyBridges do: [ self testCopyBridges ].
-        self runTest: #testScopedFormFrees do: [ self testScopedFormFrees ].
-        self runTest: #testIndirectAlienZeroTail do: [ self testIndirectAlienZeroTail ].
-        self runTest: #testMatrixMultiplyThroughStackSpill do: [ self testMatrixMultiplyThroughStackSpill ].
-        self runTest: #testDgemmAlphaBetaMixesFprAndSpill do: [ self testDgemmAlphaBetaMixesFprAndSpill ].
-        self runTest: #testFftRoundTripIsUnscaled do: [ self testFftRoundTripIsUnscaled ].
-        self runTest: #testFftFindsASpectralPeak do: [ self testFftFindsASpectralPeak ].
-    ]
-
     "vDSP FFTs are unscaled: inverse(forward(x)) = n * x, exactly the
      contract FftSetup's comment states. 8 distinct points make any
      dropped/reordered lane change the answer."

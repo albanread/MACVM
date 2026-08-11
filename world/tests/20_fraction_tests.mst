@@ -7,20 +7,6 @@
  self error: rather than recursing or corrupting state."
 
 TestCase subclass: FractionTests [
-    runAll [
-        self runTest: #testReducesOnCreation do: [ self testReducesOnCreation ].
-        self runTest: #testWholeNumberCollapsesToInteger do: [ self testWholeNumberCollapsesToInteger ].
-        self runTest: #testNegativeNormalization do: [ self testNegativeNormalization ].
-        self runTest: #testArithmetic do: [ self testArithmetic ].
-        self runTest: #testComparison do: [ self testComparison ].
-        self runTest: #testEqualityAcrossIntegerAndDouble do: [ self testEqualityAcrossIntegerAndDouble ].
-        self runTest: #testAsDouble do: [ self testAsDouble ].
-        self runTest: #testTruncated do: [ self testTruncated ].
-        self runTest: #testIntegerSlash do: [ self testIntegerSlash ].
-        self runTest: #testIntegerSlashFractionNoRecursion do: [ self testIntegerSlashFractionNoRecursion ].
-        self runTest: #testPrintString do: [ self testPrintString ].
-    ]
-
     testReducesOnCreation [
         | f |
         f := Fraction numerator: 2 denominator: 4.

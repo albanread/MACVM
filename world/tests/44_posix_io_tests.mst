@@ -9,18 +9,6 @@
  binding surface round-trips."
 
 TestCase subclass: PosixIoTests [
-    runAll [
-        self runTest: #testNegativeReturnComesThrough do: [ self testNegativeReturnComesThrough ].
-        self runTest: #testErrnoReadable do: [ self testErrnoReadable ].
-        self runTest: #testPipeWriteRead do: [ self testPipeWriteRead ].
-        self runTest: #testKqueueReadReadiness do: [ self testKqueueReadReadiness ].
-        self runTest: #testKqueueWriteReadiness do: [ self testKqueueWriteReadiness ].
-        self runTest: #testKqueueEofFlag do: [ self testKqueueEofFlag ].
-        self runTest: #testUserEventTriggersAndLatches do: [ self testUserEventTriggersAndLatches ].
-        self runTest: #testUserEventCrossHandlePoke do: [ self testUserEventCrossHandlePoke ].
-        self runTest: #testTcpLoopbackRoundTrip do: [ self testTcpLoopbackRoundTrip ].
-    ]
-
     "pipe() into the buffer head; answers {readFd. writeFd} (two u32s)."
     pipeOn: buf [
         | rc |

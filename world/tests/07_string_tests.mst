@@ -7,18 +7,6 @@ Object subclass: StringTestsAliasHelper [
 ]
 
 TestCase subclass: StringTests [
-    runAll [
-        self runTest: #testLiteralQuoting do: [ self testLiteralQuoting ].
-        self runTest: #testAtAndAtPut do: [ self testAtAndAtPut ].
-        self runTest: #testSizeConcatCopy do: [ self testSizeConcatCopy ].
-        self runTest: #testComparisons do: [ self testComparisons ].
-        self runTest: #testSymbolRoundTrip do: [ self testSymbolRoundTrip ].
-        self runTest: #testHash do: [ self testHash ].
-        self runTest: #testPrintAndDisplay do: [ self testPrintAndDisplay ].
-        self runTest: #testLiteralAliasing do: [ self testLiteralAliasing ].
-        self runTest: #testIncludesAndIndexOf do: [ self testIncludesAndIndexOf ].
-    ]
-
     testLiteralQuoting [
         self assert: 'it''s' size = 4.
     ]

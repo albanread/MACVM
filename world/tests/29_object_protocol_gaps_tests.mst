@@ -3,22 +3,6 @@
  Collection/Bag value-equality completion."
 
 TestCase subclass: ObjectProtocolGapsTests [
-    runAll [
-        self runTest: #testAllSatisfyTrue do: [ self testAllSatisfyTrue ].
-        self runTest: #testAllSatisfyFalse do: [ self testAllSatisfyFalse ].
-        self runTest: #testAllSatisfyVacuouslyTrueOnEmpty do: [ self testAllSatisfyVacuouslyTrueOnEmpty ].
-        self runTest: #testAnySatisfyTrue do: [ self testAnySatisfyTrue ].
-        self runTest: #testAnySatisfyFalse do: [ self testAnySatisfyFalse ].
-        self runTest: #testSetEqualityIgnoresInsertionOrder do: [ self testSetEqualityIgnoresInsertionOrder ].
-        self runTest: #testSetInequality do: [ self testSetInequality ].
-        self runTest: #testBagEqualityComparesOccurrenceCounts do: [ self testBagEqualityComparesOccurrenceCounts ].
-        self runTest: #testBagInequalityOnDifferentCounts do: [ self testBagInequalityOnDifferentCounts ].
-        self runTest: #testDictionaryEquality do: [ self testDictionaryEquality ].
-        self runTest: #testDictionaryInequalityOnValue do: [ self testDictionaryInequalityOnValue ].
-        self runTest: #testSequenceableCollectionOwnEqualityUnaffected do: [ self testSequenceableCollectionOwnEqualityUnaffected ].
-        self runTest: #testDifferentClassesNeverEqual do: [ self testDifferentClassesNeverEqual ].
-    ]
-
     testAllSatisfyTrue [
         self assert: (#(2 4 6) allSatisfy: [:x | x even ]).
     ]

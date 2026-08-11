@@ -2,20 +2,6 @@
  collections protocol' Layer A, world/25_sortedcollection.mst)."
 
 TestCase subclass: SortedCollectionTests [
-    runAll [
-        self runTest: #testDefaultAscendingOrder do: [ self testDefaultAscendingOrder ].
-        self runTest: #testReverseInsertionOrder do: [ self testReverseInsertionOrder ].
-        self runTest: #testDuplicatesKept do: [ self testDuplicatesKept ].
-        self runTest: #testCustomSortBlock do: [ self testCustomSortBlock ].
-        self runTest: #testAsSortedCollection do: [ self testAsSortedCollection ].
-        self runTest: #testAsSortedCollectionWithBlock do: [ self testAsSortedCollectionWithBlock ].
-        self runTest: #testIsSorted do: [ self testIsSorted ].
-        self runTest: #testAddFirstRedirectsThroughAdd do: [ self testAddFirstRedirectsThroughAdd ].
-        self runTest: #testInheritedCollectionProtocol do: [ self testInheritedCollectionProtocol ].
-        self runTest: #testEmptyAndSingle do: [ self testEmptyAndSingle ].
-        self runTest: #testPrintString do: [ self testPrintString ].
-    ]
-
     testDefaultAscendingOrder [
         | s |
         s := SortedCollection new.

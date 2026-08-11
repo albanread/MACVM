@@ -6,7 +6,7 @@
  in this file re-runs S6-era assertions (03_integer_tests.mst already
  covers `+`/`-`/`*`/comparisons/bit-ops on their own — this file adds
  nothing new about SmallInteger correctness); its OWN job is to give the
- S10 compile trigger something to fire on: `runAll` calls `sumTo:`/
+ S10 compile trigger something to fire on: its tests call `sumTo:`/
  `absDiff:`/`bitsOf:` (D1-eligible: send-free but for inlined mono-smi
  sends) enough times that their own invocation counters cross even the
  DEFAULT threshold (`JitMode::DEFAULT_THRESHOLD` = 1000), not just the
@@ -45,22 +45,6 @@ NlrTierBase subclass: NlrTierProbe [
 ]
 
 TestCase subclass: Tier1Tests [
-    runAll [
-        self runTest: #testSumToBoundary do: [ self testSumToBoundary ].
-        self runTest: #testAbsDiffBoundary do: [ self testAbsDiffBoundary ].
-        self runTest: #testBitsOfBoundary do: [ self testBitsOfBoundary ].
-        self runTest: #testOverflowPromotesToLargeInteger do: [
-            self testOverflowPromotesToLargeInteger ].
-        self runTest: #testComparisonLadder do: [ self testComparisonLadder ].
-        self runTest: #testBitOpIdentities do: [ self testBitOpIdentities ].
-        self runTest: #testWhileTrueCountdown do: [ self testWhileTrueCountdown ].
-        self runTest: #testToDoAccumulation do: [ self testToDoAccumulation ].
-        self runTest: #testTriggerAcrossRepeatedCalls do: [
-            self testTriggerAcrossRepeatedCalls ].
-        self runTest: #testNlrThroughCompiledFrame do: [
-            self testNlrThroughCompiledFrame ].
-    ]
-
     "D1-eligible: send-free but for `+` (loop increment) and `<=`
      (inlined to:do: condition), both mono-smi once warm."
     sumTo: n [

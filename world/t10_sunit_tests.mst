@@ -1,0 +1,146 @@
+"t10_sunit_tests.mst — SUnit testing itself (docs/sunit_design.md S1).
+
+ A test framework whose own failure reporting is broken is worse than none: it
+ says green when it should say red, and everything downstream believes it. So
+ the first suite in the image is the one that checks the framework — that a
+ failed assertion is reported as a FAILURE, that an unexpected error is
+ reported as an ERROR and not confused with a failure, that tearDown runs when
+ a test explodes, and that assert:equals: says what it expected.
+
+ The awkward part of testing a test framework is that a test which is SUPPOSED
+ to fail must not make the suite red. So these run a nested TestRunner over
+ deliberately-broken cases and assert on the RESULT object — the failures below
+ are counted, not suffered."
+"I am SUnit's own suite: I run deliberately-broken tests through a nested
+ TestRunner and assert on the result, so that a framework which mis-reports a
+ failure cannot pass its own tests. Run me with `SUnitTest run`."
+
+"--- the deliberately-broken cases the suite runs ---"
+"I exist to fail, so that SUnitTest can check the framework reports me
+ correctly. I am not a bug."
+TestCase subclass: BrokenOnPurpose [
+    BrokenOnPurpose class >> isHelper [ "Run BY SUnitTest, not as part of a full run." ^true ]
+    testThatPasses [ self assert: true ]
+    testThatFails [ self assert: 1 equals: 2 ]
+    testThatErrors [ nil frobnicateWildly ]
+]
+
+"I record whether my fixture ran, so a test can prove tearDown happens even
+ when the test itself explodes."
+TestCase subclass: FixtureOrder [
+    FixtureOrder class >> isHelper [ "Run BY SUnitTest, not as part of a full run." ^true ]
+    <classVars: Log>
+    FixtureOrder class >> log [ Log isNil ifTrue: [ Log := OrderedCollection new ]. ^Log ]
+    FixtureOrder class >> resetLog [ Log := OrderedCollection new ]
+    setUp [ FixtureOrder log add: #setUp ]
+    tearDown [ FixtureOrder log add: #tearDown ]
+    testPasses [ FixtureOrder log add: #body ]
+    testExplodes [ FixtureOrder log add: #body. nil frobnicateWildly ]
+]
+
+"Two tests that simply pass — the green baseline the suite above measures
+ against."
+TestCase subclass: SUnitGreen [
+    SUnitGreen class >> isHelper [ "Run BY SUnitTest, not as part of a full run." ^true ]
+    testOne [ self assert: 3 + 4 equals: 7 ]
+    testTwo [ self deny: false ]
+]
+
+"should:raise: / shouldnt:raise:, exercised both ways round."
+TestCase subclass: RaiseCases [
+    RaiseCases class >> isHelper [ "Run BY SUnitTest, not as part of a full run." ^true ]
+    testRaisesAsExpected [ self should: [ nil frobnicateWildly ] raise: Error ]
+    testDoesNotRaise [ self shouldnt: [ 1 + 1 ] raise: Error ]
+    testExpectedARaiseButGotNone [ self should: [ 1 + 1 ] raise: Error ]
+]
+
+"--- the suite proper. It comes LAST because it names the helper classes
+ above, and this dialect resolves globals when a method is compiled: a file
+ may only reference names already bound. ---"
+TestCase subclass: SUnitTest [
+
+    testAssertEqualsSaysWhatItExpected [
+        "The message is the feature. 'assertion failed' tells you a test broke;
+         'expected 7 but was 8' tells you what to go and look at."
+        | r |
+        r := TestRunner run: (Array with: BrokenOnPurpose).
+        self assert: r failureCount equals: 1.
+        self assert: ((r failures first at: 3) indexOf: $e) > 0
+             description: 'the failure message should be present'.
+        self assert: (r failures first at: 3) equals: 'expected 2 but was 1'
+    ]
+
+    testFailureAndErrorAreCountedApart [
+        "The distinction the whole framework turns on. One broken class with
+         three tests: one passes, one fails an assertion, one raises something
+         nobody expected."
+        | r |
+        r := TestRunner run: (Array with: BrokenOnPurpose).
+        self assert: r runCount equals: 3.
+        self assert: r passedCount equals: 1.
+        self assert: r failureCount equals: 1 description: 'a bad assertion is a FAILURE'.
+        self assert: r errorCount equals: 1 description: 'a doesNotUnderstand is an ERROR'.
+        self deny: r isGreen
+    ]
+
+    testAnErrorIsNotReportedAsAFailure [
+        "Written the other way round — a broad Error handler outside — every
+         failure would land in the error bucket and the distinction would
+         silently not exist. This is the test that would catch that."
+        | r |
+        r := TestRunner run: (Array with: BrokenOnPurpose).
+        self assert: ((r errors first at: 1) endsWith: 'testThatErrors')
+             description: 'the ERROR must be the test that raised, not the one that failed'.
+        self assert: ((r failures first at: 1) endsWith: 'testThatFails')
+             description: 'the FAILURE must be the test that asserted wrongly'
+    ]
+
+    testTearDownRunsEvenWhenTheTestExplodes [
+        "A fixture that only tears down on success is not a fixture."
+        | r log |
+        FixtureOrder resetLog.
+        r := TestRunner run: (Array with: FixtureOrder).
+        log := FixtureOrder log.
+        self assert: r errorCount equals: 1 description: 'testExplodes must be an error'.
+        self assert: (log occurrencesOf: #setUp) equals: 2.
+        self assert: (log occurrencesOf: #tearDown) equals: 2
+             description: 'tearDown must run for BOTH tests, including the one that raised'
+    ]
+
+    testSelectorsAreFoundByReflectionAndSorted [
+        "No list for anyone to maintain, and a repeatable order."
+        | sels |
+        sels := BrokenOnPurpose testSelectors.
+        self assert: sels size equals: 3.
+        self assert: (sels at: 1) asString equals: 'testThatErrors'.
+        self deny: (sels includes: #setUp) description: 'setUp is not a test'
+    ]
+
+    testGreenRunIsGreen [
+        | r |
+        r := TestRunner run: (Array with: SUnitGreen).
+        self assert: r isGreen.
+        self assert: r failureCount equals: 0.
+        self assert: r errorCount equals: 0.
+        self assert: r runCount equals: 2
+    ]
+
+    testShouldRaiseFailsWhenNothingRaises [
+        "A should:raise: that quietly accepts a block which raised nothing is
+         worse than no test at all, so it is checked here."
+        | r |
+        r := TestRunner run: (Array with: RaiseCases).
+        self assert: r failureCount equals: 1
+             description: 'the block that raises nothing must FAIL the expectation'.
+        self assert: r passedCount equals: 2
+    ]
+
+    testSummaryLineIsTheWireFormat [
+        "Everything downstream parses this: the Transcript, the command line,
+         and the Tests tab. It is checked here so those three cannot drift."
+        | r |
+        r := TestRunner run: (Array with: SUnitGreen).
+        self assert: (r summaryLine beginsWith: '2 run, 0 failures, 0 errors,')
+             description: 'summary shape changed: ', r summaryLine
+    ]
+]

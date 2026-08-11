@@ -11,26 +11,6 @@
  is that the two answer different questions about the same object."
 
 TestCase subclass: StringCompletionTests [
-    runAll [
-        self runTest: #testJoin do: [ self testJoin ].
-        self runTest: #testSplitOnKeepsEmptyFields
-             do: [ self testSplitOnKeepsEmptyFields ].
-        self runTest: #testFormat do: [ self testFormat ].
-        self runTest: #testFormatEscapesBracesSymmetrically
-             do: [ self testFormatEscapesBracesSymmetrically ].
-        self runTest: #testPaddingNeverTruncates
-             do: [ self testPaddingNeverTruncates ].
-        self runTest: #testIndexOfStartingAt do: [ self testIndexOfStartingAt ].
-        self runTest: #testOccurrencesDoNotOverlap
-             do: [ self testOccurrencesDoNotOverlap ].
-        self runTest: #testBeginsWithIsAnAlias do: [ self testBeginsWithIsAnAlias ].
-        self runTest: #testAsByteArray do: [ self testAsByteArray ].
-        self runTest: #testUtf8SizeVersusByteSize do: [ self testUtf8SizeVersusByteSize ].
-        self runTest: #testCodePointDecoding do: [ self testCodePointDecoding ].
-        self runTest: #testMalformedUtf8AnswersNil
-             do: [ self testMalformedUtf8AnswersNil ].
-    ]
-
     testJoin [
         "The RECEIVER is the separator — the modern convention, and the one
          that reads correctly at the call site."

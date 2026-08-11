@@ -2,17 +2,6 @@
  in world/52_collection_ext.mst (reductions, empty-guards, slices, sort, withAll:)."
 
 TestCase subclass: CollectionExtTests [
-    runAll [
-        self runTest: #testReductions do: [ self testReductions ].
-        self runTest: #testIncludesAll do: [ self testIncludesAll ].
-        self runTest: #testEmptyGuards do: [ self testEmptyGuards ].
-        self runTest: #testSlices do: [ self testSlices ].
-        self runTest: #testAccessors do: [ self testAccessors ].
-        self runTest: #testCopyReverse do: [ self testCopyReverse ].
-        self runTest: #testSort do: [ self testSort ].
-        self runTest: #testWithAll do: [ self testWithAll ].
-    ]
-
     testReductions [
         self assert: #(1 2 3 4) sum = 10.
         self assert: (1 to: 100) sum = 5050.

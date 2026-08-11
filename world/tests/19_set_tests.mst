@@ -3,15 +3,6 @@
  (world/22_set.mst) reuses Dictionary's exact open-addressing engine."
 
 TestCase subclass: SetTests [
-    runAll [
-        self runTest: #testAddDedups do: [ self testAddDedups ].
-        self runTest: #testIncludes do: [ self testIncludes ].
-        self runTest: #testGrowthPastCapacity do: [ self testGrowthPastCapacity ].
-        self runTest: #testDoVisitsEachOnce do: [ self testDoVisitsEachOnce ].
-        self runTest: #testAsSet do: [ self testAsSet ].
-        self runTest: #testPrintString do: [ self testPrintString ].
-    ]
-
     testAddDedups [
         | s |
         s := Set new.

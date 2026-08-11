@@ -15,31 +15,6 @@
    to code that had just declared itself unable to continue."
 
 TestCase subclass: ExceptionResumeTests [
-    runAll [
-        self runTest: #testSignalExpressionAnswersResumeValue
-             do: [ self testSignalExpressionAnswersResumeValue ].
-        self runTest: #testExecutionContinuesAfterSignal
-             do: [ self testExecutionContinuesAfterSignal ].
-        self runTest: #testEnsureDoesNotRunOnResume
-             do: [ self testEnsureDoesNotRunOnResume ].
-        self runTest: #testHandlerStaysArmedAfterResume
-             do: [ self testHandlerStaysArmedAfterResume ].
-        self runTest: #testInnerHandlersSurviveResume
-             do: [ self testInnerHandlersSurviveResume ].
-        self runTest: #testErrorRefusesToResume do: [ self testErrorRefusesToResume ].
-        self runTest: #testResumeOutsideAHandler do: [ self testResumeOutsideAHandler ].
-        self runTest: #testOuterCarriesResumptionInward
-             do: [ self testOuterCarriesResumptionInward ].
-        self runTest: #testPassForwardsResumption do: [ self testPassForwardsResumption ].
-        self runTest: #testUnhandledWarningResumesNil
-             do: [ self testUnhandledWarningResumesNil ].
-        self runTest: #testManyResumesCostNoStack
-             do: [ self testManyResumesCostNoStack ].
-        self runTest: #testResumeAndRetryCompose do: [ self testResumeAndRetryCompose ].
-        self runTest: #testStackEmptyAfterResumePaths
-             do: [ self testStackEmptyAfterResumePaths ].
-    ]
-
     "The signal becomes an EXPRESSION whose value the handler chooses — the
      thing no terminating verb can do."
     testSignalExpressionAnswersResumeValue [

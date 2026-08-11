@@ -1,0 +1,437 @@
+"86_sunit.mst — SUnit: tests for the world, written in the world
+ (docs/sunit_design.md S1).
+
+ The VM is guarded by a thousand Rust tests. The world — the part users
+ actually edit, and which the environment actively invites them to edit, since
+ Accept compiles straight into the running image — was guarded by nothing they
+ could run. Worse, the guards that did exist for world code were written
+ backwards: the Minesweeper and FreeCell regression tests live in Rust and
+ assert Smalltalk facts through evaluated strings, which is the one language a
+ user of this environment cannot run.
+
+ This is the fix, and it is the ordinary SUnit everyone already knows:
+
+     TestCase subclass: MyTest [
+         setUp [ ... ]
+         testSomething [ self assert: 3 + 4 equals: 7 ]
+         tearDown [ ... ]
+     ]
+
+     MyTest run.                       'prints a summary on the Transcript'
+     (TestRunner run: (Array with: MyTest with: OtherTest)) printString.
+     TestRunner runAll printString.    'every TestCase subclass in the image'
+
+ FAILURE AND ERROR ARE DIFFERENT THINGS, and kept apart from the first line of
+ code because retrofitting that distinction is the classic SUnit-port mistake.
+ A failed assertion signals TestFailure; anything else that unwinds — a
+ doesNotUnderstand, a division by zero, an index out of bounds — is an ERROR.
+ One says the code is wrong in the way you were checking for; the other says
+ something happened you never considered. A suite that reports them together
+ tells you less than one that does not.
+
+ TestFailure is a subclass of Error, deliberately, so that code which catches
+ Error broadly — including this runner's own outer handler — can never let a
+ failure escape as an unhandled signal. The runner nests its handlers with the
+ failure one INSIDE, so failures are claimed before the error handler sees
+ them.
+
+ tearDown runs through `ensure:`, so it runs whether the test passed, failed or
+ exploded. A fixture that only tears down on success is not a fixture.
+
+ THE PRINTED RESULT IS THE WIRE FORMAT. One line per test and a summary:
+
+     PASS LifeTest testGliderWalks 3
+     FAIL MinesweeperTest testFirstClickSafe 1 expected 0 but was 1
+     ERROR FooTest testBroken 0 does not understand: frobnicate
+     5 run, 1 failure, 1 error, 41 ms
+
+ That single format is what the Transcript shows, what `macvm-gui test` prints,
+ and what the Tests tab will parse. There is no second serialization anywhere,
+ which is the only reason those three can never disagree."
+
+"--- TestFailure: an assertion that did not hold ---"
+"I am raised by a failed assertion. I am an Error subclass on purpose: code
+ that catches Error broadly must not be able to let a failure escape as an
+ unhandled signal, and a test runner's outer handler catches Error. The runner
+ nests its handlers so that I am claimed first — what is left for the outer one
+ is a genuine error, something the test never anticipated."
+Error subclass: TestFailure [
+]
+
+"--- TestResult: what happened, and the wire format ---"
+"I collect what a run did: how many tests, which passed, which failed an
+ assertion, which raised something unexpected, and how long it took. My
+ printString IS the format everything else reads — the Transcript, the command
+ line, and the Tests tab all parse the same lines, so they cannot drift apart."
+Object subclass: TestResult [
+    | passed failures errors started elapsed |
+
+    TestResult class >> new [ ^super new initResult ]
+
+    initResult [
+        passed := OrderedCollection new.
+        failures := OrderedCollection new.
+        errors := OrderedCollection new.
+        elapsed := 0.
+        started := Time millisecondClockValue.
+        ^self
+    ]
+
+    "── recording ────────────────────────────────────────────────────────"
+
+    pass: aName ms: ms [
+        passed add: (Array with: aName with: ms).
+        ^self
+    ]
+    fail: aName ms: ms message: aString [
+        failures add: (Array with: aName with: ms with: aString).
+        ^self
+    ]
+    error: aName ms: ms message: aString [
+        errors add: (Array with: aName with: ms with: aString).
+        ^self
+    ]
+    finish [ elapsed := Time millisecondClockValue - started. ^self ]
+
+    "── questions ────────────────────────────────────────────────────────"
+
+    passedCount [ ^passed size ]
+    failureCount [ ^failures size ]
+    errorCount [ ^errors size ]
+    runCount [ ^passed size + failures size + errors size ]
+    elapsedMs [ ^elapsed ]
+    isGreen [ "Nothing failed and nothing blew up." ^failures isEmpty and: [ errors isEmpty ] ]
+    failures [ ^failures ]
+    errors [ ^errors ]
+
+    "── the wire format ──────────────────────────────────────────────────"
+
+    summaryLine [
+        "The last line, and the only one a caller needs to decide pass/fail."
+        ^self runCount printString, ' run, ',
+          self failureCount printString, ' failure', (self failureCount = 1 ifTrue: [ '' ] ifFalse: [ 's' ]), ', ',
+          self errorCount printString, ' error', (self errorCount = 1 ifTrue: [ '' ] ifFalse: [ 's' ]), ', ',
+          elapsed printString, ' ms'
+    ]
+
+    printString [
+        "One line per test, then the summary. PASS lines first so a green run
+         reads top to bottom; failures and errors last, where they are looked
+         for."
+        | s |
+        s := ''.
+        passed do: [ :p |
+            s := s, 'PASS ', (p at: 1), ' ', (p at: 2) printString, (String with: Character nl) ].
+        failures do: [ :f |
+            s := s, 'FAIL ', (f at: 1), ' ', (f at: 2) printString, ' ', (f at: 3),
+                 (String with: Character nl) ].
+        errors do: [ :e |
+            s := s, 'ERROR ', (e at: 1), ' ', (e at: 2) printString, ' ', (e at: 3),
+                 (String with: Character nl) ].
+        ^s, self summaryLine
+    ]
+
+    showOn: aTranscript [
+        "Stream the same lines to the Transcript."
+        aTranscript showCr: self printString.
+        ^self
+    ]
+]
+
+"--- TestCase: the class you subclass ---"
+"I am the class your tests subclass. Write methods whose names begin `test`,
+ use setUp and tearDown for fixtures, and assert with assert:, deny:,
+ assert:equals:, assert:closeTo:precision:, should:raise: and shouldnt:raise:.
+
+ Run one class with `MyTest run`, or several with
+ `TestRunner run: (Array with: MyTest with: OtherTest)`.
+
+ A failed assertion signals TestFailure and stops that test; anything else that
+ unwinds is reported as an ERROR instead. tearDown always runs. assert:equals:
+ builds its own message from both values, because 'expected 7 but was 8' is the
+ difference between a suite people read and one they ignore."
+Object subclass: TestCase [
+    | selector |
+
+    TestCase class >> selector: aSymbol [ ^self new setSelector: aSymbol ]
+    setSelector: aSymbol [ selector := aSymbol. ^self ]
+    selector [ ^selector ]
+
+    "── fixtures ─────────────────────────────────────────────────────────"
+
+    setUp [ "Run before each test. Override." ^self ]
+    tearDown [ "Run after each test, pass or fail. Override." ^self ]
+
+    "── assertions ───────────────────────────────────────────────────────"
+
+    assert: aBoolean [
+        aBoolean ifFalse: [ self fail: 'assertion failed' ].
+        ^self
+    ]
+
+    assert: aBoolean description: aString [
+        aBoolean ifFalse: [ self fail: aString ].
+        ^self
+    ]
+
+    deny: aBoolean [
+        aBoolean ifTrue: [ self fail: 'denial failed' ].
+        ^self
+    ]
+
+    deny: aBoolean description: aString [
+        aBoolean ifTrue: [ self fail: aString ].
+        ^self
+    ]
+
+    assert: actual equals: expected [
+        "The workhorse, and the one whose MESSAGE matters: a bare 'assertion
+         failed' tells you a test broke, this tells you how."
+        actual = expected ifFalse: [
+            self fail: 'expected ', expected printString,
+                       ' but was ', actual printString ].
+        ^self
+    ]
+
+    assert: actual equals: expected description: aString [
+        "Same check, but say what it was FOR when the values alone do not
+         explain it."
+        actual = expected ifFalse: [
+            self fail: aString, ' (expected ', expected printString,
+                       ' but was ', actual printString, ')' ].
+        ^self
+    ]
+
+    assert: actual closeTo: expected precision: epsilon [
+        "Floats. Comparing them with = is a bug waiting for a rounding error."
+        (actual - expected) abs > epsilon ifTrue: [
+            self fail: 'expected ', expected printString,
+                       ' +/- ', epsilon printString,
+                       ' but was ', actual printString ].
+        ^self
+    ]
+
+    assert: actual closeTo: expected [ ^self assert: actual closeTo: expected precision: 0.000001 ]
+
+    should: aBlock raise: anExceptionClass [
+        "The test passes only if the block raises. Running to completion is
+         itself a failure, and says so — a `should:raise:` that silently
+         accepts a block which raised nothing is worse than no test."
+        | raised |
+        raised := false.
+        [ aBlock value ] on: anExceptionClass do: [ :e | raised := true ].
+        raised ifFalse: [
+            self fail: 'expected ', anExceptionClass printString, ' but nothing was raised' ].
+        ^self
+    ]
+
+    shouldnt: aBlock raise: anExceptionClass [
+        [ aBlock value ]
+            on: anExceptionClass
+            do: [ :e |
+                self fail: 'unexpected ', anExceptionClass printString,
+                           ': ', e messageText printString ].
+        ^self
+    ]
+
+    fail [ ^self fail: 'failed' ]
+    fail: aString [ "Signal a FAILURE (not an error)." ^TestFailure new signal: aString ]
+
+    "── running ──────────────────────────────────────────────────────────"
+
+    runCase [
+        "setUp, the test, tearDown — with tearDown through `ensure:` so it runs
+         however the test ends. Nothing is caught here: the RUNNER decides what
+         a failure and an error mean, and this method's job is only to make
+         sure the fixture is honoured."
+        self setUp.
+        [ self performTest ] ensure: [ self tearDown ].
+        ^self
+    ]
+
+    performTest [ ^self perform: selector ]
+
+    TestCase class >> isHelper [
+        "Answer true in a class that exists only to be run BY another test —
+         a fixture whose failures are the point. `runAll` skips helpers, so a
+         class full of deliberate failures cannot turn the whole suite red.
+
+         Without this, SUnit's own suite could not exist: it needs classes that
+         fail on purpose, and a full run would count their failures as real."
+        ^false
+    ]
+
+    TestCase class >> testSelectors [
+        "Every unary selector beginning `test`, sorted so a run is repeatable.
+         Reflection over the class, not a list anyone has to maintain."
+        | out |
+        out := OrderedCollection new.
+        (ClassMirror selectorsOf: self) do: [ :sel |
+            | s |
+            s := sel asString.
+            ((s size > 4) and: [ (s copyFrom: 1 to: 4) = 'test' and: [ (s occurrencesOf: $:) = 0 ] ])
+                ifTrue: [ out add: sel ] ].
+        ^out asSortedCollection asArray
+    ]
+
+]
+
+"--- TestRunner: runs classes and collects a result ---"
+"I run test classes and answer a TestResult. Give me the classes — `TestRunner
+ run: (Array with: FooTest with: BarTest)` — or ask me to find them myself with
+ `runAll`, which sweeps the image for TestCase subclasses.
+
+ I am where FAILURE and ERROR are told apart, with the TestFailure handler
+ nested INSIDE the Error handler so a failed assertion is claimed before the
+ broad handler can see it."
+Object subclass: TestRunner [
+
+    <classVars: Session>
+
+    TestRunner class >> run: classes [
+        "Run every test in every class given, in order, and answer the result.
+
+         `classes` is a collection — or a SINGLE TestCase class, which is how
+         a driver that names its suites one per line writes it
+         (`TestRunner run: StringTests`). Both read naturally; refusing the
+         second would be pedantry."
+        | result own |
+        own := Session isNil.
+        result := own ifTrue: [ TestResult new ] ifFalse: [ Session ].
+        (self asClassList: classes) do: [ :cls | self run: cls into: result ].
+        own ifTrue: [ ^result finish ].
+        ^result
+    ]
+
+    TestRunner class >> asClassList: classesOrOne [
+        ^(classesOrOne isKindOf: Collection)
+            ifTrue: [ classesOrOne ]
+            ifFalse: [ Array with: classesOrOne ]
+    ]
+
+    "── the accumulating session ──────────────────────────────────────────
+
+     `start` / `run:` / `report`: many suites, ONE result, and an exit status
+     at the end. This is what `world/tests/99_run_all.mst` drives — 61 library
+     suites — and what the command line needs, since a process can only exit
+     once. Without a session open, `run:` answers its own fresh result and
+     nothing exits, which is what a Workspace and the Tests tab want."
+
+    TestRunner class >> start [
+        "Begin a session. Every later `run:` accumulates into this one result."
+        Session := TestResult new.
+        ^Session
+    ]
+
+    TestRunner class >> session [ "The open session, or nil." ^Session ]
+
+    TestRunner class >> report [
+        "Print the session and END THE PROCESS with its verdict: 0 green,
+         1 otherwise. Closes the session, so a later `run:` starts fresh."
+        | r |
+        r := Session finish.
+        Session := nil.
+        r showOn: Transcript.
+        Smalltalk quit: (r isGreen ifTrue: [ 0 ] ifFalse: [ 1 ])
+    ]
+
+    TestRunner class >> run: cls into: result [
+        cls testSelectors do: [ :sel | self runOne: cls selector: sel into: result ].
+        ^result
+    ]
+
+    TestRunner class >> runOne: cls selector: sel into: result [
+        "One test, timed, with the two outcomes kept apart.
+
+         The handler order is the point. TestFailure is caught by the INNER
+         handler, so a failed assertion is recorded as a FAILURE; the outer one
+         sees only what is left, an error nobody anticipated. Written the other
+         way round — Error outside catching everything — every failure would be
+         reported as an error and the distinction would silently not exist.
+
+         WHY THE OUTCOME IS A FLAG rather than just calling `result pass:` at
+         the end of the protected block, which is how this obviously wants to
+         be written:
+
+         Originally, because of a VM bug this suite found. A test is invoked
+         with `perform:`, and an unwind did not cross a `perform:` frame: the
+         handler ran and then the protected block CARRIED ON, so the obvious
+         version recorded one failing test as both PASS and FAIL. That bug is
+         FIXED (`relay_reentrant_nlr`, src/runtime/primitives.rs — the same
+         hole was in the Workspace's Do It path, and is covered by
+         `a_non_local_return_escapes_through_a_perform_frame`), so the obvious
+         version would now work.
+
+         The flag stays anyway, because it is the better shape regardless: it
+         records the outcome and acts on it AFTERWARDS, so exactly one result
+         is recorded per test no matter what the protected block does on its
+         way out. A test framework should not be the thing that depends on
+         subtle unwind semantics being right — it is what everything else is
+         measured with."
+        | name t0 ms outcome message |
+        name := cls name asString, ' ', sel asString.
+        t0 := Time millisecondClockValue.
+        outcome := #pass.
+        message := ''.
+        [ [ (cls selector: sel) runCase ]
+              on: TestFailure
+              do: [ :e | outcome := #fail. message := e messageText ] ]
+          on: Error
+          do: [ :e |
+              "Only if the failure handler did not already claim it — see
+               above: after a caught TestFailure the block may keep running and
+               raise something else on the way out."
+              outcome == #pass ifTrue: [ outcome := #error. message := e messageText ] ].
+        ms := Time millisecondClockValue - t0.
+        outcome == #pass ifTrue: [ ^result pass: name ms: ms ].
+        outcome == #fail ifTrue: [ ^result fail: name ms: ms message: message ].
+        ^result error: name ms: ms message: message
+    ]
+
+    TestRunner class >> allTestClasses [
+        "Every TestCase subclass in this image, by reflection. The design
+         prefers being TOLD what to run — the Tests tab will pass a list from
+         the image database — but a framework that cannot find its own tests is
+         useless from a Workspace and from the command line, which is where
+         this is used."
+        | out |
+        out := OrderedCollection new.
+        ClassMirror allClasses do: [ :c |
+            (c ~~ TestCase
+                and: [ (c inheritsFrom: TestCase) and: [ c isHelper not ] ])
+                    ifTrue: [ out add: c ] ].
+        ^out asArray
+    ]
+
+    TestRunner class >> runAll [
+        "Run every test in the image."
+        ^self run: self allTestClasses
+    ]
+
+    TestRunner class >> runAllAndShow [
+        "What `macvm-gui test` and a Workspace both want: run everything and
+         print the wire format."
+        | r |
+        r := self runAll.
+        r showOn: Transcript.
+        ^r
+    ]
+]
+
+"--- TestCase, reopened for the one-liner ---
+ `run` has to live down here because it names TestRunner, and this dialect
+ resolves globals when a method is COMPILED: a file may only reference names
+ already bound. TestCase must exist before TestRunner (which asks
+ `inheritsFrom: TestCase`), so the convenience that points the other way waits
+ until both are defined. The same reason Sprite precedes GamePane in
+ world/43."
+Object subclass: TestCase [
+    TestCase class >> run [
+        "Run this class and print the result on the Transcript — the one-liner
+         for a Workspace: `MyTest run`."
+        | r |
+        r := TestRunner run: (Array with: self).
+        r showOn: Transcript.
+        ^r
+    ]
+]

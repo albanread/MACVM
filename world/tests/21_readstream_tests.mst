@@ -4,19 +4,6 @@
  own documented reason for skipping the empty-collection error case)."
 
 TestCase subclass: ReadStreamTests [
-    runAll [
-        self runTest: #testNextWalksInOrder do: [ self testNextWalksInOrder ].
-        self runTest: #testAtEnd do: [ self testAtEnd ].
-        self runTest: #testPeekDoesNotAdvance do: [ self testPeekDoesNotAdvance ].
-        self runTest: #testUpToEnd do: [ self testUpToEnd ].
-        self runTest: #testUpToEndWhenAlreadyAtEnd do: [ self testUpToEndWhenAlreadyAtEnd ].
-        self runTest: #testResetAndPosition do: [ self testResetAndPosition ].
-        self runTest: #testSkip do: [ self testSkip ].
-        self runTest: #testDoVisitsRemainingElements do: [ self testDoVisitsRemainingElements ].
-        self runTest: #testOnString do: [ self testOnString ].
-        self runTest: #testCollectionReadStream do: [ self testCollectionReadStream ].
-    ]
-
     testNextWalksInOrder [
         | rs |
         rs := ReadStream on: #(10 20 30).

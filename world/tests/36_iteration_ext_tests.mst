@@ -2,13 +2,6 @@
  protocol and the Interval>>reversed fix (world/55_iteration_ext.mst)."
 
 TestCase subclass: IterationExtTests [
-    runAll [
-        self runTest: #testSumWith do: [ self testSumWith ].
-        self runTest: #testFold do: [ self testFold ].
-        self runTest: #testWithIndex do: [ self testWithIndex ].
-        self runTest: #testIntervalReversed do: [ self testIntervalReversed ].
-    ]
-
     testSumWith [
         self assert: (#(1 2 3 4) sum: [:x | x * x ]) = 30.
         self assert: (#() sum: [:x | x ]) = 0.

@@ -3,17 +3,6 @@
  isPrime, asFloat/asInteger). All pure Smalltalk on the existing numeric classes."
 
 TestCase subclass: NumberExtTests [
-    runAll [
-        self runTest: #testFactorial do: [ self testFactorial ].
-        self runTest: #testRaisedTo do: [ self testRaisedTo ].
-        self runTest: #testSqrt do: [ self testSqrt ].
-        self runTest: #testCoercion do: [ self testCoercion ].
-        self runTest: #testLcm do: [ self testLcm ].
-        self runTest: #testQuoRem do: [ self testQuoRem ].
-        self runTest: #testReciprocal do: [ self testReciprocal ].
-        self runTest: #testIsPrime do: [ self testIsPrime ].
-    ]
-
     testFactorial [
         self assert: 0 factorial = 1.
         self assert: 1 factorial = 1.

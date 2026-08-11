@@ -8,15 +8,6 @@
  doc's own noted fallback)."
 
 TestCase subclass: GcFullTest [
-    runAll [
-        self runTest: #testChurnWithGrowthAndRelease
-            do: [ self testChurnWithGrowthAndRelease ].
-        self runTest: #testLiveGraphIntactAfterGcFull
-            do: [ self testLiveGraphIntactAfterGcFull ].
-        self runTest: #testIdentityDictionaryAfterGcFull
-            do: [ self testIdentityDictionaryAfterGcFull ].
-    ]
-
     "Sustained churn (each batch of 100 abandoned wholesale) interleaved
      with growth, then a full GC — the surviving batch's own content must
      still be intact and reachable afterward. Deliberately small (300

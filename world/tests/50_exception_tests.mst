@@ -6,24 +6,6 @@
  stack is left EMPTY on every exit path."
 
 TestCase subclass: ExceptionTests [
-    runAll [
-        self runTest: #testCatchesAndAnswersHandlerValue
-             do: [ self testCatchesAndAnswersHandlerValue ].
-        self runTest: #testNoSignalAnswersProtectedValue
-             do: [ self testNoSignalAnswersProtectedValue ].
-        self runTest: #testSubclassMatches do: [ self testSubclassMatches ].
-        self runTest: #testNonMatchingInnerPassesOutward
-             do: [ self testNonMatchingInnerPassesOutward ].
-        self runTest: #testHandlerMayResignalOutward
-             do: [ self testHandlerMayResignalOutward ].
-        self runTest: #testEnsureRunsAfterHandler
-             do: [ self testEnsureRunsAfterHandler ].
-        self runTest: #testHandlerStackNeverLeaks
-             do: [ self testHandlerStackNeverLeaks ].
-        self runTest: #testMessageTextAndReport
-             do: [ self testMessageTextAndReport ].
-    ]
-
     testCatchesAndAnswersHandlerValue [
         self assert: ([ Error signal: 'boom' ] on: Error do: [ :e | e messageText ])
                      = 'boom'

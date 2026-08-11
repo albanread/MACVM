@@ -3,15 +3,6 @@
  246/247/248)."
 
 TestCase subclass: ReflectionTests [
-    runAll [
-        self runTest: #testRespondsTo do: [ self testRespondsTo ].
-        self runTest: #testNumArgs do: [ self testNumArgs ].
-        self runTest: #testCopyEqualNotIdentical do: [ self testCopyEqualNotIdentical ].
-        self runTest: #testCopyIsIndependent do: [ self testCopyIsIndependent ].
-        self runTest: #testCopyKeepsIdentityForValues do: [ self testCopyKeepsIdentityForValues ].
-        self runTest: #testSortedCollectionCopyKeepsSortBlock do: [ self testSortedCollectionCopyKeepsSortBlock ].
-    ]
-
     testRespondsTo [
         self assert: (3 respondsTo: #printString).
         self assert: (3 respondsTo: #+).

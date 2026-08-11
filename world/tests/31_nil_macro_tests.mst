@@ -7,18 +7,6 @@
 TestCase subclass: NilMacroTests [
     | effects |
 
-    runAll [
-        self runTest: #testIfNil do: [ self testIfNil ].
-        self runTest: #testIfNotNil do: [ self testIfNotNil ].
-        self runTest: #testIfNotNilBinding do: [ self testIfNotNilBinding ].
-        self runTest: #testIfNilIfNotNil do: [ self testIfNilIfNotNil ].
-        self runTest: #testIfNotNilIfNil do: [ self testIfNotNilIfNil ].
-        self runTest: #testReceiverEvaluatedOnce do: [ self testReceiverEvaluatedOnce ].
-        self runTest: #testNested do: [ self testNested ].
-        self runTest: #testRepeat do: [ self testRepeat ].
-        self runTest: #testNlrThroughRepeat do: [ self testNlrThroughRepeat ].
-    ]
-
     testIfNil [
         self assert: (nil ifNil: [ 'A' ]) = 'A'.
         self assert: (5 ifNil: [ 'A' ]) = 5.

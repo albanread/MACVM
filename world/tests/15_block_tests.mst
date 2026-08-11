@@ -3,16 +3,6 @@
  as source-compiled assertions."
 
 TestCase subclass: BlockTests [
-    runAll [
-        self runTest: #testSharedCounter do: [ self testSharedCounter ].
-        self runTest: #testCapturedParam do: [ self testCapturedParam ].
-        self runTest: #testThreeDeepChain do: [ self testThreeDeepChain ].
-        self runTest: #testBlockReentryAfterHomeReturn
-            do: [ self testBlockReentryAfterHomeReturn ].
-        self runTest: #testValueArity do: [ self testValueArity ].
-        self runTest: #testEnsureNormalAndNlr do: [ self testEnsureNormalAndNlr ].
-    ]
-
     "Two blocks closing over the SAME enclosing temp must share mutations."
     testSharedCounter [
         | counter inc dec |

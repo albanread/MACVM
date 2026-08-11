@@ -4,23 +4,6 @@
  are ordinary correctness tests against the ported protocol."
 
 TestCase subclass: PointTests [
-    runAll [
-        self runTest: #testXY do: [ self testXY ].
-        self runTest: #testArithmetic do: [ self testArithmetic ].
-        self runTest: #testEquality do: [ self testEquality ].
-        self runTest: #testEqualityAgainstNonPoint do: [ self testEqualityAgainstNonPoint ].
-        self runTest: #testComparison do: [ self testComparison ].
-        self runTest: #testAbsNegated do: [ self testAbsNegated ].
-        self runTest: #testMaxMin do: [ self testMaxMin ].
-        self runTest: #testOrigin do: [ self testOrigin ].
-        self runTest: #testFloorTruncatedRounded do: [ self testFloorTruncatedRounded ].
-        self runTest: #testTruncateTo do: [ self testTruncateTo ].
-        self runTest: #testTranslatedByAndRelativeTo do: [ self testTranslatedByAndRelativeTo ].
-        self runTest: #testHashStableAndConsistentWithEquality do: [ self testHashStableAndConsistentWithEquality ].
-        self runTest: #testPrintString do: [ self testPrintString ].
-        self runTest: #testIntegerFloorTruncatedRoundedAreIdentity do: [ self testIntegerFloorTruncatedRoundedAreIdentity ].
-    ]
-
     testXY [
         | p |
         p := 3 @ 4.

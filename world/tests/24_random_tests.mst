@@ -5,18 +5,6 @@
  independently checkable against any other conformant implementation."
 
 TestCase subclass: RandomTests [
-    runAll [
-        self runTest: #testParkMillerConformance do: [ self testParkMillerConformance ].
-        self runTest: #testDefaultSeedIsOne do: [ self testDefaultSeedIsOne ].
-        self runTest: #testFirstStepFromSeedOne do: [ self testFirstStepFromSeedOne ].
-        self runTest: #testNextStaysInUnitInterval do: [ self testNextStaysInUnitInterval ].
-        self runTest: #testPeekDoesNotAdvance do: [ self testPeekDoesNotAdvance ].
-        self runTest: #testPeekMatchesSubsequentNext do: [ self testPeekMatchesSubsequentNext ].
-        self runTest: #testSameSeedReproducible do: [ self testSameSeedReproducible ].
-        self runTest: #testDifferentSeedsDiverge do: [ self testDifferentSeedsDiverge ].
-        self runTest: #testNextIntegerInRange do: [ self testNextIntegerInRange ].
-    ]
-
     testParkMillerConformance [
         | r |
         r := Random new.

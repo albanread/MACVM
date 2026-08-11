@@ -8,36 +8,6 @@
  later lookup silently misses."
 
 TestCase subclass: CollectionCompletionTests [
-    runAll [
-        self runTest: #testCountReachesNonSequenceable
-             do: [ self testCountReachesNonSequenceable ].
-        self runTest: #testAnyOneAndEmptyError do: [ self testAnyOneAndEmptyError ].
-        self runTest: #testCopyWithAndWithoutPreserveSpecies
-             do: [ self testCopyWithAndWithoutPreserveSpecies ].
-        self runTest: #testAsDictionaryRoundTrips do: [ self testAsDictionaryRoundTrips ].
-        self runTest: #testRemoveAllSuchThatOnSet do: [ self testRemoveAllSuchThatOnSet ].
-        self runTest: #testDictRemoveKey do: [ self testDictRemoveKey ].
-        self runTest: #testDictRemoveKeyHealsCollisions
-             do: [ self testDictRemoveKeyHealsCollisions ].
-        self runTest: #testDictRemoveKeyIfAbsent do: [ self testDictRemoveKeyIfAbsent ].
-        self runTest: #testDictRemoveThenGrow do: [ self testDictRemoveThenGrow ].
-        self runTest: #testDictEqualityAndSelect do: [ self testDictEqualityAndSelect ].
-        self runTest: #testKeysSortedSafely do: [ self testKeysSortedSafely ].
-        self runTest: #testAssociationAt do: [ self testAssociationAt ].
-        self runTest: #testSetEqualityAndHash do: [ self testSetEqualityAndHash ].
-        self runTest: #testBagCensus do: [ self testBagCensus ].
-        self runTest: #testCopyReplaceAll do: [ self testCopyReplaceAll ].
-        self runTest: #testCopyReplaceAllEmptyPattern
-             do: [ self testCopyReplaceAllEmptyPattern ].
-        self runTest: #testPairsDo do: [ self testPairsDo ].
-        self runTest: #testAtIfAbsentBounds do: [ self testAtIfAbsentBounds ].
-        self runTest: #testAtAllPut do: [ self testAtAllPut ].
-        self runTest: #testAddBeforeIndex do: [ self testAddBeforeIndex ].
-        self runTest: #testAddAllFirstKeepsOrder do: [ self testAddAllFirstKeepsOrder ].
-        self runTest: #testIntervalEqualityAndStep do: [ self testIntervalEqualityAndStep ].
-        self runTest: #testWriteStreamSpecies do: [ self testWriteStreamSpecies ].
-    ]
-
     "── the placement claim: Collection protocol reaches every collection ──"
 
     testCountReachesNonSequenceable [

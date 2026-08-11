@@ -2,17 +2,6 @@
  DictionaryTests', including the required probe-wrap stress case)."
 
 TestCase subclass: DictionaryTests [
-    runAll [
-        self runTest: #testBasicAtPut do: [ self testBasicAtPut ].
-        self runTest: #testOverwriteKeepsTally do: [ self testOverwriteKeepsTally ].
-        self runTest: #testAbsentVariants do: [ self testAbsentVariants ].
-        self runTest: #testGrowthAndReadback do: [ self testGrowthAndReadback ].
-        self runTest: #testMixedKeyTypes do: [ self testMixedKeyTypes ].
-        self runTest: #testKeysAndValuesDo do: [ self testKeysAndValuesDo ].
-        self runTest: #testIncludesKeyAndSize do: [ self testIncludesKeyAndSize ].
-        self runTest: #testProbeWrap do: [ self testProbeWrap ].
-    ]
-
     testBasicAtPut [
         | d |
         d := Dictionary new.

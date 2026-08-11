@@ -1,13 +1,6 @@
 "02_boolean_tests.mst — BooleanTests (tests_s06.md '02 BooleanTests')."
 
 TestCase subclass: BooleanTests [
-    runAll [
-        self runTest: #testAndOr do: [ self testAndOr ].
-        self runTest: #testNot do: [ self testNot ].
-        self runTest: #testIfTrueFamily do: [ self testIfTrueFamily ].
-        self runTest: #testRealSends do: [ self testRealSends ].
-    ]
-
     testAndOr [
         self assert: (true and: [ true ]) = true.
         self deny: (true and: [ false ]) = true.

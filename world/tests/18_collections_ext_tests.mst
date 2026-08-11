@@ -6,15 +6,6 @@
  file existed, so their coverage lives in their own existing test files."
 
 TestCase subclass: CollectionsExtTests [
-    runAll [
-        self runTest: #testSelectOnInterval do: [ self testSelectOnInterval ].
-        self runTest: #testSelectOnArray do: [ self testSelectOnArray ].
-        self runTest: #testReject do: [ self testReject ].
-        self runTest: #testSelectRejectComplementary do: [ self testSelectRejectComplementary ].
-        self runTest: #testCollectGenericDefault do: [ self testCollectGenericDefault ].
-        self runTest: #testOccurrencesOf do: [ self testOccurrencesOf ].
-    ]
-
     testSelectOnInterval [
         self assert: ((1 to: 10) select: [:x | x even ]) asArray = #(2 4 6 8 10).
     ]

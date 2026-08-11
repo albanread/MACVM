@@ -390,6 +390,111 @@ fn cmd_render(args: &[String]) {
 /// `<world_dir>/image.sqlite3` without launching the GUI. Headless complement
 /// to `render`: the class browser and the ClassOutliner's method-source
 /// blocks read their text from this DB (the running VM keeps no source).
+/// `macvm-gui test [--world <dir>] [--list <name.list>]` — run the world's own
+/// Smalltalk test suites and exit non-zero if any failed
+/// (docs/sunit_design.md S1).
+///
+/// The point of this command is that the SAME suite a user runs from the Tests
+/// tab also gates CI, from one wire format neither side can drift from. It
+/// boots the world, layers the `tests` package on top — tests live in their own
+/// list so a lean deployment can leave them out — and asks the runner for
+/// everything.
+fn cmd_test(args: &[String]) -> ! {
+    let mut world_dir = PathBuf::from("world");
+    let mut list = String::from("tests.list");
+    let mut repeat: u32 = 1;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--world" => {
+                i += 1;
+                if let Some(d) = args.get(i) {
+                    world_dir = PathBuf::from(d);
+                }
+            }
+            "--list" => {
+                i += 1;
+                if let Some(l) = args.get(i) {
+                    list = l.clone();
+                }
+            }
+            // Run the whole suite N times in ONE image. Not padding: the
+            // second run is the first one whose methods are JIT-compiled, so
+            // `--repeat 2` is the cheapest test that the suite survives its
+            // own warm-up — and it is how a re-run bug was found.
+            "--repeat" => {
+                i += 1;
+                repeat = args.get(i).and_then(|n| n.parse().ok()).unwrap_or(1);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // The runner's output IS the report: one line per test plus a summary,
+    // printed verbatim so this command, the Transcript and the Tests tab all
+    // show the same thing.
+    struct StdoutSink;
+    impl macvm::embed::TranscriptSink for StdoutSink {
+        fn show(&mut self, text: &str) {
+            print!("{text}");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    let mut vm = match macvm::embed::VmHandle::boot(
+        macvm::runtime::VmOptions {
+            heap_mib: 256,
+            jit: macvm::runtime::JitMode::Threshold(10),
+            ..Default::default()
+        },
+        &world_dir,
+    ) {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("test: cannot boot the world at {}: {e:?}", world_dir.display());
+            std::process::exit(2);
+        }
+    };
+    vm.set_transcript(Box::new(StdoutSink));
+
+    // Layer the tests package. A missing list is not an error — a deployment
+    // may ship without tests — but it IS worth saying, because "0 run" with no
+    // explanation looks like a broken runner.
+    let list_path = world_dir.join(&list);
+    if list_path.exists() {
+        if let Err(e) = vm.load_list(&list_path) {
+            eprintln!("test: {} failed to load: {e:?}", list_path.display());
+            std::process::exit(2);
+        }
+    } else {
+        eprintln!("test: no {} — running whatever suites the world itself carries", list_path.display());
+    }
+
+    // `exec` runs ONE top-level item, so the call goes through a class.
+    if let Err(e) = vm.exec(
+        "Object subclass: MacvmTestMain [              MacvmTestMain class >> go [ ^TestRunner runAllAndShow ] ]",
+    ) {
+        eprintln!("test: cannot install the runner entry point: {e}");
+        std::process::exit(2);
+    }
+    // ONE run. The report reaches the terminal through the transcript sink as
+    // the run proceeds, and the SAME evaluation answers the verdict — so the
+    // exit status describes the run that was just printed. (This ran the suite
+    // twice at first, once to print and once to ask `isGreen`, which is both
+    // wasteful and a lie: the status would describe a second, unprinted run.)
+    let mut all_green = true;
+    for _ in 0..repeat.max(1) {
+        let green = vm.eval("MacvmTestMain go isGreen.").unwrap_or_else(|e| {
+            eprintln!("test: the run itself failed: {e}");
+            std::process::exit(2);
+        });
+        all_green &= green.trim() == "true";
+    }
+    std::process::exit(if all_green { 0 } else { 1 });
+}
+
 fn cmd_seed(args: &[String]) {
     let mut world_dir = PathBuf::from("world");
     let mut i = 0;
@@ -2646,6 +2751,7 @@ fn main() {
     match cli.first().map(String::as_str) {
         Some("render") => return cmd_render(&cli[1..]),
         Some("seed") => return cmd_seed(&cli[1..]),
+        Some("test") => return cmd_test(&cli[1..]),
         Some("export") => return cmd_export(&cli[1..]),
         Some("run") => return cmd_run_gui(&cli[1..]),
         _ => {}

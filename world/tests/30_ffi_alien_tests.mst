@@ -18,15 +18,6 @@ Object subclass: FFIAlienPosix [
 ]
 
 TestCase subclass: FFIAlienTests [
-    runAll [
-        self runTest: #testFFIGetpidReturnsARealPid do: [ self testFFIGetpidReturnsARealPid ].
-        self runTest: #testAlienDirectByteRoundTrip do: [ self testAlienDirectByteRoundTrip ].
-        self runTest: #testAlienDirectDoubleRoundTrip do: [ self testAlienDirectDoubleRoundTrip ].
-        self runTest: #testAlienSignedLongNegativeRoundTrip do: [ self testAlienSignedLongNegativeRoundTrip ].
-        self runTest: #testAlienByteAtOutOfRangeFails do: [ self testAlienByteAtOutOfRangeFails ].
-        self runTest: #testMmapIndirectAlienReadsWritesRealMemory do: [ self testMmapIndirectAlienReadsWritesRealMemory ].
-    ]
-
     "A real dlsym-resolved libc call through S20 step 4's dispatch — the
      only independently-checkable property from inside Smalltalk itself is
      that a real OS process id came back (a positive SmallInt), not a fixed

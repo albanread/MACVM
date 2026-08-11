@@ -2,18 +2,6 @@
  extras + Fraction rounding (world/57_format_iter_ext.mst)."
 
 TestCase subclass: FormatIterExtTests [
-    runAll [
-        self runTest: #testRoundTo do: [ self testRoundTo ].
-        self runTest: #testPadded do: [ self testPadded ].
-        self runTest: #testRadix do: [ self testRadix ].
-        self runTest: #testFractionRounding do: [ self testFractionRounding ].
-        self runTest: #testFlatCollect do: [ self testFlatCollect ].
-        self runTest: #testDetectMaxMin do: [ self testDetectMaxMin ].
-        self runTest: #testGroupBy do: [ self testGroupBy ].
-        self runTest: #testReplaceAll do: [ self testReplaceAll ].
-        self runTest: #testOrderedExtras do: [ self testOrderedExtras ].
-    ]
-
     testRoundTo [
         self assert: (3.14159 roundTo: 0.01) = 3.14.
         self assert: (17 roundTo: 5) = 15.

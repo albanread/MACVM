@@ -7,18 +7,6 @@
  Seeded, so a failure is reproducible."
 
 TestCase subclass: RopeTests [
-    runAll [
-        self runTest: #testSizeAndAt do: [ self testSizeAndAt ].
-        self runTest: #testInsert do: [ self testInsert ].
-        self runTest: #testInsertBoundaries do: [ self testInsertBoundaries ].
-        self runTest: #testDelete do: [ self testDelete ].
-        self runTest: #testDeleteBoundaries do: [ self testDeleteBoundaries ].
-        self runTest: #testLargeStringForcesBranches do: [ self testLargeStringForcesBranches ].
-        self runTest: #testLinesAgainstOracle do: [ self testLinesAgainstOracle ].
-        self runTest: #testUndoRedo do: [ self testUndoRedo ].
-        self runTest: #testDifferentialEdits do: [ self testDifferentialEdits ].
-    ]
-
     "── helpers ──"
     nl [ ^String with: Character nl ]
 
@@ -189,17 +177,6 @@ TestCase subclass: RopeTests [
  whole buffer text with the 0-based caret on a header line. These check the edits
  land where the caret says and that render encodes the buffer + caret correctly."
 TestCase subclass: EditorSessionTests [
-    runAll [
-        self runTest: #testRenderShape do: [ self testRenderShape ].
-        self runTest: #testInsertAtCaret do: [ self testInsertAtCaret ].
-        self runTest: #testBackspaceAtCaret do: [ self testBackspaceAtCaret ].
-        self runTest: #testDeleteAtCaret do: [ self testDeleteAtCaret ].
-        self runTest: #testEnterSplits do: [ self testEnterSplits ].
-        self runTest: #testEditAtClampedCaret do: [ self testEditAtClampedCaret ].
-        self runTest: #testUndoRedo do: [ self testUndoRedo ].
-        self runTest: #testTypeAndDelete do: [ self testTypeAndDelete ].
-    ]
-
     nl [ ^String with: Character nl ]
     "The caret (0-based) that a render blast reports: everything before the first newline."
     caretOf: render [ ^(render copyFrom: 1 to: (render indexOf: Character nl) - 1) asNumber ]

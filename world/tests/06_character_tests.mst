@@ -11,14 +11,6 @@
  without touching committed S5 behavior."
 
 TestCase subclass: CharacterTests [
-    runAll [
-        self runTest: #testFlyweightIdentity do: [ self testFlyweightIdentity ].
-        self runTest: #testRoundTrip do: [ self testRoundTrip ].
-        self runTest: #testComparisonAndHash do: [ self testComparisonAndHash ].
-        self runTest: #testClassify do: [ self testClassify ].
-        self runTest: #testCase do: [ self testCase ].
-    ]
-
     testFlyweightIdentity [
         self assert: (Character value: 65) == (Character value: 65).
         self assert: $A == $A.

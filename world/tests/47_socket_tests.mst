@@ -7,15 +7,6 @@
  the loopback interface."
 
 TestCase subclass: SocketTests [
-    runAll [
-        self runTest: #testInetAddressParseFormat do: [ self testInetAddressParseFormat ].
-        self runTest: #testUdpRoundTripRecoversPeer do: [ self testUdpRoundTripRecoversPeer ].
-        self runTest: #testSetAndGetSocketOption do: [ self testSetAndGetSocketOption ].
-        self runTest: #testChecksumIsOnesComplement do: [ self testChecksumIsOnesComplement ].
-        self runTest: #testLoopbackPingRoundTrips do: [ self testLoopbackPingRoundTrips ].
-        self runTest: #testRawSocketRefusedIsAValueNotACrash do: [ self testRawSocketRefusedIsAValueNotACrash ].
-    ]
-
     testInetAddressParseFormat [
         | a |
         a := InetAddress fromString: '192.168.1.10'.

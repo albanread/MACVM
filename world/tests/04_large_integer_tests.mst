@@ -4,17 +4,6 @@
  hand-counting hex zeros."
 
 TestCase subclass: LargeIntegerTests [
-    runAll [
-        self runTest: #testOverflowBoundary do: [ self testOverflowBoundary ].
-        self runTest: #testUnderflowBoundary do: [ self testUnderflowBoundary ].
-        self runTest: #testRoundTripDemotion do: [ self testRoundTripDemotion ].
-        self runTest: #testAddSubDigitBoundary do: [ self testAddSubDigitBoundary ].
-        self runTest: #testMultiplication do: [ self testMultiplication ].
-        self runTest: #testComparisonMatrix do: [ self testComparisonMatrix ].
-        self runTest: #testPrintString do: [ self testPrintString ].
-        self runTest: #testEqualityAcrossDemotion do: [ self testEqualityAcrossDemotion ].
-    ]
-
     testOverflowBoundary [
         | big |
         big := SmallInteger maxVal + 1.

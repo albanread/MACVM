@@ -2,20 +2,6 @@
  world/26_bag.mst)."
 
 TestCase subclass: BagTests [
-    runAll [
-        self runTest: #testAddCountsOccurrences do: [ self testAddCountsOccurrences ].
-        self runTest: #testSize do: [ self testSize ].
-        self runTest: #testOccurrencesOfMissing do: [ self testOccurrencesOfMissing ].
-        self runTest: #testIncludes do: [ self testIncludes ].
-        self runTest: #testAddWithOccurrences do: [ self testAddWithOccurrences ].
-        self runTest: #testRemoveDecrementsAndFloors do: [ self testRemoveDecrementsAndFloors ].
-        self runTest: #testRemoveIfAbsent do: [ self testRemoveIfAbsent ].
-        self runTest: #testAsBag do: [ self testAsBag ].
-        self runTest: #testInheritedCollectionProtocol do: [ self testInheritedCollectionProtocol ].
-        self runTest: #testIsEmpty do: [ self testIsEmpty ].
-        self runTest: #testPrintString do: [ self testPrintString ].
-    ]
-
     testAddCountsOccurrences [
         | b |
         b := Bag new.

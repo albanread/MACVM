@@ -15,30 +15,6 @@
    ways to leave a handler, and each one is checked here."
 
 TestCase subclass: ExceptionVerbTests [
-    runAll [
-        self runTest: #testE1StillHolds do: [ self testE1StillHolds ].
-        self runTest: #testReturnAbandonsHandler do: [ self testReturnAbandonsHandler ].
-        self runTest: #testReturnBare do: [ self testReturnBare ].
-        self runTest: #testRetryReRunsProtectedBlock
-             do: [ self testRetryReRunsProtectedBlock ].
-        self runTest: #testRetryIsALoopNotRecursion
-             do: [ self testRetryIsALoopNotRecursion ].
-        self runTest: #testRetryReArmsTheHandler do: [ self testRetryReArmsTheHandler ].
-        self runTest: #testPassGoesOutward do: [ self testPassGoesOutward ].
-        self runTest: #testPassCannotReEnterItsOwnHandler
-             do: [ self testPassCannotReEnterItsOwnHandler ].
-        self runTest: #testPassUnhandledOutwardReports
-             do: [ self testPassUnhandledOutwardReports ].
-        self runTest: #testInstanceSignalWithText do: [ self testInstanceSignalWithText ].
-        self runTest: #testEnsureOrderingWithVerbs do: [ self testEnsureOrderingWithVerbs ].
-        self runTest: #testHandlerStackEmptyAfterEveryVerb
-             do: [ self testHandlerStackEmptyAfterEveryVerb ].
-        self runTest: #testVerbsOutsideAHandlerReport
-             do: [ self testVerbsOutsideAHandlerReport ].
-        self runTest: #testNestedIndependentExceptions
-             do: [ self testNestedIndependentExceptions ].
-    ]
-
     "E1's contract is unchanged — the wrapper block it used went away, so
      this is the regression that matters most."
     testE1StillHolds [

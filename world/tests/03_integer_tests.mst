@@ -1,16 +1,6 @@
 "03_integer_tests.mst — IntegerTests (tests_s06.md '03 IntegerTests')."
 
 TestCase subclass: IntegerTests [
-    runAll [
-        self runTest: #testArith do: [ self testArith ].
-        self runTest: #testComparisons do: [ self testComparisons ].
-        self runTest: #testBitOps do: [ self testBitOps ].
-        self runTest: #testEvenOddGcdTimes do: [ self testEvenOddGcdTimes ].
-        self runTest: #testRadixLiterals do: [ self testRadixLiterals ].
-        self runTest: #testPrintString do: [ self testPrintString ].
-        self runTest: #testHash do: [ self testHash ].
-    ]
-
     testArith [
         self assert: 3 + 4 = 7.
         self assert: 3 - 4 = -1.

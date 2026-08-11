@@ -2,17 +2,6 @@
  (tests_s06.md '13')."
 
 TestCase subclass: IntervalTests [
-    runAll [
-        self runTest: #testBasics do: [ self testBasics ].
-        self runTest: #testStep do: [ self testStep ].
-        self runTest: #testToDoEquivalence do: [ self testToDoEquivalence ].
-        self runTest: #testToDoResult do: [ self testToDoResult ].
-        self runTest: #testLoopVarCapture do: [ self testLoopVarCapture ].
-        self runTest: #testWhileLoops do: [ self testWhileLoops ].
-        self runTest: #testTimesRepeat do: [ self testTimesRepeat ].
-        self runTest: #testNlrThroughToDo do: [ self testNlrThroughToDo ].
-    ]
-
     testBasics [
         self assert: (1 to: 5) size = 5.
         self assert: (1 to: 5) asArray = #(1 2 3 4 5).

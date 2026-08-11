@@ -13,15 +13,6 @@
  the escape as an Err, and then read back what the cleanup recorded."
 
 TestCase subclass: CurtailmentTests [
-    runAll [
-        self runTest: #testEnsureOnNormalCompletion do: [ self testEnsureOnNormalCompletion ].
-        self runTest: #testEnsureOnNonLocalReturn do: [ self testEnsureOnNonLocalReturn ].
-        self runTest: #testEnsureOrderInnermostFirst do: [ self testEnsureOrderInnermostFirst ].
-        self runTest: #testIfCurtailedNotRunOnNormalCompletion do: [ self testIfCurtailedNotRunOnNormalCompletion ].
-        self runTest: #testIfCurtailedRunsOnNonLocalReturn do: [ self testIfCurtailedRunsOnNonLocalReturn ].
-        self runTest: #testEnsureAnswersProtectedValue do: [ self testEnsureAnswersProtectedValue ].
-    ]
-
     testEnsureOnNormalCompletion [
         | log |
         log := OrderedCollection new.

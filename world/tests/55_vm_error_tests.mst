@@ -15,27 +15,6 @@
  output) and by hand: `1/0` still prints exactly `Error: division by zero`."
 
 TestCase subclass: VmErrorTests [
-    runAll [
-        self runTest: #testDivisionByZeroIsCatchable
-             do: [ self testDivisionByZeroIsCatchable ].
-        self runTest: #testDoesNotUnderstandIsCatchable
-             do: [ self testDoesNotUnderstandIsCatchable ].
-        self runTest: #testDnuCarriesReceiverAndMessage
-             do: [ self testDnuCarriesReceiverAndMessage ].
-        self runTest: #testIndexOutOfBoundsIsCatchable
-             do: [ self testIndexOutOfBoundsIsCatchable ].
-        self runTest: #testInBoundsAccessIsUnaffected
-             do: [ self testInBoundsAccessIsUnaffected ].
-        self runTest: #testGenericLibraryFailuresAreCatchable
-             do: [ self testGenericLibraryFailuresAreCatchable ].
-        self runTest: #testVerbsComposeWithVmErrors
-             do: [ self testVerbsComposeWithVmErrors ].
-        self runTest: #testHandlerStackCleanAfterVmErrors
-             do: [ self testHandlerStackCleanAfterVmErrors ].
-        self runTest: #testReportTextIsUnprefixed
-             do: [ self testReportTextIsUnprefixed ].
-    ]
-
     "The headline. Caught by its own class, by Error, and by Exception —
      the kind-of walk has to work for a VM-raised signal exactly as for a
      library-raised one."

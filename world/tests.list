@@ -1,0 +1,17 @@
+# The `tests` package (docs/sunit_design.md S1) — the world's own test suites.
+#
+# A THIRD package beside `world` and `cocoaui`, loaded on top of a booted
+# world, so tests can subclass TestCase (world/86_sunit.mst) and name any
+# class in the image. Files carry a `t` prefix so this list reads at a glance
+# in a shared directory.
+#
+# It SHIPS in the .app payload on purpose: a fresh install can open the Tests
+# tab, press Run All, and watch the library's own suite go green on their own
+# machine. No About box makes that argument as well.
+#
+# Run them: `macvm-gui test`, or `TestRunner runAllAndShow` in a Workspace,
+# or `MyTest run` for one class.
+
+# SUnit testing itself. First, because a framework that mis-reports a failure
+# says green when it should say red and everything downstream believes it.
+t10_sunit_tests.mst

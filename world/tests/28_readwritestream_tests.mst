@@ -1,20 +1,6 @@
 "28_readwritestream_tests.mst — ReadWriteStreamTests (world/31_readwritestream.mst)."
 
 TestCase subclass: ReadWriteStreamTests [
-    runAll [
-        self runTest: #testWriteThenReadBack do: [ self testWriteThenReadBack ].
-        self runTest: #testContentsVsContentsWrittenVsContentsRemaining do: [ self testContentsVsContentsWrittenVsContentsRemaining ].
-        self runTest: #testResetRewindsForRereading do: [ self testResetRewindsForRereading ].
-        self runTest: #testAtEndTracksSizeNotCapacity do: [ self testAtEndTracksSizeNotCapacity ].
-        self runTest: #testUpToEnd do: [ self testUpToEnd ].
-        self runTest: #testPeekDoesNotAdvance do: [ self testPeekDoesNotAdvance ].
-        self runTest: #testGrowthPastInitialCapacity do: [ self testGrowthPastInitialCapacity ].
-        self runTest: #testShovelOperator do: [ self testShovelOperator ].
-        self runTest: #testOnWithNumElementsStartsReadable do: [ self testOnWithNumElementsStartsReadable ].
-        self runTest: #testDoVisitsRemainingElementsOnly do: [ self testDoVisitsRemainingElementsOnly ].
-        self runTest: #testOnArrayNotJustString do: [ self testOnArrayNotJustString ].
-    ]
-
     testWriteThenReadBack [
         | s |
         s := ReadWriteStream on: String new.

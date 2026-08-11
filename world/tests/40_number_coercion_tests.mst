@@ -5,16 +5,6 @@
  never handled a Fraction."
 
 TestCase subclass: NumberCoercionTests [
-    runAll [
-        self runTest: #testIntegerPlusFraction do: [ self testIntegerPlusFraction ].
-        self runTest: #testIntegerMinusFraction do: [ self testIntegerMinusFraction ].
-        self runTest: #testIntegerTimesFraction do: [ self testIntegerTimesFraction ].
-        self runTest: #testIntegerCompareFraction do: [ self testIntegerCompareFraction ].
-        self runTest: #testCommutativity do: [ self testCommutativity ].
-        self runTest: #testIdentities do: [ self testIdentities ].
-        self runTest: #testStillWorks do: [ self testStillWorks ].
-    ]
-
     testIntegerPlusFraction [
         self assert: (2 + (1/2)) = (5/2).
         self assert: (1 + (1/2)) = (3/2).

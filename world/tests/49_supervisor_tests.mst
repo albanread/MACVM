@@ -74,40 +74,31 @@ Object subclass: FakeClock [
 ]
 
 TestCase subclass: SupervisorTests [
-    runAll [
-        self runTest: #testDiedFallsThroughWithoutSupervision do: [ self testDiedFallsThroughWithoutSupervision ].
-        self runTest: #testStartSpawnsInOrderAndBindsNames do: [ self testStartSpawnsInOrderAndBindsNames ].
-        self runTest: #testChildDeathRestartsAndRebindsName do: [ self testChildDeathRestartsAndRebindsName ].
-        self runTest: #testTemporaryChildIsNotRestarted do: [ self testTemporaryChildIsNotRestarted ].
-        self runTest: #testIntensityGivesUpAtExactlyMaxPlusOne do: [ self testIntensityGivesUpAtExactlyMaxPlusOne ].
-        self runTest: #testRestartsOutsideWindowAgeOut do: [ self testRestartsOutsideWindowAgeOut ].
-        self runTest: #testStopTerminatesInReverseOrderAndSilences do: [ self testStopTerminatesInReverseOrderAndSilences ].
-        self runTest: #testDiedSeamRoutesThroughDispatchOne do: [ self testDiedSeamRoutesThroughDispatchOne ].
-        self runTest: #testUnsupervisedDeathIsIgnoredByRegistry do: [ self testUnsupervisedDeathIsIgnoredByRegistry ].
-        self runTest: #testOneForAllRestartsEverySibling do: [ self testOneForAllRestartsEverySibling ].
-        self runTest: #testRestForOneRestartsOnlyTheSuffix do: [ self testRestForOneRestartsOnlyTheSuffix ].
-        self runTest: #testRestForOneAtLastPositionIsLocal do: [ self testRestForOneAtLastPositionIsLocal ].
-        self runTest: #testOneForAllSkipsTemporaryOnRestart do: [ self testOneForAllSkipsTemporaryOnRestart ].
-        self runTest: #testChildSupervisorGiveUpEscalatesAndRestartsFresh do: [ self testChildSupervisorGiveUpEscalatesAndRestartsFresh ].
-        self runTest: #testEscalationStormGivesUpAtRoot do: [ self testEscalationStormGivesUpAtRoot ].
-        self runTest: #testTreeStartStopOrdering do: [ self testTreeStartStopOrdering ].
-        self runTest: #testServiceWorkerCastDelegatesToTheNamedTarget do: [ self testServiceWorkerCastDelegatesToTheNamedTarget ].
-        self runTest: #testServiceWorkerCallNormalReplyCancelsTheDeadline do: [ self testServiceWorkerCallNormalReplyCancelsTheDeadline ].
-        self runTest: #testServiceWorkerCallRpcErrorShapedReplyFunnelsToOnError do: [ self testServiceWorkerCallRpcErrorShapedReplyFunnelsToOnError ].
-        self runTest: #testServiceWorkerCallUnboundOrDeadNameFailsFastSynchronously do: [ self testServiceWorkerCallUnboundOrDeadNameFailsFastSynchronously ].
-        self runTest: #testServiceWorkerSweepFiresTimeoutNotBeforeDeadline do: [ self testServiceWorkerSweepFiresTimeoutNotBeforeDeadline ].
-        self runTest: #testServiceWorkerDeathCrossCheckFailsFastAndSuppressesLateReply do: [ self testServiceWorkerDeathCrossCheckFailsFastAndSuppressesLateReply ].
-        self runTest: #testServiceWorkerNoLeakOverManyMixedOutcomes do: [ self testServiceWorkerNoLeakOverManyMixedOutcomes ].
-        self runTest: #testAfterRestartFiresOnEveryStartWithTheFreshHandle do: [ self testAfterRestartFiresOnEveryStartWithTheFreshHandle ].
-        self cleanupHooks
-    ]
+    "SUnit runs tearDown after EVERY test, which is what these hooks want:
+     they are process-global, and a test that leaves one set corrupts whoever
+     runs next. `runAll` used to clear them once at the very end, which was
+     enough only because SUnit-lite ran the class in a fixed listed order —
+     reflection runs tests sorted, and a leaked `spawnHook:` then broke
+     `testDiedFallsThroughWithoutSupervision`."
+    tearDown [ self cleanupHooks ]
 
     "── shared setup/teardown ─────────────────────────────────────────────"
-    freshTree [
+    "Every test starts from pristine process-global state. This used to be
+     true only by accident: `testDiedFallsThroughWithoutSupervision` resets
+     nothing and passed because `runAll` listed it FIRST. Reflection runs
+     tests sorted, so it ran after tests that had left a registered
+     supervisor, and the death it expects to fall through was supervised."
+    setUp [ self resetState ]
+
+    resetState [
         FakeWorkerHandle resetLog.
         FakeClock reset.
         WorkerNames reset.
-        SupervisorRegistry reset.
+        SupervisorRegistry reset
+    ]
+
+    freshTree [
+        self resetState.
         WorkerSupervisor spawnHook: [:src | FakeWorkerHandle spawnedWith: src ].
         WorkerSupervisor clockHook: [ FakeClock now ]
     ]

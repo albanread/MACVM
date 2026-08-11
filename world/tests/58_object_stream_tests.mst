@@ -9,22 +9,6 @@
  OrderedCollection>>shallowCopy shares its internal array."
 
 TestCase subclass: ObjectStreamTests [
-    runAll [
-        self runTest: #testSpeciesFixesSymbolCopying
-             do: [ self testSpeciesFixesSymbolCopying ].
-        self runTest: #testDeepCopyIsGenuinelyIndependent
-             do: [ self testDeepCopyIsGenuinelyIndependent ].
-        self runTest: #testDeepCopySurvivesCycles do: [ self testDeepCopySurvivesCycles ].
-        self runTest: #testDeepCopyLeavesAtomsAlone
-             do: [ self testDeepCopyLeavesAtomsAlone ].
-        self runTest: #testDeepCopyDictionaryKeysStayFindable
-             do: [ self testDeepCopyDictionaryKeysStayFindable ].
-        self runTest: #testStoreString do: [ self testStoreString ].
-        self runTest: #testTypePredicates do: [ self testTypePredicates ].
-        self runTest: #testReadStreamGaps do: [ self testReadStreamGaps ].
-        self runTest: #testWriteStreamGaps do: [ self testWriteStreamGaps ].
-    ]
-
     "The bug species was added for: String's copy producers built their
      result with `self class new:`, which for a Symbol asks for a Symbol,
      and Symbols are immutable."

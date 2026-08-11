@@ -3,15 +3,6 @@
  error is skipped (would kill the run; no should:raise: until S18)."
 
 TestCase subclass: OrderedCollectionTests [
-    runAll [
-        self runTest: #testAddOrdering do: [ self testAddOrdering ].
-        self runTest: #testGrowthPastCapacity do: [ self testGrowthPastCapacity ].
-        self runTest: #testRemove do: [ self testRemove ].
-        self runTest: #testProtocol do: [ self testProtocol ].
-        self runTest: #testFirstLast do: [ self testFirstLast ].
-        self runTest: #testPrintString do: [ self testPrintString ].
-    ]
-
     testAddOrdering [
         | oc |
         oc := OrderedCollection new.

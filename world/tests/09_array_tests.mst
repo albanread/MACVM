@@ -1,14 +1,6 @@
 "09_array_tests.mst — ArrayTests (tests_s06.md '09 ArrayTests')."
 
 TestCase subclass: ArrayTests [
-    runAll [
-        self runTest: #testLiterals do: [ self testLiterals ].
-        self runTest: #testAtAndBounds do: [ self testAtAndBounds ].
-        self runTest: #testIteration do: [ self testIteration ].
-        self runTest: #testCopyConcatEquality do: [ self testCopyConcatEquality ].
-        self runTest: #testPrintOn do: [ self testPrintOn ].
-    ]
-
     testLiterals [
         self assert: #(1 2 3) size = 3.
         self assert: (#(1 #(2 3) 4) at: 2) = #(2 3).

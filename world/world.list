@@ -232,3 +232,7 @@
 # deepCopy, storeOn:/storeString, the missing type predicates, and
 # ReadStream contents/skipTo:/collect: + WriteStream position/reset.
 84_object_stream_completion.mst
+# SUnit (docs/sunit_design.md): tests for the world, written in the world.
+# TestCase/TestFailure/TestResult/TestRunner. Loads last in the world list so
+# a test file in tests.list can subclass TestCase.
+86_sunit.mst

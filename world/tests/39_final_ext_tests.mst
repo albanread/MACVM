@@ -2,13 +2,6 @@
  constants, and Association ordering (world/58_final_ext.mst)."
 
 TestCase subclass: FinalExtTests [
-    runAll [
-        self runTest: #testLog do: [ self testLog ].
-        self runTest: #testFloorLog do: [ self testFloorLog ].
-        self runTest: #testStringConstants do: [ self testStringConstants ].
-        self runTest: #testAssociationOrder do: [ self testAssociationOrder ].
-    ]
-
     testLog [
         self assert: 100 log = 2.0.
         self assert: (8 log: 2) = 3.0.

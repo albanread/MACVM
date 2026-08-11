@@ -2,15 +2,6 @@
  Symbol/String conveniences added in world/54_object_ext.mst."
 
 TestCase subclass: ObjectExtTests [
-    runAll [
-        self runTest: #testAsString do: [ self testAsString ].
-        self runTest: #testPrintReturnsSelf do: [ self testPrintReturnsSelf ].
-        self runTest: #testBooleanLogic do: [ self testBooleanLogic ].
-        self runTest: #testCharacterTo do: [ self testCharacterTo ].
-        self runTest: #testSymbolNumArgs do: [ self testSymbolNumArgs ].
-        self runTest: #testStringWith do: [ self testStringWith ].
-    ]
-
     testAsString [
         self assert: 3 asString = '3'.
         self assert: (3/4) asString = '3/4'.

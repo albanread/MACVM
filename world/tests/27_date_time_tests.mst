@@ -4,26 +4,6 @@
  (see 30_date_time.mst's own header for exactly why)."
 
 TestCase subclass: DateTimeTests [
-    runAll [
-        self runTest: #testDateConstructionAndAccessors do: [ self testDateConstructionAndAccessors ].
-        self runTest: #testDateFromMonthName do: [ self testDateFromMonthName ].
-        self runTest: #testDayAndMonthNameLookup do: [ self testDayAndMonthNameLookup ].
-        self runTest: #testDateComparisonByYear do: [ self testDateComparisonByYear ].
-        self runTest: #testDateComparisonByMonth do: [ self testDateComparisonByMonth ].
-        self runTest: #testDateComparisonByDay do: [ self testDateComparisonByDay ].
-        self runTest: #testDateEquality do: [ self testDateEquality ].
-        self runTest: #testDateEqualityAgainstNonDate do: [ self testDateEqualityAgainstNonDate ].
-        self runTest: #testDateHashStable do: [ self testDateHashStable ].
-        self runTest: #testDatePrintString do: [ self testDatePrintString ].
-        self runTest: #testTimeFromSecondsAndAccessors do: [ self testTimeFromSecondsAndAccessors ].
-        self runTest: #testTimeMinutes do: [ self testTimeMinutes ].
-        self runTest: #testTimeArithmetic do: [ self testTimeArithmetic ].
-        self runTest: #testTimeComparison do: [ self testTimeComparison ].
-        self runTest: #testTimeEquality do: [ self testTimeEquality ].
-        self runTest: #testTimeEqualityAgainstNonTime do: [ self testTimeEqualityAgainstNonTime ].
-        self runTest: #testTimePrintString do: [ self testTimePrintString ].
-    ]
-
     testDateConstructionAndAccessors [
         | d |
         d := Date newDay: 4 monthIndex: 7 year: 2026.

@@ -6,13 +6,6 @@
  should:raise: until S18, same as StringTests' skip)."
 
 TestCase subclass: SymbolTests [
-    runAll [
-        self runTest: #testInterningIdentity do: [ self testInterningIdentity ].
-        self runTest: #testEqualityAsymmetry do: [ self testEqualityAsymmetry ].
-        self runTest: #testStringRoundTrip do: [ self testStringRoundTrip ].
-        self runTest: #testPrintString do: [ self testPrintString ].
-    ]
-
     testInterningIdentity [
         self assert: #foo == #foo.
         self assert: 'foo' asSymbol == #foo.

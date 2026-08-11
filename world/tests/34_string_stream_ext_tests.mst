@@ -4,18 +4,10 @@
 
 TestCase subclass: StringStreamExtTests [
     | nl |
-    runAll [
-        nl := Character value: 10.
-        self runTest: #testTrim do: [ self testTrim ].
-        self runTest: #testCapitalized do: [ self testCapitalized ].
-        self runTest: #testIncludesSubstring do: [ self testIncludesSubstring ].
-        self runTest: #testSubStrings do: [ self testSubStrings ].
-        self runTest: #testAsNumber do: [ self testAsNumber ].
-        self runTest: #testStreamContents do: [ self testStreamContents ].
-        self runTest: #testReadNext do: [ self testReadNext ].
-        self runTest: #testUpTo do: [ self testUpTo ].
-        self runTest: #testPeekForNextLine do: [ self testPeekForNextLine ].
-    ]
+    "SUnit gives every test its OWN instance, so shared setup belongs here.
+     This used to be the first line of `runAll`, which worked only because
+     SUnit-lite ran a whole class on ONE instance."
+    setUp [ nl := Character value: 10 ]
 
     testTrim [
         self assert: '  hi there  ' trimSeparators = 'hi there'.

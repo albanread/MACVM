@@ -8,36 +8,6 @@
  a test that fails on a library revision rather than on a bug."
 
 TestCase subclass: NumericCompletionTests [
-    runAll [
-        self runTest: #testSignPredicates do: [ self testSignPredicates ].
-        self runTest: #testTranscendentalsOnIntegers
-             do: [ self testTranscendentalsOnIntegers ].
-        self runTest: #testTranscendentalsOnFractions
-             do: [ self testTranscendentalsOnFractions ].
-        self runTest: #testArcSinCos do: [ self testArcSinCos ].
-        self runTest: #testArcTanTwoArgQuadrants do: [ self testArcTanTwoArgQuadrants ].
-        self runTest: #testDegreesRadians do: [ self testDegreesRadians ].
-        self runTest: #testBitAt do: [ self testBitAt ].
-        self runTest: #testIsPowerOfTwoAndHighBit do: [ self testIsPowerOfTwoAndHighBit ].
-        self runTest: #testSqrtFloorIsExact do: [ self testSqrtFloorIsExact ].
-        self runTest: #testIntegerBaseAndCharacter do: [ self testIntegerBaseAndCharacter ].
-        self runTest: #testDoubleSpecialValues do: [ self testDoubleSpecialValues ].
-        self runTest: #testStringLines do: [ self testStringLines ].
-        self runTest: #testSymbolShape do: [ self testSymbolShape ].
-        self runTest: #testCharacterProtocol do: [ self testCharacterProtocol ].
-        self runTest: #testIfNilIsReflective do: [ self testIfNilIsReflective ].
-        self runTest: #testAssert do: [ self testAssert ].
-        self runTest: #testPointTranspose do: [ self testPointTranspose ].
-        self runTest: #testLargeIntegerDivision do: [ self testLargeIntegerDivision ].
-        self runTest: #testLargeIntegerDivisorNearShortDivisionFence
-             do: [ self testLargeIntegerDivisorNearShortDivisionFence ].
-        self runTest: #testLargeIntegerFlooredSigns
-             do: [ self testLargeIntegerFlooredSigns ].
-        self runTest: #testLargeIntegerDerivedProtocol
-             do: [ self testLargeIntegerDerivedProtocol ].
-        self runTest: #testLargeIntegerBits do: [ self testLargeIntegerBits ].
-    ]
-
     "Float helper: transcendentals are approximations, so every float
      assertion here is a tolerance test."
     close: a to: b [ ^(a - b) abs < 0.000001 ]

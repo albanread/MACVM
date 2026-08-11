@@ -13,21 +13,6 @@
    values are in bounds."
 
 TestCase subclass: ClockCompletionTests [
-    runAll [
-        self runTest: #testEpochDayVectors do: [ self testEpochDayVectors ].
-        self runTest: #testCivilRoundTrip do: [ self testCivilRoundTrip ].
-        self runTest: #testPreEpochDates do: [ self testPreEpochDates ].
-        self runTest: #testLeapYears do: [ self testLeapYears ].
-        self runTest: #testDayOfWeek do: [ self testDayOfWeek ].
-        self runTest: #testDayOfYearAndDaysInMonth
-             do: [ self testDayOfYearAndDaysInMonth ].
-        self runTest: #testDateArithmetic do: [ self testDateArithmetic ].
-        self runTest: #testTimeFromEpochSeconds do: [ self testTimeFromEpochSeconds ].
-        self runTest: #testLiveClockIsSelfConsistent
-             do: [ self testLiveClockIsSelfConsistent ].
-        self runTest: #testLiveValuesAreInRange do: [ self testLiveValuesAreInRange ].
-    ]
-
     "Fixed vectors, every one of them cross-checked against the system
      `date` command rather than against this implementation."
     testEpochDayVectors [

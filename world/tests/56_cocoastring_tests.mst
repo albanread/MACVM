@@ -10,27 +10,6 @@
  binary (Foundation is dlopen'd), so NSString is reachable without a GUI."
 
 TestCase subclass: CocoaStringTests [
-    runAll [
-        self runTest: #testSizeIsUtf16NotBytes do: [ self testSizeIsUtf16NotBytes ].
-        self runTest: #testIndexingMatchesNsString
-             do: [ self testIndexingMatchesNsString ].
-        self runTest: #testAstralPlaneAndCodePoints
-             do: [ self testAstralPlaneAndCodePoints ].
-        self runTest: #testRangesAreZeroBasedUtf16
-             do: [ self testRangesAreZeroBasedUtf16 ].
-        self runTest: #testAbsentSubstringAnswersNil
-             do: [ self testAbsentSubstringAnswersNil ].
-        self runTest: #testConversionRoundTrips do: [ self testConversionRoundTrips ].
-        self runTest: #testOrdinaryStringProtocol do: [ self testOrdinaryStringProtocol ].
-        self runTest: #testCaseConversionIsUnicodeAware
-             do: [ self testCaseConversionIsUnicodeAware ].
-        self runTest: #testComparison do: [ self testComparison ].
-        self runTest: #testMutability do: [ self testMutability ].
-        self runTest: #testAcceptsEitherSpecies do: [ self testAcceptsEitherSpecies ].
-        self runTest: #testInvalidUtf8RaisesAtTheBoundary
-             do: [ self testInvalidUtf8RaisesAtTheBoundary ].
-    ]
-
     "The headline disagreement, asserted from both sides."
     testSizeIsUtf16NotBytes [
         self assert: 'café' size equals: 5.              "bytes"

@@ -1,15 +1,6 @@
 "10_bytearray_tests.mst — ByteArrayTests (tests_s06.md '10 ByteArrayTests')."
 
 TestCase subclass: ByteArrayTests [
-    runAll [
-        self runTest: #testLiteral do: [ self testLiteral ].
-        self runTest: #testAtAndPut do: [ self testAtAndPut ].
-        self runTest: #testCopyFromTo do: [ self testCopyFromTo ].
-        self runTest: #testHashEquality do: [ self testHashEquality ].
-        self runTest: #testCollect do: [ self testCollect ].
-        self runTest: #testPrintString do: [ self testPrintString ].
-    ]
-
     testLiteral [
         self assert: #[1 2 255] size = 3.
         self assert: (#[1 2 255] at: 3) = 255.

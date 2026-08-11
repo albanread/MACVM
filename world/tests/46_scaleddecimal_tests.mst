@@ -6,16 +6,6 @@
  the larger scale winning, and equality is by value across the exact tower."
 
 TestCase subclass: ScaledDecimalTests [
-    runAll [
-        self runTest: #testLiteralFormsAndClass do: [ self testLiteralFormsAndClass ].
-        self runTest: #testPrintingRoundTrip do: [ self testPrintingRoundTrip ].
-        self runTest: #testExactness do: [ self testExactness ].
-        self runTest: #testStickyScaledArithmetic do: [ self testStickyScaledArithmetic ].
-        self runTest: #testValueEquality do: [ self testValueEquality ].
-        self runTest: #testComparisonsAndConversion do: [ self testComparisonsAndConversion ].
-        self runTest: #testIntegerExponentLiterals do: [ self testIntegerExponentLiterals ].
-    ]
-
     testLiteralFormsAndClass [
         self assert: 3.14s2 class == ScaledDecimal.
         self assert: 100s2 class == ScaledDecimal.      "integer form"

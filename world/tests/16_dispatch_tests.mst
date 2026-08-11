@@ -33,15 +33,6 @@ Object subclass: DnuCatcher [
 ]
 
 TestCase subclass: DispatchTests [
-    runAll [
-        self runTest: #testSuperChain do: [ self testSuperChain ].
-        self runTest: #testDnuHandler do: [ self testDnuHandler ].
-        self runTest: #testEnsureOrderThroughTwoFrames
-            do: [ self testEnsureOrderThroughTwoFrames ].
-        self runTest: #testIfCurtailedBothPaths
-            do: [ self testIfCurtailedBothPaths ].
-    ]
-
     "Each override adds its increment to the inherited result — proves super
      binds to the DEFINING class's superclass, not the receiver's."
     testSuperChain [

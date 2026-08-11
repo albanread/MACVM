@@ -93,13 +93,18 @@ fn suite_green() {
 
     assert_eq!(vm.exit_code, Some(0), "stdout so far:\n{}", buf.as_string());
     let out = buf.as_string();
+    // `TestResult>>summaryLine` (world/86_sunit.mst) — the one line every
+    // caller parses: "N run, F failures, E errors, T ms". SUnit-lite's
+    // "N run, M failed" is gone with it; its N counted ASSERTIONS, this one
+    // counts TESTS, which is why the floor below is a floor and not an
+    // equality.
     let report_line = out
         .lines()
-        .find(|l| l.ends_with("failed"))
-        .unwrap_or_else(|| panic!("no '... failed' report line in:\n{out}"));
+        .find(|l| l.contains(" run, ") && l.contains(" errors, "))
+        .unwrap_or_else(|| panic!("no summary line in:\n{out}"));
     assert!(
-        report_line.ends_with(", 0 failed"),
-        "expected 0 failures, got: {report_line}"
+        report_line.contains(", 0 failures, 0 errors,"),
+        "expected a green run, got: {report_line}"
     );
     let run_count: u64 = report_line
         .split(' ')
@@ -108,7 +113,7 @@ fn suite_green() {
         .unwrap_or_else(|| panic!("couldn't parse run count from: {report_line}"));
     assert!(
         run_count >= 200,
-        "expected >= 200 assertions run, got {run_count}"
+        "expected >= 200 tests run, got {run_count}"
     );
 }
 
@@ -184,12 +189,11 @@ fn deliberately_failing_assertion_fails_the_run() {
     let buf = OutputBuffer::new();
     vm.out = Box::new(buf.clone());
     world::load_world(&mut vm, &world_dir()).expect("load_world");
-    let dir = world_dir().join("tests");
-    world::load_file(&mut vm, &dir.join("00_sunit.mst")).expect("load 00_sunit.mst");
-
+    // SUnit itself comes from the WORLD now (world/86_sunit.mst) — there is
+    // no separate framework file to load. Tests are found by reflection, so
+    // the probe is just a `test*` method.
     let src = "TestCase subclass: DeliberatelyFailingTests [\n\
-        runAll [ self runTest: #testBoom do: [ self testBoom ] ]\n\
-        testBoom [ self assert: 1 = 2 ]\n\
+        testBoom [ self assert: 1 equals: 2 ]\n\
     ]\n\
     TestRunner start.\n\
     TestRunner run: DeliberatelyFailingTests.\n\

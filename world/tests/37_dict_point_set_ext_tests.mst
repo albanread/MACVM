@@ -2,15 +2,6 @@
  convenience added in world/56_dict_point_set_ext.mst."
 
 TestCase subclass: DictPointSetExtTests [
-    runAll [
-        self runTest: #testDictPresent do: [ self testDictPresent ].
-        self runTest: #testKeyAtValue do: [ self testKeyAtValue ].
-        self runTest: #testAssociations do: [ self testAssociations ].
-        self runTest: #testPointDist do: [ self testPointDist ].
-        self runTest: #testPointDot do: [ self testPointDot ].
-        self runTest: #testSetAlgebra do: [ self testSetAlgebra ].
-    ]
-
     dict [ ^Dictionary new at: #a put: 1; at: #b put: 2; at: #c put: 3; yourself ]
 
     testDictPresent [

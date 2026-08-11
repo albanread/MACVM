@@ -6,22 +6,6 @@
  objects the way a computed concatenation result is)."
 
 TestCase subclass: IdentityCollectionsTests [
-    runAll [
-        self runTest: #testEqualButDistinctStringsSetUp do: [ self testEqualButDistinctStringsSetUp ].
-        self runTest: #testIdentitySetKeepsBothEqualDistinctObjects do: [ self testIdentitySetKeepsBothEqualDistinctObjects ].
-        self runTest: #testPlainSetCollapsesEqualObjects do: [ self testPlainSetCollapsesEqualObjects ].
-        self runTest: #testIdentitySetIncludesIsIdentityBased do: [ self testIdentitySetIncludesIsIdentityBased ].
-        self runTest: #testIdentitySetDedupsTheSameObject do: [ self testIdentitySetDedupsTheSameObject ].
-        self runTest: #testIdentityDictionaryKeepsBothEqualDistinctKeys do: [ self testIdentityDictionaryKeepsBothEqualDistinctKeys ].
-        self runTest: #testIdentityDictionaryLookupIsIdentityBased do: [ self testIdentityDictionaryLookupIsIdentityBased ].
-        self runTest: #testIdentityDictionarySameKeyObjectOverwrites do: [ self testIdentityDictionarySameKeyObjectOverwrites ].
-        self runTest: #testIdentityDictionaryGrowthPastCapacity do: [ self testIdentityDictionaryGrowthPastCapacity ].
-        self runTest: #testIdentitySetGrowthPastCapacity do: [ self testIdentitySetGrowthPastCapacity ].
-        self runTest: #testIdentityDictionaryPrintString do: [ self testIdentityDictionaryPrintString ].
-        self runTest: #testIdentitySetPrintString do: [ self testIdentitySetPrintString ].
-        self runTest: #testWorksWithSmallIntegerKeysToo do: [ self testWorksWithSmallIntegerKeysToo ].
-    ]
-
     testEqualButDistinctStringsSetUp [
         | s1 s2 |
         s1 := 'hel', 'lo'.

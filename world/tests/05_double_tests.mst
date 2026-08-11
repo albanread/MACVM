@@ -1,14 +1,6 @@
 "05_double_tests.mst — DoubleTests (tests_s06.md '05 DoubleTests')."
 
 TestCase subclass: DoubleTests [
-    runAll [
-        self runTest: #testArithLiterals do: [ self testArithLiterals ].
-        self runTest: #testMixedCoercion do: [ self testMixedCoercion ].
-        self runTest: #testMathOps do: [ self testMathOps ].
-        self runTest: #testComparisons do: [ self testComparisons ].
-        self runTest: #testPrintString do: [ self testPrintString ].
-    ]
-
     testArithLiterals [
         self assert: 3.14 class == Double.
         "Squeak exponent semantics (changed 2026-07): a bare-`e` integer

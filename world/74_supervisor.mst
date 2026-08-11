@@ -303,7 +303,17 @@ Object subclass: SupervisorRegistry [
     "Test/boot seam: forget every owner. The onWorkerDied: hook stays
      installed (harmless: an empty table routes every death to the
      unsupervised log line)."
-    SupervisorRegistry class >> reset [ Owners := Dictionary new ]
+    SupervisorRegistry class >> reset [
+        "Reset ALL of it, including the seam. `ensureInstalled` latches on
+         `Installed`, so clearing only `Owners` left `Worker`'s DiedHandler
+         armed for the life of the image with no way to re-arm it — and
+         `dispatchOne:` routes a death shape-first, so an armed seam swallows
+         deaths that nothing supervises. A half-reset is worse than none:
+         whether a death falls through then depended on what had run earlier."
+        Owners := Dictionary new.
+        Installed := false.
+        Worker onWorkerDied: nil
+    ]
 ]
 
 "I am an OTP-style supervisor: I own an ordered list of child WorkerSpecs,

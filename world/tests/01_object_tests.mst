@@ -1,17 +1,6 @@
 "01_object_tests.mst — ObjectTests (tests_s06.md '01 ObjectTests')."
 
 TestCase subclass: ObjectTests [
-    runAll [
-        self runTest: #testIdentity do: [ self testIdentity ].
-        self runTest: #testEqualityDefault do: [ self testEqualityDefault ].
-        self runTest: #testHash do: [ self testHash ].
-        self runTest: #testNilChecks do: [ self testNilChecks ].
-        self runTest: #testYourself do: [ self testYourself ].
-        self runTest: #testClass do: [ self testClass ].
-        self runTest: #testKindOf do: [ self testKindOf ].
-        self runTest: #testAssociation do: [ self testAssociation ].
-    ]
-
     testIdentity [
         | a b |
         a := Object new.
