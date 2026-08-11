@@ -1552,6 +1552,22 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 275,
+        name: "GamePane>>paletteMemory",
+        f: prim_game_palette_memory,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 276,
+        name: "GamePane>>paletteGlobalBase",
+        f: prim_game_palette_global_base,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -2072,6 +2088,38 @@ fn prim_game_text_rows(_vm: &mut VmState, _args: &[Oop]) -> PrimResult {
         return PrimResult::Fail;
     };
     PrimResult::Ok(SmallInt::new(rows as i64).oop())
+}
+
+/// `paletteMemory` (275): the palette itself as a length-bounded `Alien` —
+/// RGBA bytes, four per entry (SM4, docs/DIRECT_SCREEN.md).
+///
+/// The last bulk state that still travelled as commands. Copper bars rewrite
+/// what colour index 1 means on every one of 240 scanlines each frame; through
+/// `linePaletteAt:` that is 240 commands a frame, and through here it is 960
+/// byte stores and none.
+///
+/// Entry `y * 16 + i` is line `y`'s colour `i` (1..15); entry
+/// `paletteGlobalBase + c - 16` is global colour `c` (16..255).
+fn prim_game_palette_memory(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    let Some((ptr, entries, _)) = crate::embed::palette_memory() else {
+        return PrimResult::Fail;
+    };
+    let bytes = entries.saturating_mul(4);
+    if bytes == 0 {
+        return PrimResult::Fail;
+    }
+    PrimResult::Ok(crate::runtime::alien::make_indirect_alien(
+        vm, ptr as u64, bytes,
+    ))
+}
+
+/// `paletteGlobalBase` (276): the ENTRY index at which the 240 global colours
+/// begin — `viewportHeight * 16`, but a demo should ask rather than assume.
+fn prim_game_palette_global_base(_vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    let Some((_, _, base)) = crate::embed::palette_memory() else {
+        return PrimResult::Fail;
+    };
+    PrimResult::Ok(SmallInt::new(base as i64).oop())
 }
 
 /// `linePaletteAt:index:rgb:` (261): per-scanline palette override. Colour is a
@@ -5514,6 +5562,8 @@ mod tests {
             (272, "GamePane>>textCols"),
             (273, "GamePane>>textRows"),
             (274, "replaceFrom:to:with:startingAt:"),
+            (275, "GamePane>>paletteMemory"),
+            (276, "GamePane>>paletteGlobalBase"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

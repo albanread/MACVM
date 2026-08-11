@@ -165,8 +165,13 @@ Object subclass: Copper [
             pane cls: 1.
             painted := true.
             self drawHud ].
+        "Rewrite what colour index 1 MEANS on each of the 240 scanlines -
+         straight into the palette buffer (SM4). This used to be 240
+         `linePaletteAt:` commands a frame, which was the last bulk state in
+         this engine still travelling as commands; it is now 960 byte stores
+         and none."
         0 to: Copper height - 1 do: [ :y |
-            pane linePaletteAt: y index: 1 rgb: (self lineColour: y) ].
+            pane lineMemoryAt: y index: 1 put: (self lineColour: y) ].
         t := t + 3.
         pane present.
         ^self
@@ -181,7 +186,7 @@ Object subclass: Copper [
              at: 1 row: 1 color: GamePane lightGrey.
         "53 cells wide, so this line has to fit in 52 from column 1 - the
          plane clips rather than wrapping, silently."
-        pane textPut: '240 POKES A FRAME  SPACE RECOLOURS  ESC QUITS'
+        pane textPut: '960 BYTES A FRAME  SPACE RECOLOURS  ESC QUITS'
              at: 1 row: 28 color: GamePane lightGrey.
         ^self
     ]

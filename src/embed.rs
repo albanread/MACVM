@@ -608,6 +608,47 @@ pub(crate) fn text_memory() -> Option<(*mut u8, usize, usize)> {
     ))
 }
 
+// The PALETTE, published like the two planes above (SM4). The last piece of
+// per-frame state that still travelled as commands: copper bars rewrite what a
+// colour MEANS on each of 240 scanlines every frame, which was 240
+// `linePaletteAt:` commands a second-and-a-half's worth of channel traffic for
+// something that is, in the end, 960 bytes.
+//
+// Entries are RGBA BYTES. Layout, which a writer must know: `height` groups of
+// 16 PER-LINE entries first (line `y`, index `i` in 1..15, is entry
+// `y * 16 + i`), then 240 GLOBAL entries (index `c` in 16..255 is entry
+// `globalBase + c - 16`).
+static PALETTE_PTR: AtomicUsize = AtomicUsize::new(0);
+static PALETTE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+static PALETTE_GLOBAL_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// Publish the palette buffer. The host also tells its pane that the guest now
+/// owns it, so the pane stops uploading a CPU copy over the guest's writes.
+pub fn publish_palette_memory(ptr: *mut u8, entries: usize, global_base: usize) {
+    PALETTE_ENTRIES.store(entries, Ordering::Relaxed);
+    PALETTE_GLOBAL_BASE.store(global_base, Ordering::Relaxed);
+    PALETTE_PTR.store(ptr as usize, Ordering::Release);
+}
+
+pub fn clear_palette_memory() {
+    PALETTE_PTR.store(0, Ordering::Release);
+    PALETTE_ENTRIES.store(0, Ordering::Relaxed);
+    PALETTE_GLOBAL_BASE.store(0, Ordering::Relaxed);
+}
+
+/// `(ptr, entries, global_base)`, or `None` when no pane is open.
+pub(crate) fn palette_memory() -> Option<(*mut u8, usize, usize)> {
+    let p = PALETTE_PTR.load(Ordering::Acquire);
+    if p == 0 {
+        return None;
+    }
+    Some((
+        p as *mut u8,
+        PALETTE_ENTRIES.load(Ordering::Relaxed),
+        PALETTE_GLOBAL_BASE.load(Ordering::Relaxed),
+    ))
+}
+
 /// Where game-primitive commands go — the game analogue of [`TranscriptSink`].
 /// `Send` because the GUI's sink hands commands across the worker-to-main
 /// thread channel, exactly like the transcript sink hands text.
@@ -2663,6 +2704,81 @@ mod tests {
         crate::embed::clear_screen_memory();
         assert_eq!(vm.eval("GamePane new screenMemory.").unwrap(), "nil");
         assert_eq!(vm.eval("GamePane new screenStride.").unwrap(), "nil");
+    }
+
+    #[test]
+    fn the_palette_is_memory_too_and_costs_no_commands() {
+        // SM4, and the end of the arc: the palette was the last bulk state
+        // still travelling as commands. A copper effect rewrites what a colour
+        // MEANS on all 240 scanlines every frame — 240 commands through
+        // `linePaletteAt:`, and none at all through here.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _published = PublishedMemory;
+
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+        // The real layout: 240 lines of 16 per-line entries, then 240 globals.
+        const HEIGHT: usize = 240;
+        const GLOBAL_BASE: usize = HEIGHT * 16;
+        const ENTRIES: usize = GLOBAL_BASE + 240;
+        let pal = leaked_screen(ENTRIES * 4);
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+
+        assert_eq!(vm.eval("GamePane basicNew paletteMemory.").unwrap(), "nil");
+        crate::embed::publish_palette_memory(pal.as_mut_ptr(), ENTRIES, GLOBAL_BASE);
+        assert_eq!(
+            vm.eval("GamePane basicNew paletteGlobalBase.").unwrap(),
+            GLOBAL_BASE.to_string(),
+            "a demo must be able to ASK where the globals start"
+        );
+
+        // Rewrite one colour on every scanline — the copper case — and count
+        // what it cost on the channel.
+        captured.lock().unwrap().clear();
+        vm.exec(
+            "[ :p | 0 to: 239 do: [ :y | \
+                 p lineMemoryAt: y index: 1 put: (y * 1000) + 66 ] ] \
+               value: GamePane basicNew.",
+        )
+        .expect("writing 240 scanline colours must run");
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "240 scanline colours must cost NO commands — that is the slice"
+        );
+
+        // The bytes really landed, at `y * 16 + index`, as R G B A.
+        for y in [0usize, 1, 137, 239] {
+            let rgb = (y * 1000 + 66) as u32;
+            let at = ((y * 16) + 1) * 4;
+            assert_eq!(pal[at], ((rgb >> 16) & 255) as u8, "line {y} red");
+            assert_eq!(pal[at + 1], ((rgb >> 8) & 255) as u8, "line {y} green");
+            assert_eq!(pal[at + 2], (rgb & 255) as u8, "line {y} blue");
+            assert_eq!(pal[at + 3], 255, "line {y} must stay opaque");
+        }
+
+        // A global colour lands after every line's sixteen.
+        vm.exec("GamePane basicNew paletteMemoryAt: GamePane basicNew paletteGlobalBase + 4 put: 16711935.")
+            .expect("writing a global colour must run");
+        let at = (GLOBAL_BASE + 4) * 4;
+        assert_eq!([pal[at], pal[at + 1], pal[at + 2]], [255, 0, 255]);
+
+        // And it is length-bounded like every other Alien: writing past the
+        // end of the palette cannot corrupt whatever follows it.
+        let last = (ENTRIES - 1) * 4;
+        let before = pal[last];
+        vm.exec(&format!(
+            "GamePane basicNew paletteMemoryAt: {} put: 123456.",
+            ENTRIES + 10
+        ))
+        .expect("an out-of-range entry must be refused quietly");
+        assert_eq!(pal[last], before, "a wild entry must not land anywhere");
     }
 
     #[test]

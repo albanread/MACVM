@@ -195,6 +195,9 @@ fn ensure_pane() {
         // The text plane is built with the pane and lives as long as it. An
         // untouched grid draws nothing, so this is free for every demo that
         // does not use it, and instantly there for every demo that does.
+        let pane_palette_ptr = pane.palette_ptr();
+        let pane_palette_entries = pane.palette_entries();
+        let pane_palette_global_base = pane.palette_global_base();
         let text_plane = TextPlane::new(&win.device, w, h).ok();
         if let Some(tp) = text_plane.as_ref() {
             macvm::embed::publish_text_memory(tp.cells_ptr(), tp.cols() as usize, tp.rows() as usize);
@@ -212,6 +215,19 @@ fn ensure_pane() {
             h,
             timer: objc::NIL,
         });
+        // Publish the palette buffer too (SM4): a demo can rewrite colours —
+        // including all 240 per-scanline entries, every frame — with byte
+        // stores instead of a command each. No coordination is needed with
+        // `paletteAt:`, because the pane's setters write THIS SAME buffer:
+        // there is one palette and no CPU mirror, so there is nothing that
+        // could copy stale colours over a demo's work. Published at creation
+        // because the buffer lives as long as the pane and never moves.
+        macvm::embed::publish_palette_memory(
+            pane_palette_ptr,
+            pane_palette_entries,
+            pane_palette_global_base,
+        );
+
         // Start this session with a clean held-key table. HELD_KEYS is only
         // cleared by a keyUp: delivered to the game's OWN view, so an Escape
         // that closed the PREVIOUS demo — its keyUp: has nowhere to go, since
@@ -290,6 +306,7 @@ fn close_window() {
     // is about to be freed.
     macvm::embed::clear_screen_memory();
     macvm::embed::clear_text_memory();
+    macvm::embed::clear_palette_memory();
     // Forget where the mouse was; the next demo's first frame should not see a
     // pointer position left behind by this one.
     GAME_MOUSE_X.store(-1, Ordering::Release);

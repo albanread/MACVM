@@ -447,6 +447,55 @@ Object subclass: GamePane [
         ^self
     ]
 
+    "--- the palette, as memory (docs/DIRECT_SCREEN.md SM4) ---
+     The colour table itself, as RGBA bytes, four per entry - so a demo can
+     rewrite colours with stores instead of a command each. That matters most
+     for the PER-SCANLINE entries: a copper effect rewrites what a colour
+     means on every scanline every frame, which is 240 commands a frame
+     through linePaletteAt: and none at all through here.
+
+     Layout: `height` groups of 16 per-line entries first, so line `y` colour
+     `i` (1..15) is entry `y * 16 + i`; then the 240 global entries, so colour
+     `c` (16..255) is entry `paletteGlobalBase + c - 16`. Within an entry the
+     bytes are red, green, blue, alpha. Leave alpha at 255.
+
+     paletteAt:r:g:b: and linePaletteAt:... still work and write the very same
+     buffer - there is one palette and no copy of it anywhere, which is what
+     stops a per-frame upload ever clobbering what a demo wrote."
+
+    paletteMemory [
+        "The palette as an Alien of RGBA bytes; nil with no pane open."
+        <primitive: 275>
+        ^nil
+    ]
+    paletteGlobalBase [
+        "The ENTRY index where the 240 global colours begin. Ask rather than
+         assume: it is the viewport height times sixteen."
+        <primitive: 276>
+        ^nil
+    ]
+
+    paletteMemoryAt: entry put: rgb [
+        "Write one palette ENTRY from a packed 0xRRGGBB, straight into the
+         buffer. The unit is an ENTRY, not a byte, because every caller thinks
+         in entries and the times-four is the easy thing to get wrong."
+        | pm base |
+        pm := self paletteMemory.
+        pm isNil ifTrue: [ ^self ].
+        base := entry * 4.
+        pm byteAt: base + 1 put: ((rgb bitShift: -16) bitAnd: 255).
+        pm byteAt: base + 2 put: ((rgb bitShift: -8) bitAnd: 255).
+        pm byteAt: base + 3 put: (rgb bitAnd: 255).
+        pm byteAt: base + 4 put: 255.
+        ^self
+    ]
+
+    lineMemoryAt: line index: i put: rgb [
+        "The per-scanline entry for colour `i` on scanline `line`, written
+         directly. The copper case, and the reason this exists."
+        ^self paletteMemoryAt: (line * 16) + i put: rgb
+    ]
+
     "--- direct screen memory (docs/shared_screen_memory_design.md) ---
      The fast path for a demo that computes every pixel: instead of filling a
      ByteArray and shipping it here with blit:, ask me for the framebuffer
