@@ -8,11 +8,20 @@ test:
 test-release:
     cargo test --release
 
+# The GUI package is a NON-default workspace member (Cargo.toml's
+# `default-members = ["."]`), so a bare `cargo test` never touches it. Its
+# suites are not optional extras: `sunit_bridge.rs` is the ONLY cargo gate on
+# the in-image `tests` package — the framework everything else is measured
+# with — and without this recipe it runs only when somebody remembers to type
+# `macvm-gui test`, which is the wrong way round.
+test-gui:
+    cargo test -p macvm-gui
+
 lint:
     cargo fmt --check
     cargo clippy --all-targets -- -D warnings
 
-ci: lint test
+ci: lint test test-gui
 
 # Sprint acceptance gates. Later sprints append stress runs to their gate
 # (e.g. `MACVM_GC_STRESS=1 just test` from S7 on).
