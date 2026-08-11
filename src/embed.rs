@@ -2707,6 +2707,66 @@ mod tests {
     }
 
     #[test]
+    fn an_override_is_not_bypassed_once_its_super_target_compiles() {
+        // REGRESSION, and the worst kind: a SILENT WRONG ANSWER in the
+        // commonest constructor idiom Smalltalk has.
+        //
+        //     Foo class >> new [ ^super new initFoo ]
+        //
+        // An nmethod is installed under `(rcvr_klass, selector)` — customized —
+        // and `resolve_target_entry` links a send straight to whatever
+        // `code_table.lookup(receiver_klass, selector)` answers. So that key is
+        // a CLAIM: "sending `selector` to an instance of `rcvr_klass` runs this
+        // method." A super send breaks it. `super new` runs `Behavior>>new`
+        // with a receiver whose klass is `Foo class`, so the compile trigger
+        // customized `Behavior>>new` for `Foo class` and installed it under
+        // `(Foo class, #new)` — the very key `Foo new` looks up. From then on
+        // `Foo new` linked to `Behavior>>new` and skipped the override
+        // entirely, answering an allocated but UNINITIALIZED instance.
+        //
+        // It began exactly on the call that crossed the threshold, at EVERY
+        // threshold (measured: 2991/3000 wrong at 10, 2001/3000 at 1000), and
+        // `world` itself is written this way (`GameFrame`, `SoundDoc`). The
+        // fix declines to key an nmethod under a (klass, selector) that
+        // resolves to a different method.
+        let mut vm = boot_test_vm(JitMode::Threshold(20));
+        vm.exec(
+            "Object subclass: CtorProbe [ \
+                 | a | \
+                 CtorProbe class >> new [ ^super new initProbe ] \
+                 initProbe [ a := 7. ^self ] \
+                 a [ ^a ] ]",
+        )
+        .expect("the probe must compile");
+
+        // Well past the threshold, so `Behavior>>new` is hot and compiled.
+        let uninitialized = vm
+            .eval(
+                "| bad | bad := 0. \
+                 1 to: 400 do: [ :i | (CtorProbe new a) isNil \
+                     ifTrue: [ bad := bad + 1 ] ]. \
+                 bad.",
+            )
+            .expect("the loop must run");
+        assert_eq!(
+            uninitialized, "0",
+            "every `CtorProbe new` must run the override and initialize; \
+             a non-zero count means compiled sends bypassed `CtorProbe class>>new`"
+        );
+
+        // And the ordinary, non-overridden path must be untouched — a class
+        // that does NOT define `new` still gets `Behavior>>new`.
+        vm.exec("Object subclass: PlainProbe [ ]")
+            .expect("plain probe must compile");
+        assert_eq!(
+            vm.eval("(PlainProbe new isKindOf: PlainProbe) printString.")
+                .unwrap(),
+            "'true'",
+            "an inherited `new` must still work"
+        );
+    }
+
+    #[test]
     fn a_non_local_return_escapes_through_a_perform_frame() {
         // REGRESSION. `perform:` dispatches through `run_method_reentrant` — a
         // nested interpreter loop — and a nested run is an UNWIND BOUNDARY: an

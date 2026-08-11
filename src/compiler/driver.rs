@@ -807,6 +807,72 @@ fn compile_method_full(
         }
     }
 
+    // The KEY INVARIANT. An nmethod is installed under `(rcvr_klass,
+    // selector)` — customized — and `resolve_target_entry` links a send site
+    // straight to whatever `code_table.lookup(receiver_klass, selector)`
+    // answers. So that key is a CLAIM: "sending `selector` to an instance of
+    // `rcvr_klass` runs this method." A SUPER send breaks it. `super new`
+    // inside `Foo class>>new` runs `Behavior>>new` with a receiver whose klass
+    // is `Foo class` — so the compile trigger customized `Behavior>>new` for
+    // `Foo class` and installed it under `(Foo class, #new)`, the very key
+    // `Foo new` looks up. Every subsequent `Foo new` then linked to
+    // `Behavior>>new` and SKIPPED the override:
+    //
+    //     Foo class >> new [ ^super new initFoo ]   "the commonest idiom there is"
+    //     Foo new  =>  an allocated but UNINITIALIZED instance
+    //
+    // Silent, and wrong at every threshold — it began exactly on the call that
+    // crossed it (`first at = threshold`, measured). `world` itself is written
+    // this way (`GameFrame`, `SoundDoc`).
+    //
+    // A method reached only through `super` gets no customized nmethod under a
+    // key that would misdirect ordinary sends. It still runs — interpreted, and
+    // it still compiles for any receiver klass whose lookup DOES resolve to it
+    // (the ordinary, non-overridden case, which is the common one and is
+    // unaffected). Blocks are exempt: they key by `by_block`, never by
+    // (klass, selector) — see `CodeTable::install`.
+    if !method.is_block() {
+        let sel = crate::oops::wrappers::SymbolOop::try_from(method.selector())
+            .expect("a method's selector is always a Symbol");
+        // Walked here rather than through `lookup`, for two reasons: this must
+        // not PANIC on a half-wired klass chain (a synthetic test universe has
+        // them, and this runs on every compile), and it must not disturb the
+        // lookup cache. A truncated walk simply yields `None`.
+        let resolved = {
+            let nil = vm.universe.nil_obj;
+            let mut k = rcvr_klass;
+            loop {
+                if let Some(dict) =
+                    crate::oops::method_dict::MethodDictOop::try_from(k.methods())
+                {
+                    if let Some(m) = dict.probe(vm, sel) {
+                        break Some(m);
+                    }
+                }
+                let sc = k.superclass();
+                if sc.raw() == nil.raw() {
+                    break None;
+                }
+                match KlassOop::try_from(sc) {
+                    Some(next) => k = next,
+                    None => break None,
+                }
+            }
+        };
+        // Decline only on POSITIVE evidence that this key names someone else.
+        // "Not found" or "chain truncated" is not evidence, and must leave
+        // behaviour exactly as it was.
+        if resolved.is_some_and(|m| m.oop().raw() != method.oop().raw()) {
+            if vm.options.trace.is_enabled("jit") {
+                eprintln!(
+                    "[jit] declining: {} would install under a key that resolves elsewhere                      (super-entered activation)",
+                    selector_string(method)
+                );
+            }
+            return None;
+        }
+    }
+
     // S24 L2 step 3 OSR envelope (phase A — was S15 A2 v1's "no has_ctx, no
     // closures"): non-ctx closure-BEARING methods now OSR. The v1 comment's
     // worry ("escape-mode operand stacks can hold phantoms the transfer
@@ -872,8 +938,20 @@ fn compile_method_full(
         let sel = crate::oops::wrappers::SymbolOop::try_from(method.selector())
             .map(|s| s.as_string())
             .unwrap_or_default();
-        if sel == want {
-            eprintln!("==== IR {sel} (v{version}) ====");
+        // `MACVM_DBG_IR=selector` matches every method of that name — and
+        // several classes legitimately share one (`Behavior>>new` and any
+        // `Foo class>>new` both answer to `new`), which makes the dump easy to
+        // MISREAD as the method you meant. `MACVM_DBG_IR=Klass>>selector`
+        // disambiguates.
+        let holder_name = KlassOop::try_from(method.holder())
+            .map(|k| crate::memory::print_oop(&vm.universe, k.name()))
+            .unwrap_or_default();
+        let qualified = format!("{}>>{}", holder_name.trim_start_matches('#'), sel);
+        if sel == want || qualified == want {
+            eprintln!(
+                "==== IR {qualified} (v{version}) rcvr_klass={} ====",
+                crate::memory::print_oop(&vm.universe, rcvr_klass.name())
+            );
             for blk in &ir_method.blocks {
                 eprintln!("  block {} @bci{}:", blk.id.0, blk.bci);
                 for ir in &blk.code {
@@ -896,7 +974,16 @@ fn compile_method_full(
             for (i, e) in ir_method.pool.iter().enumerate() {
                 eprintln!("  pool[{i}] = {:#x} {:?} {}", e.value, e.kind, named(e.value));
             }
-            eprintln!("==== END IR {sel} ====");
+            for (i, cs) in ir_method.call_sites.iter().enumerate() {
+                eprintln!(
+                    "  site[{i}] = #{} argc={} static_klass={:?} self_klass={:?}",
+                    cs.selector.as_string(),
+                    cs.argc,
+                    cs.static_klass.map(|k| crate::memory::print_oop(&vm.universe, k.name())),
+                    cs.self_klass.map(|k| crate::memory::print_oop(&vm.universe, k.name())),
+                );
+            }
+            eprintln!("==== END IR {qualified} ====");
         }
     }
     let mut regalloc_result = regalloc::regalloc(&ir_method);
@@ -1661,6 +1748,18 @@ fn build_deopt_metadata(
                     &f3_const,
                     &f3_pool,
                 );
+                if std::env::var_os("MACVM_CVDBG").is_some()
+                    && ir_method.block_closure_vreg.is_some()
+                    && root_receiver == crate::compiler::scopes::ValueLoc::Nil
+                {
+                    let cv = ir_method.block_closure_vreg.unwrap();
+                    let iv = intervals.iter().find(|iv| iv.vreg == cv);
+                    eprintln!(
+                        "CVDBG root_receiver=Nil pos={position} cv=v{} interval={:?}",
+                        cv.0,
+                        iv.map(|i| (i.start, i.end, i.assignment, i.crosses_safepoint))
+                    );
+                }
                 let root_slots = (0..n_slots)
                     .map(|i| {
                         resolve_frame_loc(
