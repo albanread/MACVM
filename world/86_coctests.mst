@@ -1,0 +1,540 @@
+"86_coctests.mst — the Tests tab (docs/sunit_design.md §5, sprint S2).
+
+ The command line already runs the suite (`macvm-gui test`). This is the same
+ SUnit for people who live in the GUI: a tree of every runnable suite on the
+ left, one result row per test on the right, and the failure text of whatever
+ you selected underneath. Read-and-run only in S2 — authoring (S3) and Debug
+ (S4) hang off the same furniture.
+
+ WHERE THE WORK HAPPENS. The tree and the results are both answered by the
+ PRIMARY VM over `Worker uiDoit:onReply:` — never computed here. Two reasons,
+ and the second is the one that matters: the UI worker must not block (a suite
+ is fast but not instant, and this VM is the main thread), and the primary is
+ the VM that will actually run the tests, so a tree built there cannot offer a
+ suite that isn't really loaded. `TestRunner treeReport` and
+ `TestRunner runNamed:` are that surface; `TestResult printString` is already
+ the wire format, so results need no encoding of their own.
+
+ The reply arrives as the result's printString (`serveUiDoit:`), i.e. a quoted
+ String — hence `unquoted:`. Everything else is line parsing.
+
+ THE TWO COCOA LAWS this file obeys, both learned the hard way elsewhere:
+ defer the ATTACH (setDataSource: makes AppKit query synchronously, which
+ re-enters the VM if it happens inside an exec — CocoaMonitor's own comment),
+ and defer every reload for the same reason. Outline items are NSStrings
+ holding a path ('' root, '2' the second class, '2.3' its third test), the
+ Outliner's trick: AppKit hands the item back opaquely, and a string survives
+ that round trip where a Smalltalk object would not."
+
+Object subclass: CocoaTests [
+    <classVars: Container Outline OutlineFace OCol Handles HandleList
+                Table TableFace Cols Rows Tree Status Summary SummaryLabel
+                DetailView Actions Busy SelClass SelTest>
+
+    CocoaTests class >> barHeight [ ^34.0 ]
+    CocoaTests class >> leftWidth [ ^250.0 ]
+    CocoaTests class >> detailHeight [ ^96.0 ]
+    CocoaTests class >> headerHeight [ ^22.0 ]
+
+    "── registration (tab-host protocol, 64_cocoaui) ──────────────────────"
+    CocoaTests class >> register [
+        CocoaUI registerViewNamed: #tests title: 'Tests' icon: 'checkmark.circle'
+                container: [ self containerView ]
+                onShow: [ self refreshTree ]
+    ]
+    CocoaTests class >> containerView [
+        Container isNil ifTrue: [ self buildView ].
+        ^Container
+    ]
+
+    "── the view ──────────────────────────────────────────────────────────"
+    CocoaTests class >> buildView [
+        | host frame w h barH leftW detH scroll hdr rightW |
+        host := CocoaUI contentHost.
+        frame := host onMain frame.
+        w := frame at: 3. h := frame at: 4.
+        barH := self barHeight. leftW := self leftWidth. detH := self detailHeight.
+        rightW := w - leftW.
+        Actions := OrderedCollection new.
+        Rows := OrderedCollection new.
+        Tree := OrderedCollection new.
+        Status := Dictionary new.
+
+        Container := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Container onMain setAutoresizesSubviews: true.
+
+        "── left: the suite tree ──"
+        scroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: leftW with: 100.0).
+        scroll onMain setHasVerticalScroller: true.
+        scroll onMain setBorderType: 0.
+        Outline := ((Cocoa classNamed: 'NSOutlineView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: leftW with: 100.0).
+        OCol := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain
+            initWithIdentifier: 'item'.
+        OCol onMain setWidth: leftW - 24.0.
+        OCol onMain setEditable: false.
+        Outline onMain addTableColumn: OCol.
+        Outline onMain setOutlineTableColumn: OCol.
+        Outline onMain setRowHeight: 20.0.
+        Outline onMain setHeaderView: nil.
+        scroll onMain setDocumentView: Outline.
+        hdr := self headerLabeled: 'SUITES'.
+        Container onMain addSubview: (self paneWith: hdr scroll: scroll
+            at: (Array with: 0.0 with: barH with: leftW with: h - barH)
+            mask: CocoaUI maskHeightSizable + CocoaUI maskMaxXMargin).
+
+        "── right, upper: one row per test ──"
+        scroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: rightW with: 100.0).
+        scroll onMain setHasVerticalScroller: true.
+        scroll onMain setBorderType: 0.
+        Table := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: rightW with: 100.0).
+        Table onMain setUsesAlternatingRowBackgroundColors: true.
+        Table onMain setRowHeight: 20.0.
+        Table onMain setAllowsColumnReordering: false.
+        Cols := OrderedCollection new.
+        self addColumn: 'status' title: 'STATUS' width: 66.0.
+        self addColumn: 'test'   title: 'TEST'   width: 300.0.
+        self addColumn: 'ms'     title: 'MS'     width: 46.0.
+        self addColumn: 'note'   title: 'NOTE'   width: 420.0.
+        scroll onMain setDocumentView: Table.
+        hdr := self headerLabeled: 'RESULTS'.
+        Container onMain addSubview: (self paneWith: hdr scroll: scroll
+            at: (Array with: leftW with: barH + detH with: rightW with: h - barH - detH)
+            mask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable).
+
+        "── right, lower: the selected row's full text ──"
+        scroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: rightW with: 100.0).
+        scroll onMain setHasVerticalScroller: true.
+        scroll onMain setBorderType: 0.
+        DetailView := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: rightW with: 100.0).
+        DetailView onMain setEditable: false.
+        DetailView onMain setFont: (CocoaUI fixedFontOfSize: 11.0).
+        scroll onMain setDocumentView: DetailView.
+        hdr := self headerLabeled: 'DETAIL'.
+        Container onMain addSubview: (self paneWith: hdr scroll: scroll
+            at: (Array with: leftW with: barH with: rightW with: detH)
+            mask: CocoaUI maskWidthSizable + CocoaUI maskMaxYMargin).
+
+        self buildBar: w.
+        self deferAttachFaces.
+    ]
+
+    CocoaTests class >> buildBar: w [
+        | bx btn |
+        bx := 8.0.
+        btn := self buttonTitled: 'Run All' at: bx wide: 84.0.
+        self wireAction: btn to: [ self runAll ].
+        bx := bx + 90.0.
+        btn := self buttonTitled: 'Run Selected' at: bx wide: 110.0.
+        self wireAction: btn to: [ self runSelected ].
+        bx := bx + 116.0.
+        SummaryLabel := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: bx with: 9.0 with: w - bx - 8.0 with: 18.0).
+        SummaryLabel onMain setStringValue: 'no run yet'.
+        SummaryLabel onMain setEditable: false.
+        SummaryLabel onMain setSelectable: true.
+        SummaryLabel onMain setBordered: false.
+        SummaryLabel onMain setDrawsBackground: false.
+        SummaryLabel onMain setFont: (CocoaUI fixedFontOfSize: 11.0).
+        SummaryLabel onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMaxYMargin.
+        Container onMain addSubview: SummaryLabel.
+    ]
+
+    CocoaTests class >> buttonTitled: aTitle at: x wide: wid [
+        | btn |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain
+            initWithFrame: (Array with: x with: 5.0 with: wid with: 24.0).
+        btn onMain setTitle: aTitle.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: CocoaUI maskMaxXMargin + CocoaUI maskMaxYMargin.
+        Container onMain addSubview: btn.
+        ^btn
+    ]
+
+    "── view helpers (CocoaMonitor's, with an explicit frame+mask) ────────"
+    CocoaTests class >> addColumn: ident title: aTitle width: wid [
+        | col |
+        col := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain
+            initWithIdentifier: ident.
+        col onMain setWidth: wid.
+        col onMain setEditable: false.
+        (col onMain headerCell) onMain setStringValue: aTitle.
+        Table onMain addTableColumn: col.
+        Cols add: ident.
+    ]
+    CocoaTests class >> headerLabeled: aTitle [
+        | f |
+        f := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: 100.0 with: self headerHeight).
+        f onMain setStringValue: '  ' , aTitle.
+        f onMain setEditable: false.
+        f onMain setSelectable: false.
+        f onMain setBordered: false.
+        f onMain setDrawsBackground: true.
+        f onMain setBackgroundColor: ((Cocoa classNamed: 'NSColor') onMain windowBackgroundColor).
+        f onMain setTextColor: ((Cocoa classNamed: 'NSColor') onMain secondaryLabelColor).
+        f onMain setFont: ((Cocoa classNamed: 'NSFont') onMain boldSystemFontOfSize: 11.0).
+        ^f
+    ]
+    CocoaTests class >> paneWith: aHeader scroll: aScroll at: rect mask: aMask [
+        | pane hh pw ph |
+        hh := self headerHeight.
+        pw := rect at: 3. ph := rect at: 4.
+        pane := ((Cocoa classNamed: 'NSView') onMain alloc) onMain initWithFrame: rect.
+        pane onMain setAutoresizesSubviews: true.
+        pane onMain setAutoresizingMask: aMask.
+        aHeader onMain setFrame: (Array with: 0.0 with: ph - hh with: pw with: hh).
+        aHeader onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        aScroll onMain setFrame: (Array with: 0.0 with: 0.0 with: pw with: ph - hh).
+        aScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        pane onMain addSubview: aHeader.
+        pane onMain addSubview: aScroll.
+        ^pane
+    ]
+    CocoaTests class >> wireAction: aControl to: aBlock [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        Actions add: delegate.
+    ]
+
+    "── attach, DEFERRED (CocoaMonitor's law: setDataSource: queries
+       SYNCHRONOUSLY, and inside an exec that re-enters the VM) ───────────"
+    CocoaTests class >> deferAttachFaces [
+        | holder d |
+        holder := CocoaToolbarAction on: [ self attachFaces ].
+        d := MacvmDelegate actionTargetOn: holder.
+        Actions add: d.
+        d onMain performSelector: 'macvmAction:' withObject: nil afterDelay: 0.0.
+    ]
+    CocoaTests class >> attachFaces [
+        Outline isNil ifTrue: [ ^self ].
+        OutlineFace := MacvmDelegate outlineSourceOn: self.
+        Outline onMain setDataSource: OutlineFace.
+        Outline onMain setDelegate: OutlineFace.
+        TableFace := MacvmDelegate tableSourceOn: (Worker classNamed: #CocoaTestsFace) new.
+        Table onMain setDataSource: TableFace.
+        Table onMain setDelegate: TableFace.
+        self wireAction: Table to: [ self rowClicked ].
+        self refreshTree.
+    ]
+    CocoaTests class >> deferReload [
+        "The Monitor's law, copied exactly: park `reloadData` ITSELF on the
+         run loop (performSelector:...afterDelay: 0), never call it from
+         inside a VM dispatch. reloadData's datasource queries are
+         synchronous; fired from inside a callback dispatch they re-enter a
+         busy VM and fail closed to ZERO ROWS — which presents exactly as it
+         did here: attach state right, data right, both views blank. The
+         expands are parked the same way, one per suite, AFTER the reload
+         (afterDelay: 0 timers fire in order): `expandItem:expandChildren:`
+         has two arguments and cannot be parked, but per-item `expandItem:`
+         can, and the tree is two levels deep so the classes are all of it."
+        Outline isNil ifFalse: [
+            Outline onMain performSelector: 'reloadData' withObject: nil afterDelay: 0.0.
+            1 to: (Tree isNil ifTrue: [ 0 ] ifFalse: [ Tree size ]) do: [ :i |
+                Outline onMain performSelector: 'expandItem:'
+                        withObject: (self handleFor: i printString) afterDelay: 0.0 ] ].
+        Table isNil ifFalse: [
+            Table onMain performSelector: 'reloadData' withObject: nil afterDelay: 0.0 ].
+    ]
+
+    "── the tree, from the PRIMARY ────────────────────────────────────────"
+    CocoaTests class >> refreshTree [
+        Container isNil ifTrue: [ ^self ].
+        Worker uiDoit: 'TestRunner treeReport'
+               onReply: [ :r | self setTreeFrom: (self unquoted: r) ]
+    ]
+    CocoaTests class >> setTreeFrom: text [
+        "CLASS <name> / TEST <selector> lines, in order."
+        | cur |
+        Tree := OrderedCollection new.
+        cur := nil.
+        (self linesOf: text) do: [ :line |
+            (line startsWith: 'CLASS ') ifTrue: [
+                cur := Array with: (line copyFrom: 7 to: line size)
+                             with: OrderedCollection new.
+                Tree add: cur ].
+            ((line startsWith: 'TEST ') and: [ cur notNil ]) ifTrue: [
+                (cur at: 2) add: (line copyFrom: 6 to: line size) ] ].
+        self deferReload.
+    ]
+
+    "── running, on the PRIMARY ───────────────────────────────────────────"
+    CocoaTests class >> runAll [
+        Tree isEmpty ifTrue: [ ^self note: 'no suites — load a tests package first' ].
+        self runNames: (Tree collect: [ :e | e at: 1 ])
+    ]
+    CocoaTests class >> runSelected [
+        "One test if a test row is selected, else the selected class, else all."
+        SelClass isNil ifTrue: [ ^self runAll ].
+        SelTest isNil ifTrue: [ ^self runNames: (Array with: SelClass) ].
+        Busy == true ifTrue: [ ^self ].
+        Busy := true.
+        self note: 'running ' , SelClass , ' ' , SelTest , ' ...'.
+        Worker uiDoit: '(TestRunner runNamed: ''' , SelClass , ''' selector: ''' ,
+                       SelTest , ''') printString'
+               onReply: [ :r | self showResults: (self unquoted: r) ]
+    ]
+    CocoaTests class >> runNames: names [
+        | src |
+        Busy == true ifTrue: [ ^self ].
+        Busy := true.
+        self note: 'running ' , names size printString , ' suite(s) ...'.
+        src := '(TestRunner runNamed: #('.
+        names do: [ :n | src := src , '#' , n , ' ' ].
+        src := src , ')) printString'.
+        Worker uiDoit: src onReply: [ :r | self showResults: (self unquoted: r) ]
+    ]
+
+    "── results: TestResult printString IS the wire format ────────────────"
+    CocoaTests class >> showResults: text [
+        Busy := false.
+        Rows := OrderedCollection new.
+        Summary := ''.
+        (self linesOf: text) do: [ :line | self absorbResultLine: line ].
+        SummaryLabel isNil ifFalse: [
+            SummaryLabel onMain setStringValue: (Summary isEmpty
+                ifTrue: [ 'no results' ] ifFalse: [ Summary ]) ].
+        self deferReload.
+    ]
+    CocoaTests class >> absorbResultLine: line [
+        "PASS <Class> <sel> <ms> | FAIL/ERROR <Class> <sel> <ms> <note...>,
+         and the trailing summary line, which is the only one with no verb."
+        | parts status name ms note |
+        line isEmpty ifTrue: [ ^self ].
+        parts := self wordsOf: line.
+        parts size < 4 ifTrue: [
+            (line includesSubstring: ' run, ') ifTrue: [ Summary := line ].
+            ^self ].
+        status := parts at: 1.
+        ((status = 'PASS') or: [ (status = 'FAIL') or: [ status = 'ERROR' ] ]) ifFalse: [
+            (line includesSubstring: ' run, ') ifTrue: [ Summary := line ].
+            ^self ].
+        name := (parts at: 2) , ' ' , (parts at: 3).
+        ms := parts at: 4.
+        note := self restOf: line after: 4.
+        Rows add: (Array with: status with: name with: ms with: note).
+        Status at: name put: status.
+    ]
+
+    "── outline data source (paths as NSString items, the Outliner's trick)"
+    CocoaTests class >> handleFor: path [
+        | k h |
+        Handles isNil ifTrue: [ Handles := Dictionary new. HandleList := OrderedCollection new ].
+        k := path asSymbol.
+        h := Handles at: k ifAbsent: [ nil ].
+        h isNil ifTrue: [
+            h := Cocoa nsString: path.
+            Handles at: k put: h.
+            HandleList add: h ].
+        ^h
+    ]
+    CocoaTests class >> pathOf: item [
+        ^item isNil ifTrue: [ '' ] ifFalse: [ item sendString: 'description' ]
+    ]
+    CocoaTests class >> outlineView: ov numberOfChildrenOfItem: item [
+        | p e |
+        Tree isNil ifTrue: [ ^0 ].
+        item isNil ifTrue: [ ^Tree size ].
+        p := self pathOf: item.
+        (p includes: $.) ifTrue: [ ^0 ].                 "a test has no children"
+        e := self classAt: p asNumber.
+        ^e isNil ifTrue: [ 0 ] ifFalse: [ (e at: 2) size ]
+    ]
+    CocoaTests class >> outlineView: ov isItemExpandable: item [
+        ^(self outlineView: ov numberOfChildrenOfItem: item) > 0
+    ]
+    CocoaTests class >> outlineView: ov child: i ofItem: item [
+        item isNil ifTrue: [ ^self handleFor: (i + 1) printString ].
+        ^self handleFor: (self pathOf: item) , '.' , (i + 1) printString
+    ]
+    CocoaTests class >> outlineView: ov objectValueForTableColumn: col byItem: item [
+        | p e ix sel |
+        p := self pathOf: item.
+        p isEmpty ifTrue: [ ^'' ].
+        (p includes: $.) ifFalse: [
+            e := self classAt: p asNumber.
+            ^e isNil ifTrue: [ '' ]
+                     ifFalse: [ (self dotForClass: (e at: 1)) , ' ' , (e at: 1) ] ].
+        ix := self splitPath: p.
+        e := self classAt: (ix at: 1).
+        e isNil ifTrue: [ ^'' ].
+        (ix at: 2) > (e at: 2) size ifTrue: [ ^'' ].
+        sel := (e at: 2) at: (ix at: 2).
+        ^(self dotFor: (e at: 1) , ' ' , sel) , ' ' , sel
+    ]
+    CocoaTests class >> outlineViewSelectionDidChange: aNote [
+        | row item p e ix |
+        Outline isNil ifTrue: [ ^self ].
+        row := Outline onMain selectedRow.
+        row < 0 ifTrue: [ ^self ].
+        item := Outline onMain itemAtRow: row.
+        item isNil ifTrue: [ ^self ].
+        p := self pathOf: item.
+        item release.
+        p isEmpty ifTrue: [ ^self ].
+        (p includes: $.)
+            ifTrue: [
+                ix := self splitPath: p.
+                e := self classAt: (ix at: 1).
+                e isNil ifTrue: [ ^self ].
+                SelClass := e at: 1.
+                SelTest := (ix at: 2) <= (e at: 2) size
+                    ifTrue: [ (e at: 2) at: (ix at: 2) ] ifFalse: [ nil ] ]
+            ifFalse: [
+                e := self classAt: p asNumber.
+                e isNil ifTrue: [ ^self ].
+                SelClass := e at: 1.
+                SelTest := nil ].
+        self showDetailForSelection.
+    ]
+
+    "── table data source ─────────────────────────────────────────────────"
+    CocoaTests class >> rowCount [ ^Rows isNil ifTrue: [ 0 ] ifFalse: [ Rows size ] ]
+    CocoaTests class >> valueAtCol: aCol row: aRow [
+        | ident idx row |
+        (Rows isNil or: [ aRow >= Rows size ]) ifTrue: [ ^'' ].
+        row := Rows at: aRow + 1.
+        "asString: `identifier` answers an NSString HANDLE; compared raw it
+         matches no Smalltalk string and every cell answers '' (found as a
+         table with perfect row count and perfectly blank cells)."
+        ident := (aCol onMain identifier) asString.
+        idx := Cols indexOf: ident.
+        idx = 0 ifTrue: [ ^'' ].
+        ^row at: idx
+    ]
+    CocoaTests class >> rowClicked [
+        Table isNil ifTrue: [ ^self ].
+        self showRowDetail: (Table onMain selectedRow)
+    ]
+    CocoaTests class >> showRowDetail: row [
+        "Also the scripted entry point: a ctl script cannot click, but it can
+         ask for the same detail the click would have shown (0-based, the
+         table's own indexing)."
+        | r |
+        (row < 0 or: [ Rows isNil or: [ row >= Rows size ] ]) ifTrue: [ ^self ].
+        r := Rows at: row + 1.
+        self showDetail: (r at: 1) , '  ' , (r at: 2) , '  ' , (r at: 3) , ' ms' ,
+            ((r at: 4) isEmpty ifTrue: [ '' ]
+                ifFalse: [ (String with: Character nl) , (String with: Character nl) , (r at: 4) ])
+    ]
+
+    "── the detail pane ───────────────────────────────────────────────────"
+    CocoaTests class >> showDetailForSelection [
+        | key hit |
+        SelClass isNil ifTrue: [ ^self ].
+        SelTest isNil ifTrue: [ ^self showDetail: SelClass , ' — Run Selected runs this whole suite' ].
+        key := SelClass , ' ' , SelTest.
+        hit := nil.
+        Rows isNil ifFalse: [ Rows do: [ :r | (r at: 2) = key ifTrue: [ hit := r ] ] ].
+        hit isNil ifTrue: [ ^self showDetail: key , ' — not run yet' ].
+        self showDetail: (hit at: 1) , '  ' , key , '  ' , (hit at: 3) , ' ms' ,
+            ((hit at: 4) isEmpty ifTrue: [ '' ]
+                ifFalse: [ (String with: Character nl) , (String with: Character nl) , (hit at: 4) ])
+    ]
+    CocoaTests class >> showDetail: aString [
+        DetailView isNil ifFalse: [ DetailView onMain setString: aString ]
+    ]
+    CocoaTests class >> note: aString [
+        SummaryLabel isNil ifFalse: [ SummaryLabel onMain setStringValue: aString ]
+    ]
+
+    "── status dots (last run's per-node state, held UI-side) ─────────────"
+    CocoaTests class >> dotFor: key [
+        | s |
+        Status isNil ifTrue: [ ^'·' ].
+        s := Status at: key ifAbsent: [ nil ].
+        s isNil ifTrue: [ ^'·' ].
+        s = 'PASS' ifTrue: [ ^'●' ].
+        ^'✕'
+    ]
+    CocoaTests class >> dotForClass: aName [
+        "A suite is red if ANY of its tests is, grey until it has been run."
+        | any bad |
+        Status isNil ifTrue: [ ^'·' ].
+        any := false. bad := false.
+        Status keysAndValuesDo: [ :k :v |
+            (k startsWith: aName , ' ') ifTrue: [
+                any := true.
+                v = 'PASS' ifFalse: [ bad := true ] ] ].
+        any ifFalse: [ ^'·' ].
+        ^bad ifTrue: [ '✕' ] ifFalse: [ '●' ]
+    ]
+
+    "── small text helpers ────────────────────────────────────────────────"
+    CocoaTests class >> unquoted: s [
+        "A doit reply is the result's printString, so a String arrives quoted."
+        (s size >= 2 and: [ (s at: 1) = $' and: [ (s at: s size) = $' ] ])
+            ifTrue: [ ^s copyFrom: 2 to: s size - 1 ].
+        ^s
+    ]
+    CocoaTests class >> linesOf: text [
+        | out cur nl |
+        nl := Character nl.
+        out := OrderedCollection new.
+        cur := ''.
+        text do: [ :c |
+            c = nl ifTrue: [ out add: cur. cur := '' ] ifFalse: [ cur := cur , (String with: c) ] ].
+        cur isEmpty ifFalse: [ out add: cur ].
+        ^out
+    ]
+    CocoaTests class >> wordsOf: line [
+        | out cur |
+        out := OrderedCollection new.
+        cur := ''.
+        line do: [ :c |
+            c = $  ifTrue: [ cur isEmpty ifFalse: [ out add: cur. cur := '' ] ]
+                   ifFalse: [ cur := cur , (String with: c) ] ].
+        cur isEmpty ifFalse: [ out add: cur ].
+        ^out
+    ]
+    CocoaTests class >> restOf: line after: n [
+        "Everything past the first n space-separated words, verbatim — a
+         failure message has its own spaces and must not be re-joined."
+        | seen i sz |
+        seen := 0. i := 1. sz := line size.
+        [ i <= sz and: [ seen < n ] ] whileTrue: [
+            [ i <= sz and: [ (line at: i) = $  ] ] whileTrue: [ i := i + 1 ].
+            [ i <= sz and: [ (line at: i) ~= $  ] ] whileTrue: [ i := i + 1 ].
+            seen := seen + 1 ].
+        [ i <= sz and: [ (line at: i) = $  ] ] whileTrue: [ i := i + 1 ].
+        i > sz ifTrue: [ ^'' ].
+        ^line copyFrom: i to: sz
+    ]
+    CocoaTests class >> classAt: i [
+        (Tree isNil or: [ i < 1 or: [ i > Tree size ] ]) ifTrue: [ ^nil ].
+        ^Tree at: i
+    ]
+    CocoaTests class >> splitPath: p [
+        "'3.7' -> (3 7)."
+        | dot |
+        dot := p indexOf: $..
+        dot = 0 ifTrue: [ ^Array with: p asNumber with: 0 ].
+        ^Array with: (p copyFrom: 1 to: dot - 1) asNumber
+              with: (p copyFrom: dot + 1 to: p size) asNumber
+    ]
+
+    CocoaTests class >> teardown [
+        Container := nil. Outline := nil. Table := nil. DetailView := nil.
+        SummaryLabel := nil. Actions := nil. Handles := nil. HandleList := nil.
+        Tree := nil. Rows := nil. Status := nil. SelClass := nil. SelTest := nil.
+    ]
+]
+
+"The table's data source is a separate object, as the debugger and Monitor
+ both do: `MacvmDelegate tableSourceOn:` wants an instance, and the outline
+ source is the class itself, so the two cannot share one receiver."
+Object subclass: CocoaTestsFace [
+    numberOfRowsInTableView: aTable [ ^CocoaTests rowCount ]
+    tableView: aTable objectValueForTableColumn: aCol row: aRow [
+        ^CocoaTests valueAtCol: aCol row: aRow ]
+]

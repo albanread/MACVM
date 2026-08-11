@@ -178,6 +178,7 @@ Object subclass: CocoaUI [
         (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv register ].
         (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc register ].
         (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc register ].
+        (Worker classNamed: #CocoaTests) ifNotNil: [ :tc | tc register ].
         (Worker classNamed: #CocoaMonitor) ifNotNil: [ :mc | mc register ].
         "A- / A+ and Do It / Print It, after every view's switcher item."
         self buildFontButtons.

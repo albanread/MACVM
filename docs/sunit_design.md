@@ -27,6 +27,11 @@ Three audiences, in priority order:
 
 ## 1. Grounding — what exists (verified, not assumed)
 
+> **2026-08-11:** the "SUnit-lite" this section describes was retired in
+> d6c7697 — `world/tests/*` now runs on the real SUnit by reflection, and
+> `world/86_sunit.mst` is the framework. S1 landed (79a85be) with the cargo
+> bridge; S2 (the Tests tab, `world/86_coctests.mst`) is below.
+
 Every design decision below leans on machinery that is already built and
 tested. File:line citations are to the state at commit `11aaa84`.
 

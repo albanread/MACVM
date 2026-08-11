@@ -56,7 +56,13 @@ pub(crate) const WORLD_DOITS: &[&str] = &[
 /// never runs AppKit UI code, so `cocoaui`'s classes would be dead weight
 /// there, same role split as before, now expressed as a DB query instead of
 /// which raw `.mst` files got read.
-pub(crate) const PRIMARY_LISTS: &[&str] = &["world"];
+/// `tests` rides along (sprint S2): the Tests tab runs suites on the PRIMARY —
+/// it must never block the main thread — so the primary is the VM that has to
+/// hold them. Without it `TestRunner allTestClasses` answers nothing there and
+/// the tab is an empty tree, which is exactly what it looked like before this
+/// was added. The UI worker deliberately does NOT load them: it displays
+/// results, it does not produce them.
+pub(crate) const PRIMARY_LISTS: &[&str] = &["world", "tests"];
 
 /// The package lists the UI WORKER boots: the base world plus its own
 /// implementation (`CocoaUI`/`CocoaBrowser`/`CocoaHelp`/etc.) — the two

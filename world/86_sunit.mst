@@ -388,6 +388,54 @@ Object subclass: TestRunner [
         ^result error: name ms: ms message: message
     ]
 
+    "── the Tests tab's two questions (docs/sunit_design.md §5) ───────────
+
+     Both answer TEXT, because a reply crosses the worker boundary as a doit
+     result — `serveUiDoit:` sends the result's printString. `TestResult` is
+     already text (`printString` IS the wire format), so RESULTS need nothing
+     new; only the tree does."
+
+    TestRunner class >> treeReport [
+        "Every runnable suite and its tests, one per line:
+
+             CLASS FooTest
+             TEST testAlpha
+             TEST testBeta
+
+         Answered by REFLECTION on the VM that will actually run them, so the
+         tab cannot offer a test that is not really there."
+        | s nl |
+        nl := String with: Character nl.
+        s := ''.
+        self allTestClasses do: [ :cls |
+            s := s, 'CLASS ', cls name asString, nl.
+            cls testSelectors do: [ :sel | s := s, 'TEST ', sel asString, nl ] ].
+        ^s
+    ]
+
+    TestRunner class >> runNamed: names [
+        "Run the named suites (Strings or Symbols) and answer the result.
+         Names rather than classes because the request arrives as SOURCE TEXT
+         from the UI worker; an unknown name is skipped rather than raising,
+         since a stale tab selection is not a test failure."
+        | classes |
+        classes := OrderedCollection new.
+        names do: [ :n |
+            | c |
+            c := Worker classNamed: n asSymbol.
+            c isNil ifFalse: [ classes add: c ] ].
+        ^self run: classes asArray
+    ]
+
+    TestRunner class >> runNamed: aName selector: aSelector [
+        "One test, for the tab's Run Selected on a single method."
+        | cls result |
+        cls := Worker classNamed: aName asSymbol.
+        result := TestResult new.
+        cls isNil ifFalse: [ self runOne: cls selector: aSelector asSymbol into: result ].
+        ^result finish
+    ]
+
     TestRunner class >> allTestClasses [
         "Every TestCase subclass in this image, by reflection. The design
          prefers being TOLD what to run — the Tests tab will pass a list from

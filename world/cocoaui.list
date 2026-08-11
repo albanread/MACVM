@@ -60,4 +60,5 @@
 # the UI BRIDGE band (`bridgeStatsLine` — the Cocoa side's own counters).
 # Rides the ~4 Hz metrics beat at a user-selectable period; self-registers
 # by name with the SF-Symbol magnifying glass.
+86_coctests.mst
 85_cocoamonitor.mst
