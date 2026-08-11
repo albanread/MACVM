@@ -1,0 +1,143 @@
+"43a_textscreen.mst — TextScreen: a page of text composed off-screen, then put
+ up in one copy (docs/shared_screen_memory_design.md SM3).
+
+ The text plane (world/43) is a grid of cells the VM writes with stores. That
+ already makes a HUD free to rewrite every frame. This class is the other half
+ of the idea: a page you compose ONCE and keep, and show whenever you like for
+ the cost of a single memcpy — no redrawing, no commands, nothing recomputed.
+
+ That is what makes a menu or a help screen instant. A program with ten pages
+ of documentation holds ten TextScreens and swaps between them at whatever rate
+ you can press a key; the cost of showing one does not depend on how much is on
+ it.
+
+     help := TextScreen cols: pane textCols rows: pane textRows.
+     help put: 'MACVM' at: 2 row: 1 color: GamePane white.
+     help put: 'Press SPACE to begin' at: 2 row: 3 color: GamePane yellow.
+     pane textBlast: help bytes.
+
+ A cell is four bytes — character, foreground colour, background colour, flags
+ — and character 0 means an unused cell, which draws nothing at all. So a fresh
+ TextScreen is transparent, and clearing one really does remove it rather than
+ painting it black.
+
+ Composing costs ordinary Smalltalk work, which is the point: it happens once,
+ off the frame path, and what happens per frame is a copy."
+"I am a page of text composed off-screen and shown in one copy. Build me the
+ size of a pane's text plane (TextScreen cols: pane textCols rows: pane
+ textRows), write into me with put:at:row:color: and friends, then show me with
+ `pane textBlast: myScreen bytes`. Showing me costs one memcpy however much is
+ written on me, which is what makes menus and help pages instant. My cells are
+ four bytes — char, foreground, background, flags — and an unwritten cell draws
+ nothing, so I am transparent where I am blank."
+Object subclass: TextScreen [
+    | cols rows bytes |
+
+    TextScreen class >> cols: c rows: r [
+        "A blank page of `c` by `r` cells. Blank means transparent, not black:
+         every cell starts with character 0, which draws nothing."
+        ^self new setCols: c rows: r
+    ]
+
+    setCols: c rows: r [
+        cols := c.
+        rows := r.
+        bytes := ByteArray new: c * r * 4.
+        ^self
+    ]
+
+    cols [ ^cols ]
+    rows [ ^rows ]
+    bytes [ "The page, ready for `GamePane>>textBlast:`." ^bytes ]
+
+    "── writing ──────────────────────────────────────────────────────────"
+
+    at: col row: row put: aCharacter color: fg back: bg flags: fl [
+        "One cell. Off-page writes are ignored, so a line that runs long clips
+         instead of failing or wrapping into the row below."
+        | base |
+        (col >= 0 and: [ row >= 0 and: [ col < cols and: [ row < rows ] ] ])
+            ifFalse: [ ^self ].
+        base := ((row * cols) + col) * 4.
+        bytes at: base + 1 put: aCharacter asInteger.
+        bytes at: base + 2 put: fg.
+        bytes at: base + 3 put: bg.
+        bytes at: base + 4 put: fl.
+        ^self
+    ]
+
+    put: aString at: col row: row color: fg [
+        "A string over whatever is behind it — the common case."
+        ^self put: aString at: col row: row color: fg back: 0 flags: 1
+    ]
+
+    put: aString at: col row: row color: fg back: bg flags: fl [
+        1 to: aString size do: [ :i |
+            self at: col + i - 1 row: row
+                 put: (aString at: i) color: fg back: bg flags: fl ].
+        ^self
+    ]
+
+    centre: aString row: row color: fg [
+        "A string centred on the page — what a title or a menu heading wants,
+         and fiddly enough to get wrong by hand every time."
+        | col |
+        col := (cols - aString size) // 2.
+        col < 0 ifTrue: [ col := 0 ].
+        ^self put: aString at: col row: row color: fg
+    ]
+
+    fillRow: row color: bg [
+        "Paint a whole row as a solid band — a title bar, or a highlighted menu
+         line. Uses spaces with an OPAQUE background, because a cell with
+         character 0 draws nothing at all."
+        0 to: cols - 1 do: [ :c |
+            self at: c row: row put: $  color: bg back: bg flags: 0 ].
+        ^self
+    ]
+
+    box: fg [
+        "A single-line border round the whole page, drawn from ASCII so it
+         needs no glyphs the 5x7 font does not have."
+        | last |
+        last := rows - 1.
+        0 to: cols - 1 do: [ :c |
+            self at: c row: 0 put: $- color: fg back: 0 flags: 1.
+            self at: c row: last put: $- color: fg back: 0 flags: 1 ].
+        0 to: last do: [ :r |
+            self at: 0 row: r put: $| color: fg back: 0 flags: 1.
+            self at: cols - 1 row: r put: $| color: fg back: 0 flags: 1 ].
+        self at: 0 row: 0 put: $+ color: fg back: 0 flags: 1.
+        self at: cols - 1 row: 0 put: $+ color: fg back: 0 flags: 1.
+        self at: 0 row: last put: $+ color: fg back: 0 flags: 1.
+        self at: cols - 1 row: last put: $+ color: fg back: 0 flags: 1.
+        ^self
+    ]
+
+    clear [
+        "Blank the page — back to transparent."
+        1 to: bytes size do: [ :i | bytes at: i put: 0 ].
+        ^self
+    ]
+
+    "── reading, mostly so a test can check a page without a GPU ──────────"
+
+    characterAt: col row: row [
+        "The character in a cell, or nil for an unused one."
+        | v |
+        v := bytes at: (((row * cols) + col) * 4) + 1.
+        v = 0 ifTrue: [ ^nil ].
+        ^Character value: v
+    ]
+
+    lineAt: row [
+        "A whole row as a String, unused cells becoming spaces — the readable
+         form of a page, and what a test asserts against."
+        | s ch |
+        s := String new: cols.
+        0 to: cols - 1 do: [ :c |
+            ch := self characterAt: c row: row.
+            s at: c + 1 put: (ch isNil ifTrue: [ $  ] ifFalse: [ ch ]) ].
+        ^s
+    ]
+]

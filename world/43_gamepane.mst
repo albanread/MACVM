@@ -558,6 +558,25 @@ Object subclass: GamePane [
         ^self
     ]
 
+    textBlast: aByteArray [
+        "Show a whole prepared page AT ONCE — `cols * rows * 4` bytes of cells,
+         copied into the text plane in a single memcpy rather than a store per
+         character (SM3).
+
+         This is what makes a menu, a help page or a console screen INSTANT:
+         compose it once into a TextScreen, keep it, and put it up whenever you
+         like for the cost of one copy. Nothing is redrawn and nothing is sent.
+
+         A page of the wrong size is refused rather than half-applied."
+        | tm n |
+        tm := self textMemory.
+        tm isNil ifTrue: [ ^self ].
+        n := self textCols * self textRows * 4.
+        aByteArray size = n ifFalse: [ ^self ].
+        tm replaceFrom: 1 to: n with: aByteArray startingAt: 1.
+        ^self
+    ]
+
     textClearPlane [
         "Blank every cell — the plane goes invisible again. Cheap: it is a
          memory wipe, not a redraw."

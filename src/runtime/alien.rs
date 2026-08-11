@@ -453,6 +453,79 @@ pub(crate) fn prim_alien_for_address_size(vm: &mut VmState, args: &[Oop]) -> Pri
     PrimResult::Ok(make_indirect_alien(vm, addr.value() as u64, nbytes as usize))
 }
 
+/// `Alien>>replaceFrom:to:with:startingAt:` (id 274) — the BULK copy, and the
+/// difference between "a screen you can write" and "a screen you can show".
+///
+/// Every accessor above moves one value. Filling a text page a cell at a time
+/// is 6,360 sends; filling a framebuffer a pixel at a time is 76,800. Both are
+/// fine when a demo is computing each value anyway — but not when it already
+/// HAS the bytes and only wants them on screen. This is one `memcpy`, which is
+/// what makes a prepared page appear instantly instead of being redrawn.
+///
+/// Standard Smalltalk protocol, 1-based and inclusive, so it reads like
+/// `SequenceableCollection`'s own. Bounds are checked on BOTH sides — the
+/// destination against the Alien's declared size (so a wrong length cannot
+/// scribble past a framebuffer, the property the whole design leans on) and
+/// the source against the ByteArray's.
+#[allow(unsafe_code)]
+pub(crate) fn prim_alien_replace_from_to_with(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let _ = vm;
+    let Some(a) = AlienOop::try_from(args[0]) else {
+        return PrimResult::Fail;
+    };
+    let (Some(start), Some(stop), Some(src_at)) = (
+        SmallInt::try_from(args[1]),
+        SmallInt::try_from(args[2]),
+        SmallInt::try_from(args[4]),
+    ) else {
+        return PrimResult::Fail;
+    };
+    let Some(src) = crate::oops::wrappers::ByteArrayOop::try_from(args[3]) else {
+        return PrimResult::Fail;
+    };
+    let (start, stop, src_at) = (start.value(), stop.value(), src_at.value());
+    if start < 1 || src_at < 1 {
+        return PrimResult::Fail;
+    }
+    // An empty range is a no-op, not an error — `1 to: 0` falls out of any
+    // loop that computes its own bounds.
+    if stop < start {
+        return PrimResult::Ok(args[0]);
+    }
+    let n = (stop - start + 1) as usize;
+    let dst_len = effective_len(a);
+    let src_len = src.len();
+    if (start as usize - 1).saturating_add(n) > dst_len {
+        return PrimResult::Fail;
+    }
+    if (src_at as usize - 1).saturating_add(n) > src_len {
+        return PrimResult::Fail;
+    }
+    let Some(base) = indirect_base(a) else {
+        // A DIRECT Alien's bytes live in the heap tail; bulk-copying into a
+        // moving object is a separate question and not the one this exists to
+        // answer (the screen is always indirect).
+        return PrimResult::Fail;
+    };
+    // Read through `byte_at` rather than taking a slice: `ByteArrayOop` never
+    // hands out a pointer into the moving heap, deliberately. Nothing here
+    // allocates, so nothing can move underneath the loop — and even read one
+    // byte at a time on this side it is a Rust loop, not 6,360 Smalltalk
+    // sends, which is the whole point.
+    //
+    // SAFETY: both ranges were bounds-checked above; the destination is the
+    // host-published region this Alien wraps, whose validity is the host's
+    // documented contract (`publish_screen_buffers`).
+    unsafe {
+        let dst = (base as *mut u8).add(start as usize - 1);
+        let src_off = src_at as usize - 1;
+        for k in 0..n {
+            *dst.add(k) = src.byte_at(src_off + k);
+        }
+    }
+    PrimResult::Ok(args[0])
+}
+
 /// Build an indirect `Alien` over an external region — the shape
 /// `forAddress:size:` hands back, factored out so other primitives can mint
 /// one without going through Smalltalk. `screenMemory`
@@ -532,6 +605,7 @@ const ALIEN_BOOTSTRAP_SRC: &str = "Object subclass: Alien [ \
     doubleAt: i [ <primitive: 116> ^self ] \
     doubleAt: i put: v [ <primitive: 117> ^self ] \
     size [ <primitive: 118> ^self ] \
+    replaceFrom: start to: stop with: aByteArray startingAt: srcIndex [ <primitive: 274> ^self ] \
 ]";
 
 /// Called once from `VmState::with_options`, immediately after

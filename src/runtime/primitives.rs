@@ -1544,6 +1544,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 274,
+        name: "replaceFrom:to:with:startingAt:",
+        f: crate::runtime::alien::prim_alien_replace_from_to_with,
+        argc: 4,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -5505,6 +5513,7 @@ mod tests {
             (271, "GamePane>>textMemory"),
             (272, "GamePane>>textCols"),
             (273, "GamePane>>textRows"),
+            (274, "replaceFrom:to:with:startingAt:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

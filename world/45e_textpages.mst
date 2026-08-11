@@ -1,0 +1,196 @@
+"45e_textpages.mst — TextPages: the SM3 proof, and a small worked example of
+ the thing text memory is really for (docs/shared_screen_memory_design.md).
+ Launch it from the Demos menu, or a Workspace:
+
+     TextPages launch
+
+ SPACE turns the page, Escape quits.
+
+ Four pages of text, each composed ONCE into a TextScreen at launch, and shown
+ by copying it into the text plane. Turning a page is one memcpy of 6,360
+ bytes. It does not matter how full the page is, nothing is redrawn, and not
+ one command goes down the VM->GUI channel to do it — the frame's `present` is
+ the only command a frame ever sends.
+
+ That is the difference the slice was about. Through the old text overlay, a
+ page of forty lines was forty commands to put up and forty more to take down,
+ every time; a program with ten help screens paid for the size of each one
+ every time it showed it. Here a page costs what a page costs to COMPOSE, once,
+ off the frame path — and after that, showing it is a copy.
+
+ The pages are also the honest documentation of this engine's text plane: what
+ a cell is, what character 0 means, why the grid is 53x30. In a headless VM the
+ pane's text memory is nil and the demo does nothing, harmlessly."
+"I am four pages of text shown in the game pane, and the demo that shows what
+ shared text memory is for. Launch me from the Demos menu, or a Workspace:
+ TextPages launch. SPACE turns the page, Escape quits. Each page is composed
+ once into a TextScreen and then shown by one copy into the text plane, so
+ turning a page costs a memcpy however much is written on it — no redrawing, no
+ commands. Harmless in a headless VM."
+Object subclass: TextPages [
+    | pane pages current prevSpace built |
+    <classVars: Current>
+
+    TextPages class >> launch [ ^self new start ]
+    TextPages class >> current [ ^Current ]
+
+    start [
+        Current := self.
+        pane := GamePane new.
+        current := 1.
+        prevSpace := false.
+        built := false.
+        pane onStep: [ :frame | self stepWith: frame ]; run.
+        ^self
+    ]
+
+    "── the pages ────────────────────────────────────────────────────────"
+
+    buildPages [
+        "Compose every page once. This is ordinary Smalltalk work — a few
+         thousand cell writes — and it happens here, at launch, exactly once.
+         What happens per page-turn afterwards is a single copy."
+        | c r |
+        c := pane textCols.
+        r := pane textRows.
+        pages := Array new: 4.
+        pages at: 1 put: (self titlePageCols: c rows: r).
+        pages at: 2 put: (self cellPageCols: c rows: r).
+        pages at: 3 put: (self whyPageCols: c rows: r).
+        pages at: 4 put: (self creditsPageCols: c rows: r).
+        built := true.
+        ^self
+    ]
+
+    titlePageCols: c rows: r [
+        | p |
+        p := TextScreen cols: c rows: r.
+        p box: GamePane darkGrey.
+        p fillRow: 2 color: GamePane midnight.
+        p centre: 'SHARED TEXT MEMORY' row: 2 color: GamePane white.
+        p centre: 'four pages, one memcpy each' row: 4 color: GamePane lightGrey.
+        p put: 'This page is 53 by 30 cells of four bytes.' at: 4 row: 8
+          color: GamePane peach.
+        p put: 'Showing it copies 6360 bytes and sends' at: 4 row: 10
+          color: GamePane peach.
+        p put: 'no commands at all.' at: 4 row: 11 color: GamePane peach.
+        p put: 'Turning the page is the same copy whether' at: 4 row: 14
+          color: GamePane lightGrey.
+        p put: 'the page is empty or completely full.' at: 4 row: 15
+          color: GamePane lightGrey.
+        p centre: 'SPACE turns the page' row: 27 color: GamePane yellow.
+        ^p
+    ]
+
+    cellPageCols: c rows: r [
+        | p |
+        p := TextScreen cols: c rows: r.
+        p box: GamePane darkGrey.
+        p fillRow: 2 color: GamePane midnight.
+        p centre: 'WHAT A CELL IS' row: 2 color: GamePane white.
+        p put: 'Every cell is four bytes:' at: 4 row: 5 color: GamePane lightGrey.
+        p put: 'char' at: 6 row: 7 color: GamePane yellow.
+        p put: 'the ASCII code. ZERO means unused,' at: 14 row: 7 color: GamePane peach.
+        p put: 'and an unused cell draws NOTHING -' at: 14 row: 8 color: GamePane peach.
+        p put: 'not a black square. That is why' at: 14 row: 9 color: GamePane peach.
+        p put: 'this plane can sit over every pane.' at: 14 row: 10 color: GamePane peach.
+        p put: 'fg' at: 6 row: 12 color: GamePane yellow.
+        p put: 'foreground palette index.' at: 14 row: 12 color: GamePane peach.
+        p put: 'bg' at: 6 row: 14 color: GamePane yellow.
+        p put: 'background palette index.' at: 14 row: 14 color: GamePane peach.
+        p put: 'flags' at: 6 row: 16 color: GamePane yellow.
+        p put: 'bit 0: transparent background,' at: 14 row: 16 color: GamePane peach.
+        p put: 'so text sits over the picture' at: 14 row: 17 color: GamePane peach.
+        p put: 'instead of in a box.' at: 14 row: 18 color: GamePane peach.
+        p put: 'Cells are 6 by 8 pixels: the 5x7 font' at: 4 row: 21
+          color: GamePane lightGrey.
+        p put: 'plus a pixel of leading each way.' at: 4 row: 22
+          color: GamePane lightGrey.
+        p centre: 'SPACE turns the page' row: 27 color: GamePane yellow.
+        ^p
+    ]
+
+    whyPageCols: c rows: r [
+        | p |
+        p := TextScreen cols: c rows: r.
+        p box: GamePane darkGrey.
+        p fillRow: 2 color: GamePane midnight.
+        p centre: 'WHY IT IS A BUFFER' row: 2 color: GamePane white.
+        p put: 'The overlay used to take commands: one' at: 4 row: 5
+          color: GamePane peach.
+        p put: 'message per string, every frame.' at: 4 row: 6 color: GamePane peach.
+        p put: 'Minesweeper redrew its HUD each frame' at: 4 row: 8
+          color: GamePane lightGrey.
+        p put: 'and sent a command per revealed number,' at: 4 row: 9
+          color: GamePane lightGrey.
+        p put: 'sixty times a second, for a board that' at: 4 row: 10
+          color: GamePane lightGrey.
+        p put: 'had not changed.' at: 4 row: 11 color: GamePane lightGrey.
+        p put: 'The fix was a RULE: only redraw when' at: 4 row: 13
+          color: GamePane red.
+        p put: 'something changed. Rules get forgotten.' at: 4 row: 14
+          color: GamePane red.
+        p put: 'Written as memory there is no rule.' at: 4 row: 17
+          color: GamePane green.
+        p put: 'A store is not a message, so redrawing' at: 4 row: 18
+          color: GamePane green.
+        p put: 'everything always is cheaper than' at: 4 row: 19 color: GamePane green.
+        p put: 'deciding whether to.' at: 4 row: 20 color: GamePane green.
+        p centre: 'SPACE turns the page' row: 27 color: GamePane yellow.
+        ^p
+    ]
+
+    creditsPageCols: c rows: r [
+        | p |
+        p := TextScreen cols: c rows: r.
+        p box: GamePane darkGrey.
+        p fillRow: 2 color: GamePane midnight.
+        p centre: 'THE WHOLE IDEA' row: 2 color: GamePane white.
+        p centre: 'Commands are for control.' row: 8 color: GamePane peach.
+        p centre: 'Memory is for state.' row: 10 color: GamePane peach.
+        p centre: 'Pixels and text are state.' row: 14 color: GamePane yellow.
+        p put: 'GamePane>>screenMemory   the picture' at: 6 row: 19
+          color: GamePane lightGrey.
+        p put: 'GamePane>>textMemory     these words' at: 6 row: 20
+          color: GamePane lightGrey.
+        p put: 'GamePane>>textBlast:     this page' at: 6 row: 21
+          color: GamePane lightGrey.
+        p centre: 'SPACE returns to the first page' row: 27 color: GamePane yellow.
+        ^p
+    ]
+
+    "── the frame ────────────────────────────────────────────────────────"
+
+    pageCount [ ^4 ]
+    currentPage [ ^current ]
+
+    showPage [
+        "Put the current page up: ONE copy, whatever is on it."
+        built ifFalse: [ ^self ].
+        pane textBlast: (pages at: current) bytes.
+        ^self
+    ]
+
+    stepWith: frame [
+        "Compose on the first frame the pane can tell us its size, then show a
+         page and present. The page is re-blasted every frame purely to prove
+         it costs nothing to do so — a real program would blast only on a
+         change, and would be no faster for it."
+        pane textCols isNil ifTrue: [ ^self ].
+        built ifFalse: [ self buildPages ].
+        self readSpaceFrom: frame.
+        self showPage.
+        pane present.
+        ^self
+    ]
+
+    readSpaceFrom: frame [
+        | down |
+        down := frame keyHeld: GamePane keyA.
+        (down and: [ prevSpace not ]) ifTrue: [
+            current := current + 1.
+            current > self pageCount ifTrue: [ current := 1 ] ].
+        prevSpace := down.
+        ^self
+    ]
+]

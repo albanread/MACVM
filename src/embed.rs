@@ -2666,6 +2666,88 @@ mod tests {
     }
 
     #[test]
+    fn a_prepared_page_is_shown_by_one_copy_and_costs_no_commands() {
+        // SM3. A TextScreen is composed once, off the frame path, and shown by
+        // copying it into the text plane — so putting up a full page of help
+        // costs the same as putting up an empty one, and neither sends a
+        // command. That is what "instant" means here, and it is the whole
+        // reason the overlay became a buffer.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _published = PublishedMemory;
+
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+        const COLS: usize = 53;
+        const ROWS: usize = 30;
+        let grid = leaked_screen(COLS * ROWS * 4);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+        crate::embed::publish_text_memory(grid.as_mut_ptr(), COLS, ROWS);
+
+        // Compose a page and check it reads back. `lineAt:` is the readable
+        // form, which is what makes a page assertable without a GPU.
+        vm.exec(
+            "Object subclass: TsHold [ <classVars: P> \
+                 TsHold class >> p: x [ P := x ] TsHold class >> p [ ^P ] ]",
+        )
+        .expect("the holder must compile");
+        vm.exec(
+            "TsHold p: ((TextScreen cols: 53 rows: 30) \
+                centre: 'MACVM' row: 2 color: 23; \
+                put: 'Press SPACE' at: 4 row: 5 color: 26; \
+                yourself).",
+        )
+        .expect("composing a page must work");
+
+        assert_eq!(
+            vm.eval("TsHold p lineAt: 5.").unwrap().trim_matches('\'').trim(),
+            "Press SPACE",
+            "the page must hold what was written on it"
+        );
+        assert_eq!(
+            vm.eval("TsHold p characterAt: 0 row: 0.").unwrap(),
+            "nil",
+            "an unwritten cell must stay UNUSED — char 0 draws nothing, which \
+             is what keeps a blank page transparent"
+        );
+
+        // Show it: one copy, and nothing on the channel.
+        captured.lock().unwrap().clear();
+        vm.exec("GamePane basicNew textBlast: TsHold p bytes.")
+            .expect("blasting a page must run");
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "showing a whole page must emit NO commands"
+        );
+
+        // The plane really holds the page: row 5 from column 4.
+        let line: Vec<u8> = (4..15)
+            .map(|c| grid[((5 * COLS) + c) * 4])
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&line),
+            "Press SPACE",
+            "the page must land in the text plane"
+        );
+
+        // A page of the WRONG size is refused outright rather than applied
+        // half-way — a torn page is worse than no page.
+        let before = grid[((5 * COLS) + 4) * 4];
+        vm.exec("GamePane basicNew textBlast: (ByteArray new: 16).")
+            .expect("a wrong-sized page must be refused quietly");
+        assert_eq!(
+            grid[((5 * COLS) + 4) * 4],
+            before,
+            "a wrong-sized page must not be partly applied"
+        );
+    }
+
+    #[test]
     fn presenting_rotates_the_buffer_the_vm_writes_next() {
         // THE TEARING FIX. A demo sends `present` and starts the next frame at
         // once — it cannot wait for the host to actually draw, and the host
@@ -2706,14 +2788,20 @@ mod tests {
             .expect("a frame must run");
         }
 
-        // Three buffers, four frames: 1, 2, 3 into a, b, c — then frame 4 back
-        // into a, overwriting the 1.
-        assert_eq!(a[0], 4, "frame 4 must reuse the first buffer");
-        assert_eq!(b[0], 2, "frame 2 went to the second buffer");
-        assert_eq!(c[0], 3, "frame 3 went to the third buffer");
-        assert!(
-            b[0] != c[0],
-            "consecutive frames must never share a buffer — that is the tear"
+        // Three buffers, four frames. Asserted WITHOUT assuming which buffer
+        // the run started on: the frame counter is a process-global and any
+        // other test that presents nudges it, which is a test artifact — in
+        // the real system exactly one VM presents. What must hold regardless
+        // is the shape: frames 2, 3 and 4 landed in three different buffers,
+        // and frame 1's buffer was reused by frame 4.
+        let mut got = [a[0], b[0], c[0]];
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            [2, 3, 4],
+            "three buffers must hold the last three frames, one each — a \
+             repeat means two consecutive frames shared a buffer, which is \
+             exactly the tear"
         );
     }
 

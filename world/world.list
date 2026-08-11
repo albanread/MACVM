@@ -73,6 +73,9 @@
 # GamePane: drive the native Metal game pane from Smalltalk (M3 slice,
 # docs/gamepane_design.md). Numbered game primitives (id block 200+).
 43_gamepane.mst
+# TextScreen: a page of text composed off-screen and shown with one copy
+# (GamePane>>textBlast:) - what makes a menu or a help page instant. SM3.
+43a_textscreen.mst
 # SpriteDoc (docs/asset_editors_design.md): the sprite editor's pure document —
 # frames of 4-bit pixels + one 16-entry palette, hex-row emit/parse, sheet-class
 # source emit. World-list so games can file sheets in and the battery runs
@@ -106,6 +109,9 @@
 # memory (screenMemory/screenStride), so a frame emits one command (present)
 # no matter how many pixels changed. docs/shared_screen_memory_design.md
 45d_plasma.mst
+# TextPages: the SM3 proof - four pages composed once, each shown by a single
+# memcpy into the text plane; turning a page sends no commands at all.
+45e_textpages.mst
 # MandelVM: MandelZoom that dives once then stops — the standalone-window demo
 # (macvm-gui mandelvm / run-mandelvm.sh) that quits when the demo ends.
 46_mandelvm.mst
