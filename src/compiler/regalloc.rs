@@ -1284,14 +1284,37 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
     // to the method's last position makes spill-all keep the slot canonical
     // and every liveness-intersected oopmap include it — one slot, and the
     // whole analysis dimension disappears.
+    // The bound the two pins below widen to. It must exceed every position
+    // `resolve_frame_loc` will ever be ASKED about — and those are the
+    // SAFEPOINT positions, which is not the same set as the interval ends.
+    //
+    // This used to be `max(interval ends) + 2`, and that is wrong whenever a
+    // safepoint sits at or past the last position any vreg is live at — a
+    // method whose trailing instructions keep nothing alive. `resolve_frame_loc`
+    // tests `iv.end > pos` STRICTLY, so a closure interval widened to 28 and a
+    // safepoint at 28 resolved the receiver to `ValueLoc::Nil`, and the
+    // materializer then aborted the process rebuilding the frame:
+    //
+    //     root-block scope's receiver ValueLoc must hold the closure
+    //
+    // Observed on `TestRunner class >> allTestClasses` — a `do:` block,
+    // standalone-compiled, whose closure interval ended at 28 with safepoints
+    // at 28 and 29. Taking the max over BOTH sets is what the original comment
+    // already intended by "the method's last position".
+    let pin_end = intervals
+        .iter()
+        .map(|iv| iv.end)
+        .chain(safepoint_positions.iter().copied())
+        .max()
+        .unwrap_or(0)
+        + 2;
     if let Some(cv) = method.block_closure_vreg {
         // +2: resolve_frame_loc/build_for_position use STRICT upper bounds
         // (`iv.end > pos`), so ending exactly AT the last position would
         // resolve Nil at the final safepoint -- the very deopt this exists
         // for (observed: scope_recv=Nil on depth3's block deopt).
-        let max_pos = intervals.iter().map(|iv| iv.end).max().unwrap_or(0) + 2;
         if let Some(iv) = intervals.iter_mut().find(|iv| iv.vreg == cv) {
-            iv.end = max_pos;
+            iv.end = pin_end;
             iv.crosses_safepoint = true;
         }
     }
@@ -1305,9 +1328,10 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
     // the deopt corrupts (observed: `printOn:` with a captured stream, ctxloc
     // -> Nil at the trap). Same one-slot pin as `block_closure_vreg` above.
     if let Some((cv, _nctx)) = method.method_ctx_vreg {
-        let max_pos = intervals.iter().map(|iv| iv.end).max().unwrap_or(0) + 2;
+        // Same bound, and for the same reason — a materialized Context read
+        // after a trailing safepoint has the identical failure mode.
         if let Some(iv) = intervals.iter_mut().find(|iv| iv.vreg == cv) {
-            iv.end = max_pos;
+            iv.end = pin_end;
             iv.crosses_safepoint = true;
         }
     }
@@ -1524,6 +1548,73 @@ mod tests {
         }
         for p in [1u32, 3, 6, 8, 9] {
             assert!(!known.contains(&p), "v{p} must NOT be known-smi");
+        }
+    }
+
+    /// REGRESSION: the closure vreg of a block compilation must be readable
+    /// at EVERY safepoint, including one that sits past the last position any
+    /// vreg is live at.
+    ///
+    /// The pin used to widen to `max(interval ends) + 2`, which is not the
+    /// same thing as "the method's last position" — trailing safepoint-bearing
+    /// ops (an `UncommonTrap`, a loop `Poll`) define nothing, so they can be
+    /// numbered well beyond every interval end. `resolve_frame_loc` tests
+    /// `iv.end > pos` STRICTLY, so those safepoints resolved the block's
+    /// receiver to `ValueLoc::Nil` and the deopt materializer aborted the
+    /// process rebuilding the frame:
+    ///
+    ///     root-block scope's receiver ValueLoc must hold the closure
+    ///
+    /// Seen for real on `TestRunner class >> allTestClasses` — a `do:` block,
+    /// standalone-compiled, closure interval ending at 28 with safepoints at
+    /// 28 and 29.
+    #[test]
+    fn closure_vreg_is_readable_at_a_safepoint_past_every_interval_end() {
+        let v = |n: u32| VReg(n);
+        let block = IrBlock {
+            id: BlockId(0),
+            bci: 0,
+            code: vec![
+                Ir::Param { dst: v(0), index: 0 }, // pos 0: the closure, used nowhere later
+                Ir::ConstSmi { dst: v(1), value: 1 }, // pos 1
+                Ir::Ret { val: v(1) },             // pos 2  <- last position any vreg is live at
+                Ir::UncommonTrap { bci: 0 },       // pos 3  <- safepoints BEYOND that
+                Ir::UncommonTrap { bci: 1 },       // pos 4
+            ],
+            entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
+        };
+        let mut m = hand_method(
+            vec![block],
+            (0..2)
+                .map(|_| VRegInfo { is_oop: true, is_fp: false })
+                .collect(),
+        );
+        m.block_closure_vreg = Some(v(0));
+
+        let ra = regalloc(&m);
+        assert!(
+            !ra.safepoint_positions.is_empty(),
+            "the trailing traps must register as safepoints, or this test proves nothing"
+        );
+        let const_smi: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
+        let const_pool: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for &sp in &ra.safepoint_positions {
+            let loc = crate::compiler::scopes::resolve_frame_loc(
+                v(0),
+                sp,
+                &ra.intervals,
+                &[],
+                &const_smi,
+                &const_pool,
+            );
+            assert_ne!(
+                loc,
+                crate::compiler::scopes::ValueLoc::Nil,
+                "the closure must be readable at safepoint position {sp} \
+                 (interval ends: {:?})",
+                ra.intervals.iter().map(|i| (i.vreg.0, i.end)).collect::<Vec<_>>()
+            );
         }
     }
 
