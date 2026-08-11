@@ -1,10 +1,33 @@
 # Direct screen access — writing the picture instead of sending it
 
 *How a Smalltalk demo draws by storing bytes into memory the GPU is already
-looking at. Implemented in SM0–SM3; the design and its rejected alternatives
+looking at. Implemented in SM0–SM4; the design and its rejected alternatives
 are in [`shared_screen_memory_design.md`](shared_screen_memory_design.md).*
 
-## 1. The idea in one paragraph
+## 1. What this actually is
+
+A synthetic video chip, emulated by a shader.
+
+That framing is not a flourish — it is the most useful way to hold the whole
+design. Between them the four planes are the parts a 1980s home computer had:
+a **framebuffer** of palette indices, a **colour table** with per-scanline
+entries, a **character generator** with its own font ROM, and a **sprite**
+layer. The fragment shader is the CRT: it reads that memory sixty times a
+second and turns it into light.
+
+Which means the way to program it is the way you programmed those machines —
+**poke the memory**. Not "call a drawing API that eventually reaches the GPU",
+but store a byte and watch the screen change. The whole of SM0–SM4 is really
+one idea: give the guest the memory, and let the hardware emulation do what
+hardware does.
+
+The oddity, and the fun of it, is that underneath sits a modern operating
+system, a Metal command queue and a JIT — none of which the demo can see. A
+Smalltalk program writing `fb byteAt: y * stride + x + 1 put: 3` is doing
+exactly what a POKE did, and getting the same deal: no protocol, no
+permission, no copy.
+
+## 2. The idea in one paragraph
 
 Apple Silicon has unified memory: an `MTLStorageModeShared` buffer's
 `contents()` is ordinary CPU-writable memory, and a linear texture view over
@@ -13,10 +36,12 @@ the screen. There is no upload, no copy, and no command — a pixel write is a
 store, and the frame appears because the GPU was already reading the memory it
 was stored into.
 
-Two planes work this way. The **pixel plane** is palette indices, one byte per
-pixel. The **text plane** is a grid of character cells composited over it.
+Three things work this way. The **pixel plane** is palette indices, one byte
+per pixel; the **text plane** is a grid of character cells composited over it;
+and the **palette** — the colour table both of them look through — is RGBA
+bytes. Nothing bulk travels as a command any more.
 
-## 2. Pixels
+## 3. Pixels
 
 ```smalltalk
 pane := GamePane new.
@@ -67,7 +92,7 @@ same ordered presents: the VM increments when it *sends* `present`, the host
 when it *renders* one. The command stream is ordered, so the two counts
 describe the same frame, and neither blocks on the other.
 
-## 3. Text
+## 4. Text
 
 The overlay is a screen buffer too, not a chain of commands.
 
@@ -105,7 +130,41 @@ costs a copy that does not depend on how full the page is — which is what make
 a menu or a help screen instant. A wrong-sized page is refused outright rather
 than applied half-way.
 
-## 4. Several VMs, one screen
+## 5. Colour
+
+The palette is memory too, and it is the one that changes what is *possible*
+rather than merely what is cheap.
+
+```smalltalk
+pane paletteMemoryAt: (pane paletteGlobalBase + 4) put: 16rFF00FF.
+pane lineMemoryAt: y index: 1 put: 16r3080FF.   "scanline y, colour 1"
+```
+
+Entries are **RGBA bytes**, four per entry. The layout has two regions:
+`height` groups of 16 **per-line** entries first — line `y`'s colour `i`
+(1–15) is entry `y * 16 + i` — then 240 **global** entries, where colour `c`
+(16–255) is entry `paletteGlobalBase + c - 16`.
+
+`paletteAt:r:g:b:` and `linePaletteAt:index:rgb:` still work and write **the
+same buffer**. There is one palette and no copy of it anywhere — which is not
+just tidiness: a CPU mirror would mean the next upload could copy stale
+colours over whatever a demo had written directly, and no amount of
+coordination makes two writers to two copies safe.
+
+**Why it matters more than it sounds.** Because the picture stores *indices*,
+changing the table changes every pixel that refers to it — without touching a
+pixel. Two demos live off this:
+
+- **Copper** (`world/45f`) fills the screen once with colour 1 and then never
+  writes a pixel again. Each frame it rewrites what colour 1 *means* on each of
+  240 scanlines: three bars appear to ride up and down a screen that is,
+  strictly, static. 960 bytes a frame.
+- **Julia** (`world/45h`) stores escape counts, so cycling the palette
+  recolours an entire animated fractal with no pixel read or written.
+
+Before SM4 that cost 240 commands a frame; it now costs none.
+
+## 6. Several VMs, one screen
 
 Workers are `thread::spawn`ed VMs **in this process**, and the framebuffer is
 published in a process-global — so a worker asking for `screenMemory` gets the
@@ -122,7 +181,7 @@ by construction, and the primary presents only once every band of the round has
 replied — which was already the rule that stopped a torn frame, and now also
 keeps them off the buffer being displayed.
 
-## 5. What it costs, measured
+## 7. What it costs, measured
 
 | | before | after |
 |---|---|---|
@@ -130,13 +189,14 @@ keeps them off the buffer being displayed.
 | a HUD of ~100 numbers | ~100 `Text` commands **per frame** | 0 commands |
 | showing a help page | one command per string | 1 memcpy |
 | 60 idle Minesweeper frames | up to 2 blits | **60 presents, nothing else** |
+| a copper effect | 240 `linePaletteAt:` commands per frame | 960 byte stores, 0 commands |
 
 Asserted, not described:
 `a_full_screen_direct_demo_costs_exactly_one_command_per_frame` drives Plasma —
 a full-screen field *and* a live frame counter, both rewritten every frame —
 and demands exactly five commands for five frames.
 
-## 6. Safety
+## 8. Safety
 
 `screenMemory` and `textMemory` hand back an **`Alien`**, not a raw pointer,
 and an Alien is length-bounded (see [`ALIEN.md`](ALIEN.md)). A demo with an
@@ -155,7 +215,7 @@ Getting this order wrong is not theoretical: a test that left workers running
 past the end of its buffer crashed the suite with
 `SIGSEGV far 0x1010101010101018` — in an unrelated test two positions later.
 
-## 7. When not to use it
+## 9. When not to use it
 
 `blit:` still exists and is still right when a demo already has a `ByteArray`
 it built for its own reasons — Life, Minesweeper and FreeCell all use it, and
@@ -168,18 +228,23 @@ replace object-attached text at arbitrary offsets — Minesweeper's digits
 centred in 16-pixel squares and FreeCell's ranks at +3,+4 inside a 34-pixel
 card stay pixel art in the picture. The text plane is for text *screens*.
 
-## 8. Where the code is
+## 10. Where the code is
 
 | | |
 |---|---|
 | `src/embed.rs` | the publication (`publish_screen_buffers`, `publish_text_memory`) and `GameCommand` |
-| `src/runtime/primitives.rs` | prims 268–273: `openDirect:height:`, `screenMemory`, `screenStride`, `textMemory`, `textCols`, `textRows` |
+| `src/runtime/primitives.rs` | prims 268–276: `openDirect:height:`, `screenMemory`, `screenStride`, `textMemory`, `textCols`, `textRows`, `paletteMemory`, `paletteGlobalBase` |
 | `src/runtime/alien.rs` | prim 274, the bulk copy |
 | `MacGamePane graphics/src/direct_pane.rs` | shared buffers, linear texture views, palette shader |
 | `MacGamePane graphics/src/text_plane.rs` | cell grid, font atlas, blended shader |
 | `world/43_gamepane.mst` | the Smalltalk surface |
 | `world/43a_textscreen.mst` | `TextScreen` |
-| `world/45d_plasma.mst`, `world/45e_textpages.mst` | the worked examples |
+| `MacGamePane graphics/src/indexed_pane.rs` | the palette: RGBA bytes, one buffer, no mirror |
+| `world/45d_plasma.mst` | pixels: a full-screen field, one command a frame |
+| `world/45e_textpages.mst` | text: pages composed once, shown by one copy |
+| `world/45f_copper.mst` | colour: a screen filled once and never redrawn |
+| `world/45g_attractor.mst` | density accumulated into the picture |
+| `world/45h_julia.mst` | both at once — direct pixels AND palette cycling |
 
 The pixel half is a port of MACDART's `GpDirectPane`
 (`macdart/cocoa/gamepane/gp_engine.mm`, designed in its `GAMEPANE_PLAN.md`
