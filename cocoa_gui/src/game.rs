@@ -353,7 +353,6 @@ fn present(g: &mut NativeGame) {
         g.text.render(cb, tex);
         cb.present_drawable(drawable);
         cb.commit();
-        publish_direct(g);
         return;
     }
     g.pane.upload();
@@ -380,14 +379,23 @@ fn present(g: &mut NativeGame) {
     cb.commit();
 }
 
-/// Tell the VM where the direct framebuffer is right now. Called when the pane
-/// is built and again after every present, because presenting rotates the write
-/// buffer. This is the one piece of pane state that travels by publication
-/// rather than by command — a primitive has to RETURN an address, and the
-/// command channel only runs the other way.
+/// Tell the VM about the direct framebuffer's whole ROTATING SET, once.
+///
+/// Deliberately not "the current write buffer, republished after each
+/// present": the VM cannot observe the rotation at the instant this thread
+/// performs it. A demo sends `present` and starts the next frame immediately,
+/// so it would fetch the pre-rotation pointer and write the very buffer about
+/// to be displayed — which is precisely the tearing ParallelMandel showed.
+///
+/// Publishing the set lets both sides pick `frame % count` from their own
+/// count of the same ordered events, and agree with no synchronisation.
 fn publish_direct(g: &NativeGame) {
     if let Some(d) = g.direct.as_ref() {
-        macvm::embed::publish_screen_memory(d.backbuffer_ptr(), d.stride(), d.height() as usize);
+        macvm::embed::publish_screen_buffers(
+            &d.buffer_ptrs(),
+            d.stride(),
+            d.height() as usize,
+        );
     }
 }
 
@@ -546,8 +554,8 @@ pub fn drain() {
                     if let Some(g) = cell.borrow_mut().as_mut() {
                         match DirectPane::new(&g.win.device, *w, *h) {
                             Ok(d) => {
-                                macvm::embed::publish_screen_memory(
-                                    d.backbuffer_ptr(),
+                                macvm::embed::publish_screen_buffers(
+                                    &d.buffer_ptrs(),
                                     d.stride(),
                                     d.height() as usize,
                                 );

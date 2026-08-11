@@ -1682,6 +1682,12 @@ fn prim_game_disc(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// `present` (207): upload the CPU buffer and show the frame.
 fn prim_game_present(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     game_emit(vm, GameCommand::Present);
+    // Count the frame the VM just finished. `screenMemory` picks its buffer
+    // from this count, so the next frame is drawn into a DIFFERENT buffer from
+    // the one just handed to the host — without waiting for the host to say it
+    // is done, which is the wait that cannot be had here and the tear that
+    // came of pretending otherwise.
+    crate::embed::advance_screen_frame();
     PrimResult::Ok(args[0])
 }
 

@@ -472,40 +472,94 @@ pub enum GameCommand {
 // `clear_screen_memory` bumps it so a stale handle reads as "no buffer" rather
 // than as freed memory. Belt and braces on top of the fact that the buffers
 // themselves are only freed on pane close, with the writing VM stopped first.
-static SCREEN_PTR: AtomicUsize = AtomicUsize::new(0);
+// ROTATION, and why it is counted rather than published.
+//
+// The first cut published ONE pointer — "the current write buffer" — and
+// republished it after each present. That tore, visibly and badly, and the
+// reason is a race the "three buffers, no fence" argument missed: the rotation
+// happens on the MAIN thread when the Present command is drained, but the VM
+// does not wait for that. A demo sends `present` and immediately starts the
+// next frame, so it fetches the OLD published pointer and begins writing the
+// very buffer the GPU is about to read. ParallelMandel showed it worst, its
+// four workers piling into the buffer being displayed.
+//
+// The fix needs no synchronisation, only agreement. Both sides count the same
+// ordered events: the host publishes ALL the buffers once, and each side picks
+// `frame % count` — the VM incrementing its counter when it sends `present`,
+// the host incrementing its own when it renders one. The command stream is
+// ordered, so the two counts describe the same frame without either waiting on
+// the other.
+const MAX_SCREEN_BUFFERS: usize = 4;
+static SCREEN_PTRS: [AtomicUsize; MAX_SCREEN_BUFFERS] =
+    [const { AtomicUsize::new(0) }; MAX_SCREEN_BUFFERS];
+static SCREEN_NBUF: AtomicUsize = AtomicUsize::new(0);
+/// How many frames the VM has presented. Picks which buffer `screenMemory`
+/// hands out; the host's own count picks which one it renders.
+static SCREEN_FRAME: AtomicU64 = AtomicU64::new(0);
 static SCREEN_STRIDE: AtomicUsize = AtomicUsize::new(0);
 static SCREEN_HEIGHT: AtomicUsize = AtomicUsize::new(0);
 static SCREEN_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Publish the current direct framebuffer. Called by the host on the thread
-/// that owns the Metal buffers — at pane creation, and after each present,
-/// because presenting rotates which of the buffers is the write target.
+/// Count a presented frame — called by the `present` primitive, so the VM's
+/// notion of "which buffer am I drawing into" advances at exactly the moment
+/// it finishes a frame, not whenever the host gets round to drawing it.
+pub(crate) fn advance_screen_frame() {
+    SCREEN_FRAME.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Publish the direct framebuffer's ROTATING SET — every buffer, once, at pane
+/// creation. Not "the current one after each present": see the note above, and
+/// the tearing that taught it.
 ///
 /// # Safety contract (not `unsafe`, but a contract all the same)
-/// `ptr` must stay valid and writable until [`clear_screen_memory`] is called,
-/// and the host must stop the writing VM before freeing it.
-pub fn publish_screen_memory(ptr: *mut u8, stride: usize, height: usize) {
+/// Every pointer must stay valid and writable until [`clear_screen_memory`],
+/// and the host must stop the writing VM before freeing them.
+pub fn publish_screen_buffers(ptrs: &[*mut u8], stride: usize, height: usize) {
+    let n = ptrs.len().min(MAX_SCREEN_BUFFERS);
     SCREEN_STRIDE.store(stride, Ordering::Relaxed);
     SCREEN_HEIGHT.store(height, Ordering::Relaxed);
-    // The pointer last, with Release: a reader that sees a non-null pointer is
-    // guaranteed to see the stride and height that go with it.
-    SCREEN_PTR.store(ptr as usize, Ordering::Release);
+    SCREEN_FRAME.store(0, Ordering::Relaxed);
+    for (i, p) in ptrs.iter().take(n).enumerate() {
+        SCREEN_PTRS[i].store(*p as usize, Ordering::Relaxed);
+    }
+    // Count last, with Release: a reader that sees a non-zero count is
+    // guaranteed to see the pointers, the stride and the height that go with it.
+    SCREEN_NBUF.store(n, Ordering::Release);
+}
+
+/// Publish a SINGLE buffer — the degenerate case, used by tests and by any
+/// host with nothing to rotate. Identical to a rotating set of one, which
+/// means no rotation and therefore no tear-freedom: fine when one writer
+/// finishes a whole frame between presents, which is exactly what a test does.
+pub fn publish_screen_memory(ptr: *mut u8, stride: usize, height: usize) {
+    publish_screen_buffers(&[ptr], stride, height);
 }
 
 /// Retract the framebuffer — the pane closed, or is being rebuilt. Bumps the
 /// generation so any Alien still held over the old memory is dead rather than
 /// dangling.
 pub fn clear_screen_memory() {
-    SCREEN_PTR.store(0, Ordering::Release);
+    SCREEN_NBUF.store(0, Ordering::Release);
+    for p in SCREEN_PTRS.iter() {
+        p.store(0, Ordering::Relaxed);
+    }
     SCREEN_STRIDE.store(0, Ordering::Relaxed);
     SCREEN_HEIGHT.store(0, Ordering::Relaxed);
+    SCREEN_FRAME.store(0, Ordering::Relaxed);
     SCREEN_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 /// The published framebuffer as `(ptr, stride, height)`, or `None` when no
 /// direct pane is open.
 pub(crate) fn screen_memory() -> Option<(*mut u8, usize, usize)> {
-    let p = SCREEN_PTR.load(Ordering::Acquire);
+    let n = SCREEN_NBUF.load(Ordering::Acquire);
+    if n == 0 {
+        return None;
+    }
+    // The buffer for the frame the VM is drawing NOW — its own present count,
+    // not whatever the host last got round to rendering.
+    let slot = (SCREEN_FRAME.load(Ordering::Relaxed) as usize) % n;
+    let p = SCREEN_PTRS[slot].load(Ordering::Relaxed);
     if p == 0 {
         return None;
     }
@@ -2609,6 +2663,58 @@ mod tests {
         crate::embed::clear_screen_memory();
         assert_eq!(vm.eval("GamePane new screenMemory.").unwrap(), "nil");
         assert_eq!(vm.eval("GamePane new screenStride.").unwrap(), "nil");
+    }
+
+    #[test]
+    fn presenting_rotates_the_buffer_the_vm_writes_next() {
+        // THE TEARING FIX. A demo sends `present` and starts the next frame at
+        // once — it cannot wait for the host to actually draw, and the host
+        // draws whenever it drains the queue. So if the VM asked "which buffer
+        // now?" it would be told the one the host is about to read, and write
+        // into the picture being displayed. That is what tore, and badly, with
+        // four ParallelMandel workers piling into it.
+        //
+        // The cure is agreement without waiting: the host publishes ALL the
+        // buffers, and each side picks `frame % count` from its own count of
+        // the same ordered presents. Here: with three buffers, three
+        // consecutive frames must land in three DIFFERENT buffers, and the
+        // fourth must come back round.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _published = PublishedMemory;
+        const W: usize = 16;
+        const H: usize = 4;
+        let a = leaked_screen(W * H);
+        let b = leaked_screen(W * H);
+        let c = leaked_screen(W * H);
+        let (pa, pb, pc) = (a.as_mut_ptr(), b.as_mut_ptr(), c.as_mut_ptr());
+        crate::embed::publish_screen_buffers(&[pa, pb, pc], W, H);
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        // Frame n writes n+1 into every byte, then presents.
+        for n in 1..=4i64 {
+            // One top-level statement: `exec` runs a single top item, so a
+            // trailing `present.` on its own line would simply never run —
+            // which is exactly how this test first "proved" the bug was still
+            // there.
+            vm.exec(&format!(
+                "[ :fb | \
+                    1 to: {} do: [ :i | fb byteAt: i put: {n} ]. \
+                    GamePane basicNew present ] \
+                   value: GamePane basicNew screenMemory.",
+                W * H
+            ))
+            .expect("a frame must run");
+        }
+
+        // Three buffers, four frames: 1, 2, 3 into a, b, c — then frame 4 back
+        // into a, overwriting the 1.
+        assert_eq!(a[0], 4, "frame 4 must reuse the first buffer");
+        assert_eq!(b[0], 2, "frame 2 went to the second buffer");
+        assert_eq!(c[0], 3, "frame 3 went to the third buffer");
+        assert!(
+            b[0] != c[0],
+            "consecutive frames must never share a buffer — that is the tear"
+        );
     }
 
     #[test]
