@@ -40,7 +40,7 @@
 //! `load_order`, then install every class's methods. By the time any method
 //! compiles, every class name it could reference is already a bound global.
 
-use crate::{FullClass, FullMethod, Image};
+use crate::{FullClass, Image};
 use macvm::embed::VmHandle;
 
 /// Phase-1 shell source for a class: `<super> subclass: <name> [ |ivars| ]`
@@ -75,11 +75,11 @@ pub fn class_shell_mst(class: &FullClass) -> String {
 /// verbatim into the class body. The comment and category are omitted:
 /// neither affects compiled behaviour (comments are lexer-skipped; category
 /// is browser metadata the browser reads straight from the DB).
-pub fn class_methods_mst(class: &FullClass, methods: &[FullMethod]) -> String {
+pub fn class_methods_mst(class: &FullClass, sources: &[String]) -> String {
     let superclass = class.superclass.as_deref().unwrap_or("nil");
     let mut src = format!("{superclass} subclass: {} [\n", class.name);
-    for m in methods {
-        src.push_str(m.source.trim_end());
+    for m in sources {
+        src.push_str(m.trim_end());
         src.push('\n');
     }
     src.push_str("]\n");
@@ -145,15 +145,66 @@ pub fn load_world_from_image(
     doits: &[&str],
 ) -> Result<LoadStats, String> {
     let t0 = std::time::Instant::now();
+    let dbg = std::env::var_os("MACVM_BOOT_TIMING").is_some();
+    let mut mark = std::time::Instant::now();
+    let mut step = |label: &str, mark: &mut std::time::Instant| {
+        if dbg {
+            eprintln!("[db-step] {label}: {:.1} ms", mark.elapsed().as_nanos() as f64 / 1e6);
+        }
+        *mark = std::time::Instant::now();
+    };
     let classes = image
         .classes_for_lists(list_names)
         .map_err(|e| format!("reading classes from image: {e}"))?;
 
-    // Phase 1: bind every class global (shells only) in load_order.
-    for class in &classes {
-        vm.exec(&class_shell_mst(class))
-            .map_err(|e| format!("defining class {}: {e}", class.name))?;
+    // Both phases run as ONE source blob through `VmHandle::load_source` —
+    // one recovery bracket and one idle-baseline snapshot per PHASE, where
+    // the original ran one `exec` (bracket and all) per CLASS per phase.
+    // Together with the single grouped method query below, this took the
+    // MACVM_BOOT_TIMING "other" bucket from ~12 ms to a few; the assembled
+    // source is byte-for-byte what the per-class calls fed the compiler, so
+    // the byte-identity gate (`it_run_from_image`) is unaffected.
+    //
+    // The one thing a blob loses is free error attribution — "which class?"
+    // was the exec call's own context. `blob` keeps a line index (each
+    // chunk's first line → class name) and `attribute` recovers the class
+    // from the CompileError's own line, so a corrupt record is still named.
+    struct Blob {
+        src: String,
+        index: Vec<(u32, String)>, // (first line of chunk, class name)
+        line: u32,
     }
+    impl Blob {
+        fn new() -> Blob {
+            Blob { src: String::new(), index: Vec::new(), line: 1 }
+        }
+        fn push(&mut self, name: &str, chunk: &str) {
+            self.index.push((self.line, name.to_string()));
+            self.line += chunk.matches('\n').count() as u32;
+            self.src.push_str(chunk);
+        }
+        fn attribute(&self, e: &macvm::embed::GuestError) -> String {
+            let line = match e {
+                macvm::embed::GuestError::Compile(c) => c.span.line,
+                _ => return String::from("(runtime)"),
+            };
+            match self.index.iter().rev().find(|(l, _)| *l <= line) {
+                Some((_, name)) => name.clone(),
+                None => String::from("(preamble)"),
+            }
+        }
+    }
+
+    step("classes_for_lists (SQL)", &mut mark);
+    // Phase 1: bind every class global (shells only) in load_order.
+    let mut shells = Blob::new();
+    for class in &classes {
+        shells.push(&class.name, &class_shell_mst(class));
+    }
+    step("shell blob assembly", &mut mark);
+    vm.load_source(&shells.src)
+        .map_err(|e| format!("defining class {}: {e}", shells.attribute(&e)))?;
+    step("shells load_source (wall)", &mut mark);
 
     // Pre-declare every global a doIt assigns, so phase-2 methods that
     // reference it (e.g. `Transcript`) resolve at compile time.
@@ -171,17 +222,25 @@ pub fn load_world_from_image(
         methods: 0,
         doits: 0,
     };
+    let mut by_class = image
+        .method_sources_for_lists(list_names)
+        .map_err(|e| format!("reading methods from image: {e}"))?;
+    step("method_sources_for_lists (SQL)", &mut mark);
+    let mut reopens = Blob::new();
     for class in &classes {
-        let methods = image
-            .all_methods_of(&class.name)
-            .map_err(|e| format!("reading methods of {}: {e}", class.name))?;
+        let Some(methods) = by_class.remove(&class.name) else {
+            continue;
+        };
         if methods.is_empty() {
             continue;
         }
-        vm.exec(&class_methods_mst(class, &methods))
-            .map_err(|e| format!("installing methods of {}: {e}", class.name))?;
+        reopens.push(&class.name, &class_methods_mst(class, &methods));
         stats.methods += methods.len();
     }
+    step("reopen blob assembly", &mut mark);
+    vm.load_source(&reopens.src)
+        .map_err(|e| format!("installing methods of {}: {e}", reopens.attribute(&e)))?;
+    step("reopens load_source (wall)", &mut mark);
 
     // Finally the doIts, with every class and method in place.
     for &doit in doits {
@@ -262,13 +321,8 @@ mod tests {
         assert!(shell.contains("| x y |"), "{shell}");
 
         // Phase-2 methods reopen: no ivars, the method body verbatim.
-        let m = FullMethod {
-            selector: "x".into(),
-            side: Side::Instance,
-            category: "acc".into(),
-            source: "x [ ^x ]".into(),
-        };
-        let methods = class_methods_mst(&point, std::slice::from_ref(&m));
+        let source = String::from("x [ ^x ]");
+        let methods = class_methods_mst(&point, std::slice::from_ref(&source));
         assert!(methods.contains("Object subclass: Point ["), "{methods}");
         assert!(
             !methods.contains('|'),

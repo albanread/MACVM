@@ -630,6 +630,86 @@ impl Image {
 
     /// Every method (both sides, every category) belonging to `class_name`,
     /// at its latest version — the per-class companion to [`all_classes`].
+    /// Every latest, non-deleted method of every class in the given package
+    /// lists, grouped by class name — ONE query for the whole boot, where
+    /// [`all_methods_of`](Self::all_methods_of) is one prepared statement and
+    /// one query PER CLASS (~360 of each on a world boot; measurable in
+    /// MACVM_BOOT_TIMING's "other"). The package filter and per-class method
+    /// order (`m.method_id`) are identical to those two, so the assembled
+    /// source is byte-for-byte what the per-class path produced.
+    /// Every latest, non-deleted method SOURCE of every class in the given
+    /// package lists, grouped by class name — the boot's one bulk read.
+    ///
+    /// Lean by design, measured twice on the way here (MACVM_BOOT_TIMING):
+    ///
+    /// - NOT the `latest_method_versions` view: its correlated `MAX` per row
+    ///   of a full scan cost ~11 ms alone — the whole "other" bucket, and
+    ///   the same cost the per-class `all_methods_of` path paid in ~360
+    ///   installments (why batching the CALLS changed nothing). The CTE
+    ///   resolves every latest version in one grouped index pass.
+    /// - ONLY (class_id, source): the boot concatenates sources verbatim
+    ///   (`class_methods_mst`); selector/side/category were three more
+    ///   String materializations per row for nothing.
+    /// - The class/package filter is resolved FIRST into a 362-entry map
+    ///   (one cheap query), not re-derived per method row by a five-way
+    ///   join.
+    ///
+    /// What remains (~3-4 ms) is SQLite reading ~1.3 MB of text out of the
+    /// versioned history table — the storage floor for source-of-truth
+    /// boot, not query overhead.
+    pub fn method_sources_for_lists(
+        &self,
+        list_names: &[&str],
+    ) -> rusqlite::Result<std::collections::HashMap<String, Vec<String>>> {
+        let mut grouped: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        if list_names.is_empty() {
+            return Ok(grouped);
+        }
+        let placeholders = list_names.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let class_sql = format!(
+            "SELECT c.class_id, c.name \
+             FROM classes c JOIN latest_class_versions lcv ON lcv.class_id = c.class_id \
+             WHERE lcv.deleted = 0 AND lcv.category IN ( \
+                 SELECT DISTINCT plm.package FROM package_list_members plm \
+                 JOIN package_lists pl ON pl.list_id = plm.list_id \
+                 WHERE pl.name IN ({placeholders}) \
+             )"
+        );
+        let mut stmt = self.conn.prepare(&class_sql)?;
+        let wanted: std::collections::HashMap<i64, String> = stmt
+            .query_map(rusqlite::params_from_iter(list_names.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        // Rows stream in method_id order (matching `all_methods_of`'s
+        // per-class ORDER BY, since ids are assigned in import order);
+        // methods of unlisted classes are skipped by the map probe.
+        let mut stmt = self.conn.prepare(
+            "WITH latest AS ( \
+                 SELECT method_id, MAX(version_number) AS v \
+                 FROM method_versions GROUP BY method_id \
+             ) \
+             SELECT m.class_id, mv.source \
+             FROM methods m \
+             JOIN latest l ON l.method_id = m.method_id \
+             JOIN method_versions mv ON mv.method_id = l.method_id \
+                                    AND mv.version_number = l.v \
+             WHERE mv.deleted = 0 ORDER BY m.method_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (class_id, source) = row?;
+            if let Some(name) = wanted.get(&class_id) {
+                grouped.entry(name.clone()).or_default().push(source);
+            }
+        }
+        Ok(grouped)
+    }
+
     pub fn all_methods_of(&self, class_name: &str) -> rusqlite::Result<Vec<FullMethod>> {
         let mut stmt = self.conn.prepare(
             "SELECT m.selector, m.side, lmv.category, lmv.source \

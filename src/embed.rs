@@ -1179,6 +1179,46 @@ impl VmHandle {
         Ok(())
     }
 
+    /// Runs EVERY top-level item in `source`, in order, under ONE recovery
+    /// bracket — the bulk twin of [`exec`](Self::exec), which runs exactly one
+    /// item per call and pays the sigsetjmp + idle-baseline bracket each time.
+    ///
+    /// Built for the DB boot (`image_store::world_boot`): replaying a world is
+    /// hundreds of class definitions, and per-item `exec` calls made the
+    /// BRACKET a measurable slice of boot ("other" in MACVM_BOOT_TIMING).
+    /// One call, one bracket, same recovery semantics: a guest fatal or a
+    /// native fault mid-blob unwinds here exactly as it would mid-exec, and a
+    /// compile error aborts at the failing item (earlier items stay
+    /// installed — identical to the per-exec behaviour, where earlier calls
+    /// had already succeeded).
+    #[allow(unsafe_code)]
+    pub fn load_source(&mut self, source: &str) -> Result<(), GuestError> {
+        let slot = deopt_trap::claim_jmp_slot();
+        // SAFETY: as `eval`/`exec` — `sigsetjmp` inline at this call site,
+        // whose frame stays live for the whole recovery window.
+        let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
+        if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
+            let message = deopt_trap::take_last_guest_fatal_message().expect(
+                "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
+            );
+            return Err(self.handle_guest_fatal(message));
+        }
+        if rc != 0 {
+            let (sig, pc, far) = deopt_trap::take_last_crash_info()
+                .expect("sigsetjmp returned nonzero without a recorded crash");
+            return Err(self.handle_native_fault(sig, pc, far));
+        }
+        self.snapshot_idle_baseline();
+        let items = frontend::parser::parse_file(source).map_err(GuestError::Compile)?;
+        for item in items {
+            frontend::classdef::execute_top_item(&mut self.vm, item).map_err(GuestError::Compile)?;
+            if self.vm.exit_requested {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// The C6 reverse-dispatch callback door (`cocoa_gui_design.md` §4, §5
     /// Layer 1): run `body` — an AppKit→Smalltalk delegate dispatch that marshals
     /// its native arguments, performs the handler, and marshals the native return
