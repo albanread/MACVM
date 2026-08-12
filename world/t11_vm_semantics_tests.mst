@@ -232,3 +232,70 @@ TestCase subclass: NonLocalReturnTest [
         ^#late
     ]
 ]
+
+"── lexical scope ─────────────────────────────────────────────────────────"
+
+"A block temp is visible to a NESTED block. Standard in every Smalltalk, and
+ promised by SPEC §Temporaries ('block-local temps, full closures') — but it
+ was broken here, silently, in both tiers: the dissolved (inlined) code wrote
+ the name to a hoisted FRAME SLOT while the nested block read it from the
+ CONTEXT, so one variable had two homes. A read answered nil and a write was
+ lost. Found on 2026-08-12 while writing a table renderer whose inner loop
+ accumulated a width into a temp declared inside an `ifTrue:`."
+TestCase subclass: BlockScopeTest [
+
+    testANestedBlockSeesAnEnclosingBlockTemp [
+        "The read half: x is set in the ifTrue: block, read in the do: block."
+        | r |
+        r := nil.
+        true ifTrue: [ | x | x := 5. #(1) do: [ :each | r := x ] ].
+        self assert: r equals: 5
+    ]
+
+    testANestedBlockCanWriteAnEnclosingBlockTemp [
+        "The write half — the shape that raised `nil does not understand #+`."
+        | r |
+        r := nil.
+        true ifTrue: [ | x | x := 0. #(3 4) do: [ :w | x := x + w ]. r := x ].
+        self assert: r equals: 7
+    ]
+
+    testTwoBlockLevelsDeep [
+        "The same, one level deeper: the temp must survive two nestings."
+        | r |
+        r := nil.
+        true ifTrue: [ | x |
+            x := 1.
+            #(2) do: [ :a | #(3) do: [ :b | x := x + a + b ] ].
+            r := x ].
+        self assert: r equals: 6
+    ]
+
+    testAMethodTempStillWorks [
+        "The case that always worked, kept so a fix cannot regress it."
+        | r |
+        r := 0.
+        #(3 4) do: [ :w | r := r + w ].
+        self assert: r equals: 7
+    ]
+
+    testABlockDeclaringItsOwnTempStillWorks [
+        | r |
+        r := nil.
+        #(3 4) do: [ :w | | y | y := w * 2. r := y ].
+        self assert: r equals: 8
+    ]
+
+    testEachIterationSeesTheUpdatedValue [
+        "Not just the final value — the temp is ONE variable shared across
+         iterations, not a fresh copy per call."
+        | seen |
+        seen := nil.
+        true ifTrue: [ | n log |
+            n := 0.
+            log := OrderedCollection new.
+            #(1 2 3) do: [ :w | n := n + w. log add: n ].
+            seen := log ].
+        self assert: seen asArray equals: #(1 3 6)
+    ]
+]

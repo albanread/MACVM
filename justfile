@@ -94,7 +94,11 @@ soak-s08-ci:
 # just done in the shell instead of in Rust so this is CLI/stdout-diffable
 # under different MACVM_JIT values, not only assertable in-process).
 run-world-tests:
-    grep -v '^#' world/tests/tests.list | grep -v '^$' | sed 's|^|world/tests/|' | xargs cat > /tmp/macvm_world_tests.mst
+    # ONE tests package now (world/tests.list); its entries are relative to
+    # world/, and there is no driver file — suites are found by reflection, so
+    # the run is appended here.
+    grep -v '^#' world/tests.list | grep -v '^$' | sed 's|^|world/|' | xargs cat > /tmp/macvm_world_tests.mst
+    printf 'TestRunner start. TestRunner runAll. TestRunner report.\n' >> /tmp/macvm_world_tests.mst
     cargo run --quiet -- run /tmp/macvm_world_tests.mst --world world
 
 soak-s08:
@@ -197,7 +201,11 @@ gate-s10: gate-s09
 bridge-stats-s11:
     #!/usr/bin/env bash
     set -euo pipefail
-    grep -v '^#' world/tests/tests.list | grep -v '^$' | sed 's|^|world/tests/|' | xargs cat > /tmp/macvm_world_tests.mst
+    # ONE tests package now (world/tests.list); its entries are relative to
+    # world/, and there is no driver file — suites are found by reflection, so
+    # the run is appended here.
+    grep -v '^#' world/tests.list | grep -v '^$' | sed 's|^|world/|' | xargs cat > /tmp/macvm_world_tests.mst
+    printf 'TestRunner start. TestRunner runAll. TestRunner report.\n' >> /tmp/macvm_world_tests.mst
     # GC_STRESS=1 (scavenge on EVERY allocation), not full:64: the sampled
     # mode can legitimately land all of its collections outside compiled
     # windows (1-in-64 across a suite whose compiled stretches are short),

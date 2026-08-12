@@ -269,6 +269,26 @@ impl Ctx<'_> {
         span: Span,
         is_write: bool,
     ) -> Result<VarRef, CompileError> {
+        // A dissolved local that a NESTED REAL BLOCK captures lives in the
+        // CONTEXT, and the hoist override must not win for it — otherwise the
+        // one variable gets two homes. The dissolved (inlined) code would
+        // write the frame slot while the nested block reads the ctx slot:
+        //
+        //     | r | true ifTrue: [ | x |            "x hoisted to a frame slot"
+        //         x := 0.                           "…written there"
+        //         #(3 4) do: [:w | x := x + w ].    "…but read from the Context"
+        //         r := x ]
+        //
+        // which answered nil for the read and lost the write — `nil DNU #+`.
+        // A block temp is lexically visible to a nested block in every
+        // Smalltalk, and SPEC §"Temporaries" promises "block-local temps, full
+        // closures", so this was a defect, not a dialect choice. Ask capture
+        // FIRST and let a `Captured` answer win; the hoist still owns the
+        // names that genuinely stayed frame-local, which is what it exists for
+        // (capture does not know their fresh slot numbers).
+        if let Some(Resolved::Captured { depth, ctx_slot }) = self.capture.resolve(scope_id, name) {
+            return Ok(VarRef::Captured { depth, ctx_slot });
+        }
         for h in hoist.iter().rev() {
             if let Some(&slot) = h.names.get(name) {
                 return Ok(VarRef::Local(slot));

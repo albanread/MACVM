@@ -158,21 +158,45 @@ Exception.dlt:177-185).
   stress test — signal-through-optimized-frames exercises S13 hard. Add the
   exception tests to the S13+ stress gates when W5 lands.
 
-## 8. SUnit — lite now, 3.1 later, same surface
+## 8. SUnit — real, landed
 
-Strongtalk ships real Camp Smalltalk **SUnit 3.1** (TestCase.dlt 368 ln,
-TestResult, TestSuite, TestResource + TextTestRunner headless runner; the
-whole framework ≈1,100 lines). Its failure path is exception-based
-(`signalFailure:` → signal, caught in `TestResult>>runCase:`; teardown via
-`sunitEnsure:`), and `runAll`/`debugAsFailure` fork processes.
+**This section described a plan that has been carried out.** See
+[`TESTING.md`](TESTING.md) for how to use it and
+[`sunit_design.md`](sunit_design.md) for the design.
 
-**Binding rule for S6's SUnit-lite: keep the selector surface identical** —
-`assert:` (boolean or block), `deny:`, `assert:description:`, `setUp`,
-`tearDown`, `test*` discovery, `TestResult` with passed/failures/errors —
-recording failures instead of unwinding. Defer `should:raise:`, resumable
-failures, TestResource, forked runners. Then at W5 (+exceptions) the real
-SUnit 3.1 drops in over the same test corpus, using the `sunit*` portability
-shims (SUnitNameResolver etc.) exactly as upstream intended.
+The plan was a "SUnit-lite" that RECORDED assertion failures instead of
+unwinding, because v1 had no exceptions (SPEC §1.3) — with real SUnit dropping
+in later over the same corpus. Both halves happened. SUnit-lite shipped as
+`world/tests/00_sunit.mst` and carried the library corpus for a dozen sprints;
+exceptions landed (E0–E4); and in d6c7697 the lite version was retired and its
+549 tests moved onto the real framework, `world/86_sunit.mst`.
+
+The binding rule — keep the selector surface identical — is what made that
+migration nearly free. The 61 existing suites already declared ordinary
+`test*` methods, so reflection found exactly the same 549 tests and their
+hand-maintained `runAll` listings were deleted as pure duplication.
+
+What is there now, and how it differs from the Strongtalk/Camp Smalltalk
+original:
+
+- **Exception-based**, as upstream: `TestFailure` is an `Error` subclass,
+  `assert:` signals it, `tearDown` runs through `ensure:`.
+- **Failure vs error kept apart**, by nesting the `TestFailure` handler
+  INSIDE the `Error` handler. Written the other way round, every failure would
+  land in the error bucket and the distinction would silently not exist.
+- **A fresh instance per test**, as upstream — the semantics that make a suite
+  trustworthy, and the thing SUnit-lite did not do (it ran a whole class on one
+  instance, in a hand-written order, which hid two latent bugs until the
+  migration exposed them).
+- `should:raise:` / `shouldnt:raise:` are present, not deferred.
+- **Not present:** `TestResource`, `expectedFailures`, resumable failures,
+  forked runners, and `TestSuite` as a composable object (`TestRunner run:`
+  takes classes directly). Recorded in `sunit_design.md` §2 as deliberate.
+- **`isHelper`** is MACVM's own: `allTestClasses` sweeps by reflection, so a
+  suite that exists only to be run BY another test must opt out.
+
+572 tests across 65 suites, gated three ways (`tests/it_world.rs`,
+`gui/tests/sunit_bridge.rs`, `just ci`) and runnable from the GUI's Tests tab.
 
 ## 9. Deferred surfaces (design known, scheduled later)
 

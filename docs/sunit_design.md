@@ -238,6 +238,21 @@ template. All UI code is Smalltalk on the UI worker, per the house rule.
 Each sprint lands committed, verified per house rules (release-profile tests;
 GUI sprints driven end-to-end over `MACVM_COCOA_CTL` with screenshots).
 
+> **Status, 2026-08-12.** **S1 and S2 are LANDED.** S1: `86_sunit.mst`, the
+> `tests` package, `macvm-gui test`, and `gui/tests/sunit_bridge.rs` gating it
+> from cargo (79a85be). S2: the Tests tab, `world/86_coctests.mst`, verified in
+> the running app — 65 suites in the tree, 572 result rows, green (7688c3d).
+> SUnit-lite was retired and its 549 tests migrated on the way (d6c7697), and
+> the two lists were consolidated into one `tests` package so the GUI and the
+> CLI see the same 572 (ca55e2e). User-facing docs: [`TESTING.md`](TESTING.md).
+>
+> Two things S2 turned up, both now fixed: nested `TestRunner` runs were
+> joining an open session (SUnit's own suite nests one in every test), and the
+> primary VM had to be given the `tests` package — the tab ran on the primary
+> but the primary did not hold the suites. Two S3 questions were also parked:
+> whether "Run Selected" is acting as the window's default button, and whether
+> fronting the window for a snapshot delivers an event that reaches it.
+
 - **S1 — the framework, the first suites, the headless runner.**
   `86_sunit.mst`; `tests.list` + t-files porting the Life/Minesweeper embed
   assertions and library smoke; `macvm-gui test`; `gui/tests/sunit_bridge.rs`

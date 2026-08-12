@@ -69,6 +69,7 @@ Object subclass: CocoaHelp [
         t add: (Array with: 'The Strongtalk World'   with: #worldText).
         t add: (Array with: 'Guide: Build an App'    with: #appGuideText).
         t add: (Array with: 'Guide: Build a Game'    with: #gameGuideText).
+        t add: (Array with: 'Guide: Test Your Code'  with: #testGuideText).
         t add: (Array with: 'Automation'             with: #automationText).
         t add: (Array with: 'Caring for Your World'  with: #worldCareText).
         t add: (Array with: 'Under the Hood'         with: #internalsText).
@@ -607,6 +608,10 @@ Object subclass: CocoaHelp [
                     ifFalse: [ (self isBullet: line) ifTrue: [
                         flushBody value.
                         blocks add: (Array with: #bullet with: (self bulletTextOf: line)) ]
+                    ifFalse: [ (self isTableRow: line) ifTrue: [
+                        mode = #table ifFalse: [ flushBody value. mode := #table ].
+                        buf contents isEmpty ifFalse: [ buf nextPut: lf ].
+                        buf nextPutAll: line ]
                     ifFalse: [ (self isQuote: line) ifTrue: [
                         mode = #quote ifFalse: [ flushBody value. mode := #quote ].
                         buf contents isEmpty ifFalse: [ buf nextPut: lf ].
@@ -618,17 +623,28 @@ Object subclass: CocoaHelp [
                                     blocks add: (Array with: #quote with: buf contents).
                                     buf := WriteStream on: String new.
                                     mode := #none ]
-                                ifFalse: [ flushBody value ] ]
+                                ifFalse: [
+                                    mode = #table
+                                        ifTrue: [
+                                            blocks add: (Array with: #table with: buf contents).
+                                            buf := WriteStream on: String new.
+                                            mode := #none ]
+                                        ifFalse: [ flushBody value ] ] ]
                         ifFalse: [
                             mode = #quote ifTrue: [
                                 blocks add: (Array with: #quote with: buf contents).
                                 buf := WriteStream on: String new.
                                 mode := #none ].
+                            mode = #table ifTrue: [
+                                blocks add: (Array with: #table with: buf contents).
+                                buf := WriteStream on: String new.
+                                mode := #none ].
                             buf contents isEmpty ifFalse: [ buf nextPut: lf ].
                             buf nextPutAll: line.
-                            mode := #body ] ] ] ] ] ] ] ].
+                            mode := #body ] ] ] ] ] ] ] ] ].
         mode = #code ifTrue: [ blocks add: (Array with: fenceKind with: buf contents) ].
         mode = #quote ifTrue: [ blocks add: (Array with: #quote with: buf contents) ].
+        mode = #table ifTrue: [ blocks add: (Array with: #table with: buf contents) ].
         mode = #body ifTrue: [ flushBody value ].
         ^blocks
     ]
@@ -738,6 +754,7 @@ Object subclass: CocoaHelp [
             self append: self nl font: nil color: nil into: storage.
             ^self indentFrom: start in: storage first: 22.0 head: 42.0 ].
         tag = #rule ifTrue: [ ^self appendRuleInto: storage ].
+        tag = #table ifTrue: [ ^self appendTable: text into: storage ].
         (tag = #code or: [ tag = #launch or: [ tag = #ref or: [ tag = #ui ] ] ]) ifTrue: [
             | start |
             start := storage onMain length.
@@ -770,6 +787,110 @@ Object subclass: CocoaHelp [
             self indentFrom: start in: storage first: 18.0 head: 40.0.
             ^self append: self nl font: nil color: nil into: storage ].
         self appendMarkdown: text into: storage.
+    ]
+
+    "── tables (GFM pipe tables) ──────────────────────────────────────────
+     AppKit's CommonMark parser has NO tables — they are a GFM extension —
+     so a `| a | b |` line reaches it as literal pipes and renders as
+     literal pipes. Parsed and laid out here instead: cells split on the
+     bars, the |---|---| separator row dropped, every column padded to its
+     widest cell, and the grid set MONOSPACED so the columns actually line
+     up. A proportional font would undo the padding."
+
+    CocoaHelp class >> isTableRow: aLine [
+        ^(aLine trimSeparators) startsWith: '|'
+    ]
+    CocoaHelp class >> cellsOf: aLine [
+        "'| a | b |' -> ('a' 'b'). The leading and trailing bars are frame,
+         not separators, so they are stripped before splitting."
+        | t out |
+        t := aLine trimSeparators.
+        (t startsWith: '|') ifTrue: [ t := t copyFrom: 2 to: t size ].
+        (t endsWith: '|') ifTrue: [ t := t copyFrom: 1 to: t size - 1 ].
+        out := OrderedCollection new.
+        (t subStrings: '|') do: [ :c | out add: c trimSeparators ].
+        ^out asArray
+    ]
+    CocoaHelp class >> isSeparatorCells: cells [
+        "The |---|:--:| row: every cell is dashes and colons, and there is
+         at least one dash. It carries alignment in GFM; here it only marks
+         where the header ends."
+        | any |
+        any := false.
+        cells do: [ :c |
+            c isEmpty ifTrue: [ ^false ].
+            c do: [ :ch |
+                (ch = $- or: [ ch = $: ]) ifFalse: [ ^false ].
+                ch = $- ifTrue: [ any := true ] ] ].
+        ^any
+    ]
+    CocoaHelp class >> padTo: n text: aString [
+        | out |
+        out := WriteStream on: String new.
+        out nextPutAll: aString.
+        (aString size + 1) to: n do: [ :i | out nextPut: $  ].
+        ^out contents
+    ]
+
+    CocoaHelp class >> appendTable: text into: storage [
+        "Header in teal with a hairline rule beneath it, body rows in the
+         ordinary label colour, the whole grid on the same faint panel a
+         code listing gets — so a table reads as a figure, not as prose."
+        | rows widths header start |
+        rows := OrderedCollection new.
+        (self linesOf: text) do: [ :line |
+            | cells |
+            line trimSeparators isEmpty ifFalse: [
+                cells := self cellsOf: line.
+                (self isSeparatorCells: cells) ifFalse: [ rows add: cells ] ] ].
+        rows isEmpty ifTrue: [ ^self ].
+        "Widest cell per column, over every row."
+        widths := OrderedCollection new.
+        rows do: [ :cells |
+            1 to: cells size do: [ :i |
+                widths size < i ifTrue: [ widths add: 0 ].
+                (widths at: i) < (cells at: i) size
+                    ifTrue: [ widths at: i put: (cells at: i) size ] ] ].
+        self append: self nl font: nil color: nil into: storage.
+        start := storage onMain length.
+        header := true.
+        rows do: [ :cells |
+            | line |
+            line := WriteStream on: String new.
+            line nextPutAll: '  '.
+            1 to: cells size do: [ :i |
+                line nextPutAll: (self padTo: (widths at: i) text: (cells at: i)).
+                i < cells size ifTrue: [ line nextPutAll: '   ' ] ].
+            self append: line contents , self nl
+                 font: (CocoaUI fixedFontOfSize: 12.0)
+                 color: (header
+                            ifTrue: [ (Cocoa classNamed: 'NSColor') onMain systemTealColor ]
+                            ifFalse: [ (Cocoa classNamed: 'NSColor') onMain labelColor ])
+                 into: storage.
+            header ifTrue: [
+                "A rule of the same width as the widest row, drawn in the
+                 header colour, so the head separates without a border."
+                | ruleWidth rule |
+                ruleWidth := 0.
+                widths do: [ :w | ruleWidth := ruleWidth + w + 3 ].
+                rule := WriteStream on: String new.
+                rule nextPutAll: '  '.
+                "A LITERAL '─', appended whole — not `Character value: 9472`.
+                 A String here is a BYTE vector, so constructing a character
+                 above 255 truncates it to one invalid byte and the bridge
+                 then (correctly) refuses to hand Cocoa invalid UTF-8:
+                 `Cocoa main-thread send failed ... 'appendString:'`. Written
+                 as source text it is just its three UTF-8 bytes."
+                1 to: ruleWidth - 3 do: [ :i | rule nextPutAll: '─' ].
+                self append: rule contents , self nl
+                     font: (CocoaUI fixedFontOfSize: 12.0)
+                     color: ((Cocoa classNamed: 'NSColor') onMain tertiaryLabelColor)
+                     into: storage.
+                header := false ] ].
+        self indentFrom: start in: storage first: 22.0 head: 22.0.
+        self tintFrom: start in: storage
+             color: ((Cocoa classNamed: 'NSColor') onMain quaternaryLabelColor).
+        ^self append: self nl font: nil color: nil into: storage
     ]
 
     CocoaHelp class >> indentFrom: start in: storage first: fi head: hi [
@@ -1722,6 +1843,100 @@ Each is one readable class, in the Browser:
 - `MandelZoom` — heavy arithmetic, the JIT at full stretch.
 
 > Whole numbers are your friend: they behave predictably *and* run on the VM''s fastest path. Breakout''s physics is nothing but integer addition.
+' ]
+
+    CocoaHelp class >> testGuideText [ ^'# Guide: Test Your Code
+
+Smalltalk invented unit testing. Kent Beck wrote **SUnit** for Smalltalk-80, and when the idea was carried to Java in 1997 it became JUnit — every *Unit since descends from that original. macVM ships the real thing, so if you have written a test in Pharo or Squeak, you already know this.
+
+There is a **Tests** tab in the toolbar. It is the fastest way in.
+
+## Your first test
+
+A test class is a subclass of `TestCase`. Every method whose name begins with `test` **is** a test — found by reflection, so there is no list anywhere to keep in step.
+
+```ref
+TestCase subclass: PointTest [
+    | origin |
+
+    setUp    [ origin := 0 @ 0 ]
+    tearDown [ origin := nil ]
+
+    testAddingMovesBothAxes [
+        self assert: (origin + (3 @ 4)) equals: 3 @ 4
+    ]
+
+    testDistanceIsPythagorean [
+        self assert: (origin dist: 3 @ 4) closeTo: 5.0
+    ]
+
+    testOutOfRangeRaises [
+        self should: [ (Array new: 3) at: 99 ] raise: Error
+    ]
+]
+```
+
+File that in, then run it straight from a Workspace:
+
+```ref
+PointTest run
+```
+
+**Every test gets its own fresh instance.** `setUp` runs before each one and `tearDown` after each one — including after a test that blows up. Nothing carries from one test to the next. That is what makes a suite worth trusting, so do not stash state in class variables hoping the next test will see it.
+
+## What to assert
+
+| | |
+|---|---|
+| `assert: aBoolean` | fails unless true |
+| `deny: aBoolean` | fails unless false |
+| `assert: actual equals: expected` | **prefer this one** |
+| `assert: actual closeTo: expected` | floats |
+| `should: aBlock raise: Error` | the block must raise |
+| `shouldnt: aBlock raise: Error` | the block must not |
+
+Any of them takes a `description:` as a final keyword if you want to say why in your own words.
+
+Reach for `assert:equals:` over `assert: a = b` every time. The first reports *expected 7 but was 8*; the second only tells you a test broke, and then you go hunting.
+
+## Failure is not error
+
+macVM keeps these apart, and the difference matters:
+
+- A **FAILURE** is an assertion that did not hold. Your code ran and gave the wrong answer.
+- An **ERROR** is anything else — a `doesNotUnderstand`, a divide by zero, an index out of range. The test never got as far as judging anything.
+
+A failure usually means your logic is wrong. An error usually means your test is wrong, or something underneath it broke.
+
+## The Tests tab
+
+Three panes. On the left, **SUITES**: every runnable suite, expandable to its tests, each with a dot carrying the last verdict — filled for passed, a cross for not, a faint dot for not yet run. On the right, **RESULTS**: one row per test with its status, time and failure message. Below that, **DETAIL**: the full text of whatever you selected.
+
+**Run All** runs everything in the image. **Run Selected** runs the suite you picked, or the single test. Your tests run on the *persistent* VM behind the window, not the one drawing it, so the interface stays live while they go.
+
+## From the command line
+
+```ref
+macvm-gui test
+```
+
+It prints a line per test and a summary, and exits 0 when green and 1 when not — so it drops straight into a build script or a git hook. Add `--repeat 2` to run everything twice in one image: the second pass is the first whose methods have been compiled by the JIT, which is the cheapest check that your code survives its own warm-up.
+
+## Where your tests live
+
+Write the file, then add one line to `world/tests.list`. That is the whole ceremony — suites are found by reflection, so there is no driver to update.
+
+**One thing to know.** This window boots from the image, not from the `.mst` files on disk. After you edit anything under `world/`, reseed before you look here:
+
+```ref
+macvm-gui seed --world world
+```
+
+Otherwise the command line will show your new suite and the Tests tab will not — and the command line is the one that looks right.
+
+## What ships
+
+**572 tests across 65 suites**, green. Most of them test the library you are standing on: collections, streams, numbers, exceptions, the FFI, sockets, supervision. `SUnitTest` is SUnit testing itself — it runs deliberately-broken cases through a nested runner and checks the framework reports them correctly, because a test framework that mis-reports a failure is worse than none.
 ' ]
 
     CocoaHelp class >> automationText [ ^'# Automation

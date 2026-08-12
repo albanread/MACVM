@@ -130,6 +130,13 @@ full measured record is [`docs/cog_bench.md`](docs/cog_bench.md).
   ([`docs/SIMD.md`](docs/SIMD.md)).
 - **Debugger** — crash-dossier (PROBE), breakpoints, mixed-tier backtrace, an
   a64 disassembler, IR dumps, and step-between-calls ([`docs/DEBUGGER.md`](docs/DEBUGGER.md)).
+- **SUnit** — the real thing, exception-based: `TestCase` with
+  `setUp`/`tearDown`, a fresh instance per test, `assert:equals:`,
+  `should:raise:`, and failure kept apart from error. **572 tests across 65
+  suites**, runnable three ways — `macvm-gui test` (exits 0/1, for a build
+  script), `MyTest run` in a Workspace, or the GUI's **Tests tab** (suite tree,
+  a row per test, failure text, Run All / Run Selected). Tests run on the
+  primary VM so the interface stays live ([`docs/TESTING.md`](docs/TESTING.md)).
 - **Optional static types** — a Strongtalk-style optional type checker:
   annotate parameters/returns/instance variables
   (`aNumber <Number> ^ <Boolean>`), get nominal + block + union subtyping, a
@@ -479,6 +486,8 @@ for direct pointers and a fast JIT.
 | [`docs/cocoa_gui_flag_and_drain.md`](docs/cocoa_gui_flag_and_drain.md) | Why a C6 callback may never touch VM-level state directly (two real failure modes: fails closed silently, or crashes the process) and the flag/wake/drain mechanism every UI rebuild, primary restart, and data-backed view refresh uses instead — plus a checklist for adding a new one |
 | [`docs/cocoa_gui_implementation.md`](docs/cocoa_gui_implementation.md) | Implementation walkthrough, real source cited: how a Cocoa class is found at runtime (both directions), how a Smalltalk send becomes `objc_msgSend` and back, how the moving GC and manual refcounting coexist with zero GC changes, how the UI VM and the persistent VM actually talk |
 | [`docs/DEBUGGER.md`](docs/DEBUGGER.md) | The debugging ladder: PROBE crash dossiers, breakpoints, mixed-tier backtraces, the a64 disassembler, IR dumps |
+| [`docs/TESTING.md`](docs/TESTING.md) | **Start here to write a test.** SUnit in MACVM: the assertion protocol, failure vs error, where tests live, running them from the CLI / a Workspace / the Tests tab, and how the suite is gated |
+| [`docs/sunit_design.md`](docs/sunit_design.md) | The SUnit design and its sprints: why the framework is exception-based, the Tests tab's data path (results computed on the primary, never the UI worker), and the deliberate omissions |
 | [`docs/typechecker_design.md`](docs/typechecker_design.md) | The optional Strongtalk-style type checker (built, T0′–T4): capture → parse+model → subtype+local rules → send rule → the entire core library annotated; the isolation gate and the byte-identical differential gate that make it safe to ship advisory-only |
 | [`docs/ASM.md`](docs/ASM.md) / [`docs/CANVAS.md`](docs/CANVAS.md) | Side-track designs with working preview tools: hand-written native-AArch64 methods (`<asm:>`), and the GUI Canvas widget |
 | [`docs/gamepane_design.md`](docs/gamepane_design.md) | The native Metal game engine driven from Smalltalk (MacGamePane): the frame/threading architecture, drawing/sprite/audio command channel, and the milestone ladder |
