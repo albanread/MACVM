@@ -144,6 +144,7 @@ pub fn load_world_from_image(
     list_names: &[&str],
     doits: &[&str],
 ) -> Result<LoadStats, String> {
+    let t0 = std::time::Instant::now();
     let classes = image
         .classes_for_lists(list_names)
         .map_err(|e| format!("reading classes from image: {e}"))?;
@@ -188,6 +189,7 @@ pub fn load_world_from_image(
             .map_err(|e| format!("running doit `{doit}`: {e}"))?;
         stats.doits += 1;
     }
+    macvm::frontend::boot_timing::report("db boot", t0.elapsed().as_nanos() as u64);
     Ok(stats)
 }
 

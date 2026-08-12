@@ -922,7 +922,7 @@ impl VmHandle {
         // requires the GUI's Browser accept path to run with
         // `MACVM_JIT=off`. See `arm_foreign_fault_handler`'s own doc.
         deopt_trap::arm_foreign_fault_handler();
-        let mut vm = VmState::with_options(opts);
+        let mut vm = frontend::boot_timing::primordial(|| VmState::with_options(opts));
         if let Err(e) = frontend::world::load_world(&mut vm, world_dir) {
             return Err(VmError { msg: e.to_string() });
         }
@@ -946,7 +946,7 @@ impl VmHandle {
         set_fatal_mode(FatalMode::ExitThread);
         deopt_trap::arm_foreign_fault_handler();
         VmHandle {
-            vm: VmState::with_options(opts),
+            vm: frontend::boot_timing::primordial(|| VmState::with_options(opts)),
             idle_baseline: IdleBaseline::default(),
             error_policy: ErrorPolicy::default(),
         }

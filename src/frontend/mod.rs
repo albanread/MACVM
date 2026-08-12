@@ -7,6 +7,7 @@
 //! boundaries).
 
 pub mod ast;
+pub mod boot_timing;
 pub mod capture;
 pub mod classdef;
 pub mod codegen;

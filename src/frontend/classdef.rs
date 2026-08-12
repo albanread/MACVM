@@ -263,8 +263,9 @@ pub fn install_class_def(vm: &mut VmState, node: &mut ClassDefNode) -> Result<()
     crate::memory::store::store(vm, assoc_mem, 1, klass_h.get(vm).oop());
 
     for method in &mut node.methods {
-        let compiled =
-            super::codegen::compile_method(vm, klass_h.get(vm), method.class_side, method)?;
+        let compiled = super::boot_timing::method(|| {
+            super::codegen::compile_method(vm, klass_h.get(vm), method.class_side, method)
+        })?;
         let sel = vm.universe.intern(method.pattern_selector.as_bytes());
         let target = if method.class_side {
             klass_h.get(vm).klass()
@@ -293,11 +294,11 @@ pub fn execute_do_it(vm: &mut VmState, stmt: super::ast::Expr) -> Result<Oop, Co
 pub fn execute_top_item(vm: &mut VmState, item: TopItem) -> Result<Option<Oop>, CompileError> {
     match item {
         TopItem::ClassDef(mut c) => {
-            install_class_def(vm, &mut c)?;
+            super::boot_timing::classdef(|| install_class_def(vm, &mut c))?;
             Ok(None)
         }
         TopItem::DoIt(stmt) => {
-            let r = execute_do_it(vm, stmt)?;
+            let r = super::boot_timing::doit(|| execute_do_it(vm, stmt))?;
             // Cocoa bridge pool hygiene (docs/cocoa_bridge_design.md §3.1):
             // a doit boundary is the natural quiescent point to drain +
             // renew this thread's bottom autorelease pool. A cheap

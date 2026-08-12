@@ -1374,6 +1374,9 @@ fn parse_temp_chunk(p: &mut Parser) -> Result<TopItem, CompileError> {
 }
 
 pub fn parse_file(input: &str) -> Result<Vec<TopItem>, CompileError> {
+    super::boot_timing::parse(|| parse_file_inner(input))
+}
+fn parse_file_inner(input: &str) -> Result<Vec<TopItem>, CompileError> {
     let mut p = Parser::new(input)?;
     let mut items = Vec::new();
     while !matches!(p.cur.0, Tok::Eof) {
@@ -1394,6 +1397,9 @@ pub fn parse_file(input: &str) -> Result<Vec<TopItem>, CompileError> {
 /// statement) — the REPL's per-line/per-chunk entry point. Returns `None`
 /// (input was ONLY trailing whitespace/comments) rather than erroring.
 pub fn parse_one_top_item(input: &str) -> Result<Option<TopItem>, CompileError> {
+    super::boot_timing::parse(|| parse_one_top_item_inner(input))
+}
+fn parse_one_top_item_inner(input: &str) -> Result<Option<TopItem>, CompileError> {
     let mut p = Parser::new(input)?;
     if matches!(p.cur.0, Tok::Eof) {
         return Ok(None);
@@ -1427,6 +1433,9 @@ pub fn parse_one_top_item(input: &str) -> Result<Option<TopItem>, CompileError> 
 /// bare trailing `FA at: 20` is complete as-is while genuine garbage
 /// (`3 + 4  5`) still errors.
 pub fn parse_top_items(input: &str) -> Result<Vec<TopItem>, CompileError> {
+    super::boot_timing::parse(|| parse_top_items_inner(input))
+}
+fn parse_top_items_inner(input: &str) -> Result<Vec<TopItem>, CompileError> {
     let mut p = Parser::new(input)?;
     let mut items = Vec::new();
 

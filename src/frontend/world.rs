@@ -39,6 +39,7 @@ pub fn load_file(vm: &mut VmState, path: &Path) -> Result<(), CompileError> {
 /// Returns `false` (no error) if `world.list` itself does not exist — the
 /// caller (`main.rs`) decides whether/how to warn about that.
 pub fn load_world(vm: &mut VmState, dir: &Path) -> Result<bool, CompileError> {
+    let t0 = std::time::Instant::now();
     let list_path = dir.join("world.list");
     let list_src = match std::fs::read_to_string(&list_path) {
         Ok(s) => s,
@@ -64,7 +65,10 @@ pub fn load_world(vm: &mut VmState, dir: &Path) -> Result<bool, CompileError> {
         }
         load_file(vm, &dir.join(line))?;
         if vm.exit_requested {
-            return Ok(true);
+            return {
+        super::boot_timing::report("mst boot", t0.elapsed().as_nanos() as u64);
+        Ok(true)
+    };
         }
     }
 
@@ -77,7 +81,10 @@ pub fn load_world(vm: &mut VmState, dir: &Path) -> Result<bool, CompileError> {
         let startup_sel = vm.universe.intern(b"startUp");
         let _ = crate::runtime::send_unary_if_understood(vm, receiver, startup_sel);
     }
-    Ok(true)
+    return {
+        super::boot_timing::report("mst boot", t0.elapsed().as_nanos() as u64);
+        Ok(true)
+    }
 }
 
 /// Loads an EXTRA world list (same format as `world.list`: one `.mst` path

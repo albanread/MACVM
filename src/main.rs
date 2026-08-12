@@ -101,7 +101,7 @@ fn cmd_run(args: &[String], debug: bool) {
         eprintln!("usage: macvm run|debug <file.mst> [--world <dir>]");
         std::process::exit(2);
     };
-    let mut vm = VmState::new();
+    let mut vm = macvm::frontend::boot_timing::primordial(VmState::new);
     load_world_with_warning(
         &mut vm,
         &world_dir.unwrap_or_else(|| PathBuf::from("world")),
