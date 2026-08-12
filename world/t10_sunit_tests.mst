@@ -135,6 +135,16 @@ TestCase subclass: SUnitTest [
         self assert: r passedCount equals: 2
     ]
 
+    "A NESTED RUN MUST NOT JOIN AN OPEN SESSION, and that is guarded by this
+     whole file rather than by a test of its own. Every test here runs a
+     nested TestRunner over deliberately-broken cases; the command line drives
+     the outer run as a SESSION (start/runAll/report). So if a nested run ever
+     joined the session again, these helpers' failures would leak into the
+     real result and the suite would go red — which is exactly how the leak
+     was found. A unit test for it would have to open a session while running
+     inside one, replacing the session it lives in and resetting the depth
+     counter it means to check: self-referential, and destructive."
+
     testSummaryLineIsTheWireFormat [
         "Everything downstream parses this: the Transcript, the command line,
          and the Tests tab. It is checked here so those three cannot drift."

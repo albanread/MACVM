@@ -1,18 +1,79 @@
-# The `tests` package (docs/sunit_design.md S1) — the world's own test suites.
+# The `tests` package — every suite that ships inside the image.
 #
-# A THIRD package beside `world` and `cocoaui`, loaded on top of a booted
-# world, so tests can subclass TestCase (world/86_sunit.mst) and name any
-# class in the image. Files carry a `t` prefix so this list reads at a glance
-# in a shared directory.
+# ONE list, three consumers: `macvm-gui test` (the command line), the Tests
+# tab (via `PRIMARY_LISTS`, cocoa_gui/src/boot.rs), and `tests/it_world.rs`
+# (cargo). There used to be a second list under world/tests/ that only cargo
+# read, which meant the 549-test library corpus was invisible to the GUI and
+# to anyone running `macvm-gui test` — the suite looked like 23 tests when it
+# was really 572.
 #
-# It SHIPS in the .app payload on purpose: a fresh install can open the Tests
-# tab, press Run All, and watch the library's own suite go green on their own
-# machine. No About box makes that argument as well.
-#
-# Run them: `macvm-gui test`, or `TestRunner runAllAndShow` in a Workspace,
-# or `MyTest run` for one class.
+# There is NO driver file here. Suites are found by reflection
+# (`TestRunner runAll`), so a driver would only be a second list to keep in
+# step — and a driver that ends in `Smalltalk quit:` must never load inside
+# the GUI, which would quit the app.
 
-# SUnit testing itself. First, because a framework that mis-reports a failure
-# says green when it should say red and everything downstream believes it.
+# SUnit's own suite, and the VM guarantees a Smalltalker's code rests on.
 t10_sunit_tests.mst
 t11_vm_semantics_tests.mst
+
+# The library corpus (world/tests/), in its original load order.
+tests/01_object_tests.mst
+tests/02_boolean_tests.mst
+tests/03_integer_tests.mst
+tests/04_large_integer_tests.mst
+tests/05_double_tests.mst
+tests/06_character_tests.mst
+tests/07_string_tests.mst
+tests/08_symbol_tests.mst
+tests/09_array_tests.mst
+tests/10_bytearray_tests.mst
+tests/11_orderedcollection_tests.mst
+tests/12_dictionary_tests.mst
+tests/13_interval_controlflow_tests.mst
+tests/14_stream_print_tests.mst
+tests/15_block_tests.mst
+tests/16_dispatch_tests.mst
+tests/17_gc_full_tests.mst
+tests/tier1.mst
+tests/18_collections_ext_tests.mst
+tests/19_set_tests.mst
+tests/20_fraction_tests.mst
+tests/21_readstream_tests.mst
+tests/22_sortedcollection_tests.mst
+tests/23_bag_tests.mst
+tests/24_random_tests.mst
+tests/25_point_tests.mst
+tests/26_identity_collections_tests.mst
+tests/27_date_time_tests.mst
+tests/28_readwritestream_tests.mst
+tests/29_object_protocol_gaps_tests.mst
+tests/30_ffi_alien_tests.mst
+tests/31_nil_macro_tests.mst
+tests/32_number_ext_tests.mst
+tests/33_collection_ext_tests.mst
+tests/34_string_stream_ext_tests.mst
+tests/35_object_ext_tests.mst
+tests/36_iteration_ext_tests.mst
+tests/37_dict_point_set_ext_tests.mst
+tests/38_format_iter_ext_tests.mst
+tests/39_final_ext_tests.mst
+tests/40_number_coercion_tests.mst
+tests/41_reflection_tests.mst
+tests/42_curtailment_tests.mst
+tests/43_rope_tests.mst
+tests/44_posix_io_tests.mst
+tests/45_iostream_tests.mst
+tests/46_scaleddecimal_tests.mst
+tests/47_socket_tests.mst
+tests/48_accel_tests.mst
+tests/49_supervisor_tests.mst
+tests/50_exception_tests.mst
+tests/51_collection_completion_tests.mst
+tests/52_numeric_completion_tests.mst
+tests/53_clock_completion_tests.mst
+tests/54_exception_verb_tests.mst
+tests/55_vm_error_tests.mst
+tests/56_cocoastring_tests.mst
+tests/57_string_completion_tests.mst
+tests/58_object_stream_tests.mst
+tests/55_exception_resume_tests.mst

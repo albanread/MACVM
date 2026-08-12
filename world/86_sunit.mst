@@ -286,7 +286,7 @@ Object subclass: TestCase [
  broad handler can see it."
 Object subclass: TestRunner [
 
-    <classVars: Session>
+    <classVars: Session Depth>
 
     TestRunner class >> run: classes [
         "Run every test in every class given, in order, and answer the result.
@@ -294,11 +294,22 @@ Object subclass: TestRunner [
          `classes` is a collection — or a SINGLE TestCase class, which is how
          a driver that names its suites one per line writes it
          (`TestRunner run: StringTests`). Both read naturally; refusing the
-         second would be pedantry."
+         second would be pedantry.
+
+         ONLY THE OUTERMOST RUN JOINS THE SESSION. A test may legitimately run
+         a nested TestRunner — SUnit's own suite does exactly that, over
+         deliberately-broken cases, and asserts on the result — and a nested
+         run must get its OWN result. Without the depth guard those nested
+         runs accumulated into the open session: `r runCount` answered 11
+         instead of 3, and the broken helpers' failures leaked out and turned
+         the whole suite red. It only showed once one image held both SUnit's
+         own suite and a session-driving runner."
         | result own |
-        own := Session isNil.
+        Depth := (Depth isNil ifTrue: [ 0 ] ifFalse: [ Depth ]) + 1.
+        own := Session isNil or: [ Depth > 1 ].
         result := own ifTrue: [ TestResult new ] ifFalse: [ Session ].
-        (self asClassList: classes) do: [ :cls | self run: cls into: result ].
+        [ (self asClassList: classes) do: [ :cls | self run: cls into: result ] ]
+            ensure: [ Depth := Depth - 1 ].
         own ifTrue: [ ^result finish ].
         ^result
     ]
@@ -318,12 +329,20 @@ Object subclass: TestRunner [
      nothing exits, which is what a Workspace and the Tests tab want."
 
     TestRunner class >> start [
-        "Begin a session. Every later `run:` accumulates into this one result."
+        "Begin a session. Every later TOP-LEVEL `run:` accumulates into this
+         one result; nested runs keep their own (see `run:`)."
         Session := TestResult new.
+        Depth := 0.
         ^Session
     ]
 
     TestRunner class >> session [ "The open session, or nil." ^Session ]
+
+    TestRunner class >> closeSession [
+        "Abandon the session without printing or exiting — what a TEST that
+         opened one must do, since `report` would quit the process."
+        Session := nil. Depth := 0
+    ]
 
     TestRunner class >> report [
         "Print the session and END THE PROCESS with its verdict: 0 green,

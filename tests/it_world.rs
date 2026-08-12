@@ -16,11 +16,12 @@ fn world_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("world")
 }
 
-/// Loads `world/tests/tests.list` (NOT named `world.list`, so
-/// `frontend::world::load_world` doesn't apply directly) relative to
-/// `world/tests/`, in order, stopping early if a file requests exit.
+/// Loads `world/tests.list` — the ONE `tests` package, shared with
+/// `macvm-gui test` and the Tests tab. Entries resolve relative to the list's
+/// own directory (`world/`), so the library corpus appears as
+/// `tests/NN_*.mst`. Stops early if a file requests exit.
 fn load_tests_list(vm: &mut macvm::runtime::VmState) {
-    let dir = world_dir().join("tests");
+    let dir = world_dir();
     let list_src = std::fs::read_to_string(dir.join("tests.list")).expect("read tests.list");
     for raw_line in list_src.lines() {
         let line = raw_line.trim();
@@ -28,6 +29,17 @@ fn load_tests_list(vm: &mut macvm::runtime::VmState) {
             continue;
         }
         world::load_file(vm, &dir.join(line)).unwrap_or_else(|e| panic!("{line}: {e}"));
+        if vm.exit_requested {
+            break;
+        }
+    }
+}
+
+/// Runs `.mst` source top-level item by item, stopping if one requests exit.
+fn run_source(vm: &mut macvm::runtime::VmState, src: &str) {
+    let items = macvm::frontend::parser::parse_file(src).expect("parse");
+    for item in items {
+        macvm::frontend::classdef::execute_top_item(vm, item).expect("execute");
         if vm.exit_requested {
             break;
         }
@@ -90,6 +102,9 @@ fn suite_green() {
     vm.out = Box::new(buf.clone());
     world::load_world(&mut vm, &world_dir()).expect("load_world");
     load_tests_list(&mut vm);
+    // Suites are found by REFLECTION, so there is no driver file to load —
+    // `runAll` sweeps the image and `report` sets the exit code.
+    run_source(&mut vm, "TestRunner start. TestRunner runAll. TestRunner report.");
 
     assert_eq!(vm.exit_code, Some(0), "stdout so far:\n{}", buf.as_string());
     let out = buf.as_string();
@@ -192,19 +207,15 @@ fn deliberately_failing_assertion_fails_the_run() {
     // SUnit itself comes from the WORLD now (world/86_sunit.mst) — there is
     // no separate framework file to load. Tests are found by reflection, so
     // the probe is just a `test*` method.
-    let src = "TestCase subclass: DeliberatelyFailingTests [\n\
-        testBoom [ self assert: 1 equals: 2 ]\n\
-    ]\n\
-    TestRunner start.\n\
-    TestRunner run: DeliberatelyFailingTests.\n\
-    TestRunner report.\n";
-    let items = macvm::frontend::parser::parse_file(src).unwrap();
-    for item in items {
-        macvm::frontend::classdef::execute_top_item(&mut vm, item).expect("execute");
-        if vm.exit_requested {
-            break;
-        }
-    }
+    run_source(
+        &mut vm,
+        "TestCase subclass: DeliberatelyFailingTests [\n\
+             testBoom [ self assert: 1 equals: 2 ]\n\
+         ]\n\
+         TestRunner start.\n\
+         TestRunner run: DeliberatelyFailingTests.\n\
+         TestRunner report.\n",
+    );
     assert_eq!(vm.exit_code, Some(1));
     let out = buf.as_string();
     assert!(
