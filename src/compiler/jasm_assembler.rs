@@ -79,16 +79,31 @@ impl JasmAssembler {
 
     /// Debug/test builds only (`CodeBlob::listing`'s own doc) — S10's
     /// disassembly goldens read this, release builds don't pay for it.
-    fn push_listing(&mut self, offset: u32, word: u32, text: &str) {
+    ///
+    /// `text` is a CLOSURE, not a `&str`, and that is the whole point: the
+    /// original took a string, so every caller built its line with
+    /// `format!("{mnemonic} {ops:?}")` EAGERLY — argument evaluation happens
+    /// at the call site, outside this gate — and a release JIT compile was
+    /// allocating and Debug-formatting one throwaway String per emitted
+    /// instruction. Found by `sample` on a compile burst: `DebugStruct::
+    /// field` and malloc traffic under `JasmAssembler::emit` in a RELEASE
+    /// profile, which this comment's old claim said could not happen.
+    fn push_listing(&mut self, offset: u32, word: u32, text: impl FnOnce() -> String) {
         if cfg!(debug_assertions) || cfg!(test) {
             self.listing
-                .push(format!("{offset:06x}  {word:08x}  {text}"));
+                .push(format!("{offset:06x}  {word:08x}  {}", text()));
         }
     }
 
     /// Emit a displacement-0 branch placeholder, queue its fixup, and log
     /// it. Shared by every branch-emitting `Assembler` method.
-    fn queue_branch(&mut self, base_word: u32, label: Label, kind: BranchKind, text: &str) {
+    fn queue_branch(
+        &mut self,
+        base_word: u32,
+        label: Label,
+        kind: BranchKind,
+        text: impl FnOnce() -> String,
+    ) {
         let at = self.offset();
         self.pending.push(PendingBranch { at, label, kind });
         self.push_word(base_word);
@@ -171,13 +186,13 @@ impl Assembler for JasmAssembler {
         );
         let word = u32::from_le_bytes(encoded.bytes[..4].try_into().unwrap());
         self.buf.extend_from_slice(&encoded.bytes);
-        self.push_listing(offset, word, &format!("{mnemonic} {ops:?}"));
+        self.push_listing(offset, word, || format!("{mnemonic} {ops:?}"));
     }
 
     fn emit_u32(&mut self, word: u32) {
         let offset = self.offset();
         self.push_word(word);
-        self.push_listing(offset, word, "<raw>");
+        self.push_listing(offset, word, || String::from("<raw>"));
     }
 
     fn new_label(&mut self) -> Label {
@@ -192,22 +207,22 @@ impl Assembler for JasmAssembler {
     }
 
     fn b(&mut self, l: Label) {
-        self.queue_branch(0x1400_0000, l, BranchKind::B26, &format!("b L{}", l.0));
+        self.queue_branch(0x1400_0000, l, BranchKind::B26, || format!("b L{}", l.0));
     }
 
     fn b_cond(&mut self, c: Cond, l: Label) {
         let word = 0x5400_0000 | cond_bits(c);
-        self.queue_branch(word, l, BranchKind::B19, &format!("b.{c:?} L{}", l.0));
+        self.queue_branch(word, l, BranchKind::B19, || format!("b.{c:?} L{}", l.0));
     }
 
     fn cbz(&mut self, r: Reg, l: Label) {
         let word = cbz_base(r, false);
-        self.queue_branch(word, l, BranchKind::B19, &format!("cbz {r:?} L{}", l.0));
+        self.queue_branch(word, l, BranchKind::B19, || format!("cbz {r:?} L{}", l.0));
     }
 
     fn cbnz(&mut self, r: Reg, l: Label) {
         let word = cbz_base(r, true);
-        self.queue_branch(word, l, BranchKind::B19, &format!("cbnz {r:?} L{}", l.0));
+        self.queue_branch(word, l, BranchKind::B19, || format!("cbnz {r:?} L{}", l.0));
     }
 
     fn tbz(&mut self, r: Reg, bit: u8, l: Label) {
@@ -216,7 +231,7 @@ impl Assembler for JasmAssembler {
             word,
             l,
             BranchKind::B14,
-            &format!("tbz {r:?} #{bit} L{}", l.0),
+            || format!("tbz {r:?} #{bit} L{}", l.0),
         );
     }
 
@@ -226,7 +241,7 @@ impl Assembler for JasmAssembler {
             word,
             l,
             BranchKind::B14,
-            &format!("tbnz {r:?} #{bit} L{}", l.0),
+            || format!("tbnz {r:?} #{bit} L{}", l.0),
         );
     }
 
@@ -253,7 +268,7 @@ impl Assembler for JasmAssembler {
         let word = 0x5800_0000 | (dst.num as u32);
         self.push_word(word);
         self.lit_loads.push((offset, lit));
-        self.push_listing(offset, word, &format!("ldr {dst:?}, =lit{}", lit.0));
+        self.push_listing(offset, word, || format!("ldr {dst:?}, =lit{}", lit.0));
     }
 
     fn bl_patchable(&mut self, kind: RelocKind) -> u32 {
@@ -263,7 +278,7 @@ impl Assembler for JasmAssembler {
         let word = 0x9400_0000;
         self.push_word(word);
         self.relocs.push(Reloc { offset, kind });
-        self.push_listing(offset, word, &format!("bl . ; {kind:?} reloc"));
+        self.push_listing(offset, word, || format!("bl . ; {kind:?} reloc"));
         offset
     }
 
