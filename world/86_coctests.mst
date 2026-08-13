@@ -477,24 +477,34 @@ Object subclass: CocoaTests [
             ifTrue: [ ^s copyFrom: 2 to: s size - 1 ].
         ^s
     ]
+    "Index-based splitting, not per-character `,` accumulation — the old
+     shape copied the line-so-far for every character, quadratic per line and
+     O(report^2) over the 578-line report this parses on EVERY run, on the
+     main thread. `copyFrom:to:` with to < from answers '' (checked), so the
+     empty-line corner needs no guard."
     CocoaTests class >> linesOf: text [
-        | out cur nl |
+        | out nl start i sz |
         nl := Character nl.
         out := OrderedCollection new.
-        cur := ''.
-        text do: [ :c |
-            c = nl ifTrue: [ out add: cur. cur := '' ] ifFalse: [ cur := cur , (String with: c) ] ].
-        cur isEmpty ifFalse: [ out add: cur ].
+        start := 1. i := 1. sz := text size.
+        [ i <= sz ] whileTrue: [
+            (text at: i) = nl ifTrue: [
+                out add: (text copyFrom: start to: i - 1).
+                start := i + 1 ].
+            i := i + 1 ].
+        start <= sz ifTrue: [ out add: (text copyFrom: start to: sz) ].
         ^out
     ]
     CocoaTests class >> wordsOf: line [
-        | out cur |
+        | out i sz start |
         out := OrderedCollection new.
-        cur := ''.
-        line do: [ :c |
-            c = $  ifTrue: [ cur isEmpty ifFalse: [ out add: cur. cur := '' ] ]
-                   ifFalse: [ cur := cur , (String with: c) ] ].
-        cur isEmpty ifFalse: [ out add: cur ].
+        i := 1. sz := line size.
+        [ i <= sz ] whileTrue: [
+            [ i <= sz and: [ (line at: i) = $  ] ] whileTrue: [ i := i + 1 ].
+            i > sz ifTrue: [ ^out ].
+            start := i.
+            [ i <= sz and: [ (line at: i) ~= $  ] ] whileTrue: [ i := i + 1 ].
+            out add: (line copyFrom: start to: i - 1) ].
         ^out
     ]
     CocoaTests class >> restOf: line after: n [

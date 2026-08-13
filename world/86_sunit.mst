@@ -117,18 +117,31 @@ Object subclass: TestResult [
     printString [
         "One line per test, then the summary. PASS lines first so a green run
          reads top to bottom; failures and errors last, where they are looked
-         for."
-        | s |
-        s := ''.
+         for.
+
+         Built on a WriteStream, and that is worth a sentence: this used to
+         accumulate with `s := s , line`, which copies the WHOLE report so far
+         for every line — quadratic in tests. At 578 tests it was the hottest
+         thing in the entire suite run: `sample` showed the bulk-copy
+         primitive behind `,` as the top symbol of the process, ~80 ms per
+         report, all of it OUTSIDE the summary's own ms (which stops at
+         `finish`, before printing)."
+        | ws nl |
+        ws := WriteStream on: String new.
+        nl := Character nl.
         passed do: [ :p |
-            s := s, 'PASS ', (p at: 1), ' ', (p at: 2) printString, (String with: Character nl) ].
+            ws nextPutAll: 'PASS '; nextPutAll: (p at: 1); nextPutAll: ' ';
+               nextPutAll: (p at: 2) printString; nextPut: nl ].
         failures do: [ :f |
-            s := s, 'FAIL ', (f at: 1), ' ', (f at: 2) printString, ' ', (f at: 3),
-                 (String with: Character nl) ].
+            ws nextPutAll: 'FAIL '; nextPutAll: (f at: 1); nextPutAll: ' ';
+               nextPutAll: (f at: 2) printString; nextPutAll: ' ';
+               nextPutAll: (f at: 3); nextPut: nl ].
         errors do: [ :e |
-            s := s, 'ERROR ', (e at: 1), ' ', (e at: 2) printString, ' ', (e at: 3),
-                 (String with: Character nl) ].
-        ^s, self summaryLine
+            ws nextPutAll: 'ERROR '; nextPutAll: (e at: 1); nextPutAll: ' ';
+               nextPutAll: (e at: 2) printString; nextPutAll: ' ';
+               nextPutAll: (e at: 3); nextPut: nl ].
+        ws nextPutAll: self summaryLine.
+        ^ws contents
     ]
 
     showOn: aTranscript [
@@ -423,13 +436,14 @@ Object subclass: TestRunner [
 
          Answered by REFLECTION on the VM that will actually run them, so the
          tab cannot offer a test that is not really there."
-        | s nl |
-        nl := String with: Character nl.
-        s := ''.
+        | ws nl |
+        ws := WriteStream on: String new.
+        nl := Character nl.
         self allTestClasses do: [ :cls |
-            s := s, 'CLASS ', cls name asString, nl.
-            cls testSelectors do: [ :sel | s := s, 'TEST ', sel asString, nl ] ].
-        ^s
+            ws nextPutAll: 'CLASS '; nextPutAll: cls name asString; nextPut: nl.
+            cls testSelectors do: [ :sel |
+                ws nextPutAll: 'TEST '; nextPutAll: sel asString; nextPut: nl ] ].
+        ^ws contents
     ]
 
     TestRunner class >> runNamed: names [
