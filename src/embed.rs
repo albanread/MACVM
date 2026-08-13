@@ -2429,6 +2429,10 @@ mod tests {
 
     #[test]
     fn set_game_sink_routes_game_commands_from_a_smalltalk_doit() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The M3 vertical slice end to end: a Smalltalk doit -> GamePane
         // primitive (id 200) -> GameCommand -> the installed sink. Headless,
         // deterministic, no GPU/window — this is the real proof of the VM->GUI
@@ -2458,6 +2462,10 @@ mod tests {
 
     #[test]
     fn mandelzoom_renders_the_set_through_the_game_channel() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The MandelZoom demo (world/45_mandelzoom.mst) really renders the
         // Mandelbrot set through the VM->GUI game channel: drive its per-frame
         // draw commands into a 320x240 palette-indexed buffer (exactly as the
@@ -3400,6 +3408,10 @@ mod tests {
 
     #[test]
     fn a_step_block_may_take_the_frame_as_a_parameter_or_take_none() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The per-frame parameters are ONE object (GameFrame) held in ONE
         // GamePane class variable, rather than a class variable per input —
         // so teaching the engine a new input is an instance variable there,
@@ -3499,6 +3511,10 @@ mod tests {
 
     #[test]
     fn freecell_deals_match_the_published_reference_tables() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Designed from the spec, and pinned to it. The Microsoft FreeCell
         // shuffle is a published algorithm — the MS C runtime LCG
         // (state = 214013*state + 2531011 mod 2^31, value = state / 2^16), a
@@ -3561,6 +3577,10 @@ mod tests {
 
     #[test]
     fn freecell_deals_all_52_cards_and_the_same_number_deals_the_same_game() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The deal is the foundation of everything else: if it can lose or
         // duplicate a card, every rule test above it is meaningless. Checked
         // across a spread of numbers, including the two the folklore names.
@@ -3615,6 +3635,10 @@ mod tests {
 
     #[test]
     fn freecell_supermove_capacity_follows_the_real_rule() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The one rule that is genuinely FreeCell's own: a run of n may move
         // only if (free + 1) * 2^empty >= n, and an EMPTY destination column
         // cannot also serve as the scratch space that makes the move possible.
@@ -3666,6 +3690,10 @@ mod tests {
 
     #[test]
     fn freecell_enforces_stacking_and_foundation_order() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The two build rules, stated directly. Card c is rank c/4+1 of suit
         // c%4 (0 clubs, 1 diamonds, 2 hearts, 3 spades) — so 4 is the two of
         // clubs, 9 is the three of diamonds, and so on.
@@ -3719,6 +3747,10 @@ mod tests {
 
     #[test]
     fn freecell_drag_moves_a_legal_card_and_returns_an_illegal_one() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The whole input path, driven exactly as the GUI drives it: a press
         // frame, drag frames, then a release frame. A refused drop must put
         // the cards back where they came from — losing a card on a bad drop
@@ -3790,6 +3822,10 @@ mod tests {
 
     #[test]
     fn freecell_recognises_a_won_game() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Winning: every foundation at the king. Set it up directly rather
         // than playing a whole game out.
         let mut vm = boot_test_vm(JitMode::Threshold(10));
@@ -3809,6 +3845,10 @@ mod tests {
 
     #[test]
     fn minesweeper_actually_draws_its_numbers_flags_and_mines() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Every piece of this board is pixel art stamped into the blit buffer,
         // and the first version of it drew NOTHING — `String>>at:` hands back a
         // fresh Character rather than the canonical one, so the art's `==`
@@ -3932,6 +3972,10 @@ mod tests {
 
     #[test]
     fn minesweeper_shakes_by_scrolling_the_view_not_by_redrawing_it() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The explosion moves the picture with Scroll commands into the pane's
         // overscan — a shader uniform — rather than by redrawing the board at
         // an offset. That is the whole reason `overscan:`/`scrollTo:y:` exist,
@@ -4013,6 +4057,10 @@ mod tests {
 
     #[test]
     fn minesweeper_sounds_the_click_the_flag_and_the_explosion() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Sound presets (world/43_gamepane.mst): click 7, explode 4, blip 9.
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
         impl GameSink for VecGameSink {
@@ -4146,6 +4194,10 @@ mod tests {
 
     #[test]
     fn minesweeper_first_click_is_always_safe_and_opens_a_region() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The rule that makes the game playable: mines are not dealt until the
         // first click, and then never on that square or its neighbours — so
         // the opening move can never lose, and always opens into space rather
@@ -4204,6 +4256,10 @@ mod tests {
 
     #[test]
     fn minesweeper_deals_exactly_thirty_two_mines_and_counts_neighbours_right() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The board's own arithmetic: the right number of mines, and every
         // square's number equal to the mines actually touching it. Recomputing
         // the counts here independently is the point — it checks the game's
@@ -4260,6 +4316,10 @@ mod tests {
 
     #[test]
     fn minesweeper_right_click_toggles_a_flag_and_left_click_ignores_it() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The two buttons doing two different jobs — the reason this demo
         // exists. Also the rule that stops a misclick losing a game you had
         // deliberately flagged: a flagged square does not reveal.
@@ -4319,6 +4379,10 @@ mod tests {
 
     #[test]
     fn minesweeper_clicks_are_edge_triggered_not_level_triggered() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The distinction this demo is built to show. Life reads the button's
         // LEVEL (hold and drag paints); Minesweeper must read its EDGE, or one
         // held button would flag-toggle 60 times a second and reveal the whole
@@ -4353,6 +4417,10 @@ mod tests {
 
     #[test]
     fn minesweeper_hitting_a_mine_ends_the_game_and_space_deals_a_new_board() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Losing, and starting again. Finding a mine to click means asking the
         // board where one is — which is fine, since the point is what happens
         // AFTER you click it.
@@ -4409,6 +4477,10 @@ mod tests {
 
     #[test]
     fn life_glider_walks_one_cell_diagonally_every_four_generations() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The rules themselves, on the demo's own grid. `Life launch`
         // (world/45a_life.mst) seeds a glider in the top-left corner; a glider
         // is periodic with period 4 and translates by exactly (+1,+1) over
@@ -4463,6 +4535,10 @@ mod tests {
 
     #[test]
     fn life_mouse_draws_and_erases_cells_and_space_toggles_pause() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The controls, driven exactly as the Cocoa GUI's frame timer drives
         // them (`poll_primary_step` formats this very message with the tick's
         // key mask and pane-pixel mouse). Steps 1..3 are deliberately not
@@ -4524,6 +4600,10 @@ mod tests {
 
     #[test]
     fn life_paused_holds_its_generation_and_still_paints() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Pausing must stop the SIMULATION without stopping the FRAME — the
         // pane still has to present, or the window would freeze rather than
         // pause. Prove both halves: the generation stops moving while frames
@@ -4563,6 +4643,10 @@ mod tests {
 
     #[test]
     fn life_renders_a_grid_through_the_game_channel() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The picture, headlessly: rasterize Life's blits into a 320x240 index
         // buffer (the same proof style as MandelZoom's) and assert the frame
         // is a real lattice — live cells, dead cells and the gutter grid lines
@@ -4617,6 +4701,10 @@ mod tests {
 
     #[test]
     fn gamepane_reset_stops_the_running_demo() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Escape's close path submits `GamePane reset.` (gui close_game_pane).
         // Prove the VM-side contract it relies on: reset nils the registered
         // step block, so a later frame tick runs nothing and draws nothing —
@@ -4765,6 +4853,10 @@ mod tests {
 
     #[test]
     fn game_primitive_fails_on_out_of_range_colour_and_emits_nothing() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // r=300 is out of 0..=255, so `smi_byte` fails, the primitive fails,
         // and the method falls through to `^self` — no command emitted. This
         // is the design's rule: validate at the primitive boundary before a
@@ -4789,6 +4881,10 @@ mod tests {
 
     #[test]
     fn game_drawing_commands_reach_the_sink_in_order() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
         impl GameSink for VecGameSink {
             fn emit(&mut self, cmd: GameCommand) {
@@ -4878,6 +4974,10 @@ mod tests {
 
     #[test]
     fn frame_loop_run_registers_a_step_block_the_gui_can_pull() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
         impl GameSink for VecGameSink {
             fn emit(&mut self, cmd: GameCommand) {
@@ -4911,6 +5011,10 @@ mod tests {
 
     #[test]
     fn frame_loop_keyheld_reads_the_tick_key_mask() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
         impl GameSink for VecGameSink {
             fn emit(&mut self, cmd: GameCommand) {
@@ -4945,6 +5049,10 @@ mod tests {
 
     #[test]
     fn sprite_commands_reach_the_sink_from_smalltalk() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
         impl GameSink for VecGameSink {
             fn emit(&mut self, cmd: GameCommand) {
@@ -5041,6 +5149,10 @@ mod tests {
 
     #[test]
     fn breakout_demo_game_launches_and_steps_without_error() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The whole engine end to end in one Smalltalk class: launch the game,
         // then drive 120 frames with no keys held. The ball starts at y=200
         // heading up at 3px/frame, so it reaches the brick wall (y<110) within
@@ -5093,6 +5205,10 @@ mod tests {
 
     #[test]
     fn breakout_soaks_without_soft_lock_or_out_of_bounds() {
+        // Game tests share the PROCESS-GLOBAL pane publications (screen/text/
+        // palette pointers): a guest HUD reads them while another test
+        // publishes its own buffers. Serialized, like every screen test.
+        let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A long soak that would catch the two ways this physics could go wrong:
         // (1) the ball tunneling out of the field or an integer going haywire
         //     (assert every drawn ball centre stays in bounds), and (2) a
