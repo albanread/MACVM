@@ -1605,6 +1605,15 @@ impl VmHandle {
         )));
     }
 
+    /// This VM's primary epoch (the global worker table's generation id), or
+    /// `None` if it is not a primary. A supervisor captures it so its FATAL
+    /// hook can retire the epoch — the one path where no Drop glue runs and
+    /// spawned workers would otherwise park forever (`workers.rs`, the
+    /// global-table section).
+    pub fn primary_epoch(&self) -> Option<u64> {
+        crate::runtime::workers::primary_epoch(&self.vm)
+    }
+
     /// Registers the router's wake hook (§3.1): fired — coalesced — whenever
     /// a worker envelope lands in this (primary) VM's inbox, so a sleeping
     /// host can submit a `Worker dispatchInbox.` doit. Headless embeddings
@@ -5315,6 +5324,76 @@ mod tests {
         .expect("WkTest scoreboard must compile");
         vm.exec("WkTest reset.").expect("reset");
         vm
+    }
+
+    /// Poll the global worker table until no row of `epoch` is alive, or the
+    /// deadline passes. Filtered by epoch so parallel worker tests (each
+    /// with their own primary) can never interfere.
+    fn wait_epoch_workers_dead(epoch: u64, deadline: Duration) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            let any_alive = crate::runtime::workers::worker_table_snapshot()
+                .iter()
+                .any(|r| r.primary_epoch == epoch && r.alive);
+            if !any_alive {
+                return true;
+            }
+            if start.elapsed() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn orphaned_worker_is_reaped_when_its_primary_epoch_is_retired() {
+        // The zombie-of-last-resort gate: a FATAL primary death runs no Drop
+        // glue (`pthread_exit`), leaking the worker's channel sender inside
+        // the dead VM — under the old plain `recv()` the worker parked
+        // forever. `mem::forget` reproduces exactly that shape (nothing
+        // dropped), and `note_primary_dead` is exactly what the watchdog's
+        // fatal hook calls. The worker must notice on its pulse check and
+        // exit on its own.
+        let mut vm = boot_worker_primary();
+        vm.exec("WkTest w1: (Worker spawn: '').")
+            .expect("spawn an idle worker");
+        let epoch = vm.primary_epoch().expect("a worker primary has an epoch");
+        let alive_now = crate::runtime::workers::worker_table_snapshot()
+            .iter()
+            .any(|r| r.primary_epoch == epoch && r.alive);
+        assert!(alive_now, "the spawn must register an alive table row");
+        // Die like a fatal: no Drop glue for anything this primary owns.
+        std::mem::forget(vm);
+        assert!(
+            crate::runtime::workers::primary_epoch_alive(epoch),
+            "forgetting must NOT retire the epoch (that is the leak this gate models)"
+        );
+        crate::runtime::workers::note_primary_dead(epoch);
+        assert!(
+            wait_epoch_workers_dead(epoch, Duration::from_secs(8)),
+            "the orphaned worker must reap itself within a few pulse checks"
+        );
+    }
+
+    #[test]
+    fn worker_table_rows_flip_dead_on_clean_primary_drop() {
+        // The clean path: dropping the primary runs Drop glue — the channel
+        // senders close (workers exit via Disconnected) AND `Drop for
+        // WorkerState` retires the epoch, belt and braces with the watchdog
+        // hook. The table must agree on both counts.
+        let mut vm = boot_worker_primary();
+        vm.exec("WkTest w1: (Worker spawn: '').")
+            .expect("spawn an idle worker");
+        let epoch = vm.primary_epoch().expect("a worker primary has an epoch");
+        drop(vm);
+        assert!(
+            !crate::runtime::workers::primary_epoch_alive(epoch),
+            "a clean drop must retire the epoch via Drop for WorkerState"
+        );
+        assert!(
+            wait_epoch_workers_dead(epoch, Duration::from_secs(8)),
+            "the worker must exit promptly once its channel disconnects"
+        );
     }
 
     #[test]

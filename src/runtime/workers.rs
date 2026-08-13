@@ -22,7 +22,7 @@
 //! else — one delivery mechanism, including for failure (§8).
 
 use crate::runtime::vm_state::VmState;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,6 +30,117 @@ use std::time::Duration;
 /// Star-topology cap (§5 prim 220): far above any sane core count, far
 /// below a runaway spawn loop.
 pub const MAX_WORKERS: usize = 16;
+
+// ─────────────── the global worker table + primary epochs ───────────────
+// Supervision of LAST RESORT lives ABOVE all VMs, in plain process-global
+// Rust — because any monitor that lives inside a VM inherits VM mortality.
+// The primary looks like the natural warden of its workers (it owns the
+// links), but a fatal primary death exits by `pthread_exit` with NO Drop
+// glue: the links — the only copy of every worker's channel sender — leak,
+// and each worker parks on `recv()` forever, heap mapped, thread alive,
+// unreachable from the respawned generation. The fix is an INVARIANT, not a
+// policy: "your primary epoch has ended, therefore no message can ever
+// reach you again, therefore exit." Idle-TTLs, permanence, respawn — all
+// policy — stay in the Smalltalk supervisors (74_supervisor.mst); this
+// layer only enforces what is unconditionally true.
+//
+// Mechanism: every Primary WorkerState is minted a process-unique EPOCH id
+// (per-primary, NOT a single global counter — parallel tests run many
+// primaries in one process, and one primary's death must never reap
+// another's workers). Workers remember their parent's epoch and wake from
+// `recv_timeout` every couple of seconds to check it; the watchdog's fatal
+// hook (and, for every clean path, `Drop for WorkerState`) marks the epoch
+// dead. The table itself is the observability half: one row per spawn with
+// the shared `alive` flag the worker clears on ANY exit — readable by the
+// Monitor's host verbs and asserted on by the embed gates.
+
+/// Mints per-primary epoch ids. Starts at 1 so 0 can never name a real one.
+static NEXT_PRIMARY_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Epochs whose primary is GONE (fatal or clean — either way the star's
+/// center is dead). A tiny grow-only list: one entry per primary death in
+/// the whole process lifetime.
+static DEAD_EPOCHS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// One spawn's row in the global table. `alive` is shared with the worker
+/// thread, which clears it on every exit path (retire, crash, reap).
+struct GlobalWorkerRow {
+    worker_id: u32,
+    primary_epoch: u64,
+    spawned_at: std::time::Instant,
+    alive: Arc<AtomicBool>,
+}
+
+/// A read-side copy of one row.
+pub struct WorkerTableRow {
+    pub worker_id: u32,
+    pub primary_epoch: u64,
+    pub age: Duration,
+    pub alive: bool,
+}
+
+static WORKER_TABLE: Mutex<Vec<GlobalWorkerRow>> = Mutex::new(Vec::new());
+
+/// Record that a primary epoch has ended. Idempotent; called from the
+/// watchdog's fatal hook (the path where Drop never runs) and from
+/// `Drop for WorkerState` (every clean path). Any thread.
+pub fn note_primary_dead(epoch: u64) {
+    let mut dead = DEAD_EPOCHS.lock().unwrap_or_else(|e| e.into_inner());
+    if !dead.contains(&epoch) {
+        dead.push(epoch);
+    }
+}
+
+/// Is this epoch's primary still with us?
+pub fn primary_epoch_alive(epoch: u64) -> bool {
+    !DEAD_EPOCHS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&epoch)
+}
+
+/// The primary epoch of `vm`, if it IS a primary.
+pub fn primary_epoch(vm: &VmState) -> Option<u64> {
+    match vm.workers.as_deref() {
+        Some(WorkerState::Primary { epoch, .. }) => Some(*epoch),
+        _ => None,
+    }
+}
+
+fn worker_table_register(worker_id: u32, primary_epoch: u64, alive: Arc<AtomicBool>) {
+    let mut table = WORKER_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    // Bounded history: spawn churn (a game fleet per launch) must not grow
+    // the table forever — once it gets long, dead rows have told their story.
+    if table.len() >= 64 {
+        table.retain(|r| r.alive.load(Ordering::Relaxed));
+    }
+    table.push(GlobalWorkerRow {
+        worker_id,
+        primary_epoch,
+        spawned_at: std::time::Instant::now(),
+        alive,
+    });
+}
+
+/// Read-side: copy the table (any thread).
+pub fn worker_table_snapshot() -> Vec<WorkerTableRow> {
+    WORKER_TABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|r| WorkerTableRow {
+            worker_id: r.worker_id,
+            primary_epoch: r.primary_epoch,
+            age: r.spawned_at.elapsed(),
+            alive: r.alive.load(Ordering::Relaxed),
+        })
+        .collect()
+}
+
+/// How often a parked worker wakes to check its primary's pulse. Reap
+/// latency is at most this; the cost is one wakeup per idle worker per
+/// interval — noise.
+const EPOCH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// One message crossing a VM boundary. `from` is a worker id (0 = the
 /// primary); `corr` is the sender-assigned correlation id that routes a
@@ -157,6 +268,9 @@ pub enum WorkerState {
         /// envelopes into our own inbox.
         inbox_tx: InboxSender,
         boot: WorkerBootFn,
+        /// This primary's process-unique epoch (the global-table section
+        /// above): workers born of it exit when it is marked dead.
+        epoch: u64,
     },
     Worker {
         self_id: u32,
@@ -166,6 +280,18 @@ pub enum WorkerState {
         pending: Option<Envelope>,
         to_primary: InboxSender,
     },
+}
+
+impl Drop for WorkerState {
+    fn drop(&mut self) {
+        // Every CLEAN end of a primary — VmHandle drop, test teardown, a
+        // supervisor generation returning — retires its epoch here. The
+        // fatal path (`pthread_exit`, no Drop glue) is covered by the
+        // watchdog's fatal hook calling `note_primary_dead` directly.
+        if let WorkerState::Primary { epoch, .. } = self {
+            note_primary_dead(*epoch);
+        }
+    }
 }
 
 impl WorkerState {
@@ -180,6 +306,7 @@ impl WorkerState {
                 wake: Arc::new(Mutex::new(None)),
             },
             boot,
+            epoch: NEXT_PRIMARY_EPOCH.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -328,6 +455,7 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
         links,
         inbox_tx,
         boot,
+        epoch,
         ..
     } = &mut **ws
     else {
@@ -357,8 +485,13 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
     let (tx, rx) = channel::<Envelope>();
     let boot = boot.clone();
     let to_primary = inbox_tx.clone();
+    // The global-table row (one per SPAWN, not per id — reused ids get fresh
+    // rows) and the shared liveness flag the thread clears on any exit.
+    let epoch = *epoch;
+    let alive = Arc::new(AtomicBool::new(true));
+    worker_table_register(id, epoch, alive.clone());
     // Detached on purpose (S21: never join a VM worker thread).
-    std::thread::spawn(move || worker_main(id, &boot, &rx, &to_primary, init.as_deref()));
+    std::thread::spawn(move || worker_main(id, epoch, alive, &boot, &rx, &to_primary, init.as_deref()));
     let link = WorkerLink {
         inbox: InboxSender::detached(tx),
         alive: true,
@@ -426,12 +559,15 @@ pub fn register_hosted_worker(
 /// channel (terminate/primary exit) ends in a silent clean unwind.
 fn worker_main(
     id: u32,
+    epoch: u64,
+    alive: Arc<AtomicBool>,
     boot: &WorkerBootFn,
     rx: &Receiver<Envelope>,
     to_primary: &InboxSender,
     init: Option<&str>,
 ) {
     let Ok(mut handle) = boot() else {
+        alive.store(false, Ordering::Relaxed);
         let _ = to_primary.send(died_envelope(id));
         return;
     };
@@ -452,30 +588,57 @@ fn worker_main(
         mon.publish(handle.metrics());
         if !ok {
             mon.mark_dead();
+            alive.store(false, Ordering::Relaxed);
             let _ = to_primary.send(died_envelope(id));
             return;
         }
     }
-    while let Ok(env) = rx.recv() {
-        handle.stage_pending(env);
-        // A guest error mid-dispatch (error:, DNU, even a native fault —
-        // S21's recovery surfaces all of them as Err) retires this worker:
-        // its state is suspect, so report death and unwind. The VmHandle
-        // drops normally (heap unmapped) — pthread_exit is only for the
-        // truly unrecoverable path inside the fatal machinery itself.
-        mon.set_busy(true);
-        let ok = handle.exec("Worker dispatchPending.").is_ok();
-        mon.set_busy(false);
-        mon.publish(handle.metrics());
-        if !ok {
-            mon.mark_dead();
-            let _ = to_primary.send(died_envelope(id));
-            return;
+    loop {
+        match rx.recv_timeout(EPOCH_CHECK_INTERVAL) {
+            Ok(env) => {
+                handle.stage_pending(env);
+                // A guest error mid-dispatch (error:, DNU, even a native
+                // fault — S21's recovery surfaces all of them as Err)
+                // retires this worker: its state is suspect, so report death
+                // and unwind. The VmHandle drops normally (heap unmapped) —
+                // pthread_exit is only for the truly unrecoverable path
+                // inside the fatal machinery itself.
+                mon.set_busy(true);
+                let ok = handle.exec("Worker dispatchPending.").is_ok();
+                mon.set_busy(false);
+                mon.publish(handle.metrics());
+                if !ok {
+                    mon.mark_dead();
+                    alive.store(false, Ordering::Relaxed);
+                    let _ = to_primary.send(died_envelope(id));
+                    return;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The pulse check — supervision of last resort. A FATAL
+                // primary death runs no Drop glue: our channel sender leaks
+                // inside the dead VM's links and a plain `recv()` would park
+                // us forever, heap mapped, invisible to the respawned
+                // generation. The epoch verdict is an invariant, not policy:
+                // with the star's center gone, no message can ever reach us
+                // again. No died-envelope either — it would only queue into
+                // the dead primary's leaked inbox.
+                if !primary_epoch_alive(epoch) {
+                    eprintln!(
+                        "macvm: worker {id} reaped — its primary (epoch {epoch}) is gone"
+                    );
+                    mon.mark_dead();
+                    alive.store(false, Ordering::Relaxed);
+                    return;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    // Channel closed: the primary terminated us (or died). Retired, not
-    // crashed — same roster outcome either way.
+    // Channel closed: the primary terminated us (or dropped cleanly).
+    // Retired, not crashed — same roster outcome either way.
     mon.mark_dead();
+    alive.store(false, Ordering::Relaxed);
 }
 
 /// Send bytes (prim 221). From the primary: to worker `id` (marking it dead

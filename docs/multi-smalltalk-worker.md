@@ -438,9 +438,48 @@ worker "just works".
 |---|---|---|
 | worker guest error / native fault mid-dispatch | S21 machinery ends the *thread*; its channel endpoints drop | primary's next `send:` fails → registry marks dead + synthesizes `#workerDied`; also detected lazily by a periodic registry sweep |
 | worker wedged (infinite loop) | none in v1 (a Rust thread can't be safely killed — same stance as `VmHost::restart`) | `terminate` marks it dead and drops its channel; the thread leaks until its current doit ends (documented, like the GUI's abandoned-worker case) |
-| primary dies | process exits; workers are process-local threads | everything dies with it — by design |
+| primary dies, process too (CLI) | process exits; workers are process-local threads | everything dies with it — by design |
+| primary dies, process survives (the GUI's supervised respawn) | the primary's EPOCH is retired — by `Drop for WorkerState` on every clean path, by the watchdog's fatal hook on the `pthread_exit` path where no Drop glue runs | each orphaned worker notices on its next pulse check (`recv_timeout`, ~2 s) and exits on its own — §8.1 |
 | unpicklable payload | pickle-time, in the sender | clean Smalltalk error in the sender; nothing sent |
 | shape mismatch / unknown class | unpickle-time, in the receiver | the *dispatch* fails for that message; a `#badMessage` system envelope goes back to the sender; worker survives |
+
+## 8.1 The global worker table + primary epochs (supervision of last resort)
+
+Any monitor that lives inside a VM inherits VM mortality. The primary looks
+like the natural warden of its workers — it owns the links — but a FATAL
+primary death exits by `pthread_exit` with no Drop glue: the links (the only
+copy of every worker's channel sender) leak, and each worker parks on
+`recv()` forever — heap mapped, thread alive, unreachable from the
+respawned generation. In the star topology, supervision of last resort must
+therefore live ABOVE all VMs, in plain process-global Rust (`workers.rs`,
+the global-table section):
+
+- Every `Primary` `WorkerState` is minted a process-unique **epoch** id —
+  per-primary, not a single counter, so parallel embeddings (tests) can
+  never reap each other's workers.
+- `Drop for WorkerState` retires the epoch on every clean path; the GUI
+  watchdog's fatal hook calls `note_primary_dead` on the path where Drop
+  never runs. `VmHandle::primary_epoch()` is how a supervisor learns the id.
+- Workers wait with `recv_timeout` (2 s) instead of `recv`; on each timeout
+  they check `primary_epoch_alive` and exit — marking their Monitor row and
+  global-table row dead — when their star's center is gone. No died-envelope
+  is sent: it would only queue into the dead primary's leaked inbox.
+- The **global worker table** (`worker_table_snapshot`) is the observability
+  half: one row per spawn (worker id, epoch, age, alive — the alive flag
+  shared with the thread, cleared on every exit path), bounded by pruning
+  dead rows once the table is long.
+
+The layer split is deliberate: this layer enforces only the INVARIANT ("your
+primary epoch has ended, therefore no message can ever reach you again"),
+never policy. Idle TTLs, permanence, respawn intensity — all policy — stay
+in the Smalltalk supervisors above (`74_supervisor.mst`), which is also why
+sweeping never touches a live primary's workers: an idle stateful worker is
+legitimate, and only its owner can know otherwise.
+
+Gates: `orphaned_worker_is_reaped_when_its_primary_epoch_is_retired`
+(a `mem::forget`-leaked primary — exactly the `pthread_exit` shape — plus
+`note_primary_dead`, as the watchdog would) and
+`worker_table_rows_flip_dead_on_clean_primary_drop`, both in `embed.rs`.
 
 ## 9. GUI integration (one small pump)
 

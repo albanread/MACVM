@@ -377,8 +377,17 @@ fn primary_generation_main(
     // fatal, never merely because the primary is busy in a long doit (the CG4
     // review's must-fix: a busy primary must never be respawned).
     let mon_for_hook = mon.clone();
+    let epoch = primary.primary_epoch();
     macvm::embed::set_thread_fatal_hook(Box::new(move || {
         // Runs just before `pthread_exit` — the only cleanup a fatal permits.
+        // Retiring the epoch here is what reaps this generation's spawned
+        // workers: `pthread_exit` runs no Drop glue, so their channel
+        // senders leak inside this dead VM's links and each worker would
+        // otherwise park on `recv()` forever. The workers notice on their
+        // next pulse check and exit (workers.rs, the global-table section).
+        if let Some(e) = epoch {
+            macvm::runtime::workers::note_primary_dead(e);
+        }
         mon_for_hook.mark_dead();
         let _ = events.send(Event::Died);
     }));
