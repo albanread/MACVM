@@ -421,6 +421,7 @@ impl Frame {
     /// Unified arg/temp index: `t < argc` addresses the caller's pushed
     /// argument area (`fp - argc + t`); `t >= argc` addresses a fixed local
     /// temp slot (`fp + FRAME_TEMPS_BASE + (t - argc)`).
+    #[inline]
     fn temp_index(self, st: &ProcessStack, t: usize) -> usize {
         let argc = self.method(st).argc();
         debug_assert!(
@@ -434,11 +435,13 @@ impl Frame {
         }
     }
 
+    #[inline]
     pub fn temp(self, st: &ProcessStack, t: usize) -> Oop {
         let idx = self.temp_index(st, t);
         st.get(idx)
     }
 
+    #[inline]
     pub fn set_temp(self, st: &mut ProcessStack, t: usize, v: Oop) {
         let idx = self.temp_index(st, t);
         st.set(idx, v);

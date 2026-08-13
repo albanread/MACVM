@@ -29,6 +29,7 @@ impl MemOop {
 
     // --- header -------------------------------------------------------
 
+    #[inline]
     pub fn mark(self) -> Mark {
         // SAFETY: every allocated object has a valid 2-word header at
         // [addr, addr+16).
@@ -95,6 +96,7 @@ impl MemOop {
     /// oop (a genesis placeholder or corruption) — every object reachable
     /// outside genesis is expected to have a valid klass; callers that must
     /// tolerate a placeholder use [`MemOop::klass_oop`] directly.
+    #[inline]
     pub fn klass(self) -> KlassOop {
         KlassOop::try_from(self.klass_oop()).expect("klass field does not hold a mem oop")
     }
@@ -115,11 +117,13 @@ impl MemOop {
     /// thousand elements — a ceiling low enough to catch a wild index would
     /// also reject legitimate large bodies, so bounds-checking is left
     /// entirely to each caller instead.
+    #[inline]
     pub(crate) fn raw_body_word(self, index: usize) -> u64 {
         // SAFETY: caller guarantees the word exists (see above).
         unsafe { self.body_ptr(index).read() }
     }
 
+    #[inline]
     pub(crate) fn set_raw_body_word(self, index: usize, w: u64) {
         // SAFETY: as above.
         unsafe { self.body_ptr(index).write(w) }
@@ -135,6 +139,7 @@ impl MemOop {
     /// (chasing that klass's OWN forwarding first) rather than
     /// `instance_size_words()`'s `self.klass()`, which would try to
     /// re-derive the klass from a field that might itself be forwarded.
+    #[inline]
     pub(crate) fn raw_size_slot(self, nis: usize) -> usize {
         let idx = nis - HEADER_WORDS;
         let raw = self.raw_body_word(idx);
@@ -332,6 +337,7 @@ impl MemOop {
     /// (`IndexableOops`), byte count (`IndexableBytes`/`Method`), ncopied
     /// (`Closure`), or nslots (`Context`). Panics for a format with no size
     /// slot.
+    #[inline(always)]
     pub fn indexable_len(self) -> usize {
         let k = self.klass();
         let nis = k.non_indexable_size();
@@ -348,6 +354,7 @@ impl MemOop {
     /// Body-word index of the first element/byte immediately after the size
     /// slot — the same formula for an oop tail (`IndexableOops`) or a byte
     /// tail (`IndexableBytes`/`Method`).
+    #[inline]
     pub fn tail_start_word(self) -> usize {
         let nis = self.klass().non_indexable_size();
         (nis - HEADER_WORDS) + 1
@@ -355,6 +362,7 @@ impl MemOop {
 
     /// Byte `i` of a byte tail (`IndexableBytes`/`Method`/`Symbol`), packed
     /// 8 per word.
+    #[inline]
     pub fn tail_byte_at(self, i: usize) -> u8 {
         let word_idx = self.tail_start_word() + i / 8;
         let word = self.body_word_raw(word_idx);

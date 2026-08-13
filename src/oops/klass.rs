@@ -100,6 +100,7 @@ impl KlassOop {
             .value()
     }
 
+    #[inline]
     pub fn format(self) -> Format {
         Format::from_smi_value(self.format_smi_value())
     }
@@ -117,6 +118,7 @@ impl KlassOop {
     /// Total instance size in words, including the header, of the fixed
     /// (non-indexable) prefix. SPEC §2.3's rule stated for `Slots`, pinned
     /// here for every format (`sprint_s01_detail.md` §Design).
+    #[inline]
     pub fn non_indexable_size(self) -> usize {
         let raw = self.as_mem().raw_body_word(KLASS_NON_INDEXABLE_SIZE_INDEX);
         SmallInt::try_from(Oop::from_raw(raw))

@@ -203,6 +203,7 @@ impl ArrayOop {
         self.len() == 0
     }
 
+    #[inline]
     pub fn at(self, i: usize) -> Oop {
         // The bound feeds ONLY the debug assert, but its loads (klass →
         // format → size slot) survive release builds unless the whole
@@ -217,6 +218,7 @@ impl ArrayOop {
         self.as_mem().tail_oop_at(i)
     }
 
+    #[inline]
     pub fn at_put(self, i: usize, v: Oop) {
         // The bound feeds ONLY the debug assert, but its loads (klass →
         // format → size slot) survive release builds unless the whole

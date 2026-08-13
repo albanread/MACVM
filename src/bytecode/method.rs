@@ -15,6 +15,7 @@ use crate::oops::wrappers::{ArrayOop, MethodOop};
 use crate::oops::Oop;
 
 impl MethodOop {
+    #[inline]
     pub fn selector(self) -> Oop {
         self.as_mem().body_oop(METHOD_SELECTOR_INDEX)
     }
@@ -42,10 +43,12 @@ impl MethodOop {
             .set_body_oop(METHOD_FLAGS_INDEX, SmallInt::new(v).oop());
     }
 
+    #[inline]
     pub fn argc(self) -> usize {
         ((self.flags_value() & METHOD_FLAGS_ARGC_MASK) >> METHOD_FLAGS_ARGC_SHIFT) as usize
     }
 
+    #[inline]
     pub fn ntemps(self) -> usize {
         ((self.flags_value() & METHOD_FLAGS_NTEMPS_MASK) >> METHOD_FLAGS_NTEMPS_SHIFT) as usize
     }
@@ -120,6 +123,7 @@ impl MethodOop {
         self.set_flags_value(v);
     }
 
+    #[inline]
     pub fn primitive(self) -> i64 {
         SmallInt::try_from(self.as_mem().body_oop(METHOD_PRIMITIVE_INDEX))
             .expect("method primitive field is not a smi")
@@ -131,6 +135,7 @@ impl MethodOop {
             .set_body_oop(METHOD_PRIMITIVE_INDEX, SmallInt::new(id).oop());
     }
 
+    #[inline]
     pub fn counters(self) -> i64 {
         SmallInt::try_from(self.as_mem().body_oop(METHOD_COUNTERS_INDEX))
             .expect("method counters field is not a smi")
@@ -204,6 +209,7 @@ impl MethodOop {
         self.set_counters(self.counters() & !crate::oops::layout::COUNTERS_HAS_BP_BIT);
     }
 
+    #[inline]
     pub fn literals(self) -> ArrayOop {
         ArrayOop::try_from(self.as_mem().body_oop(METHOD_LITERALS_INDEX))
             .expect("method literals field is not an Array")
@@ -213,6 +219,7 @@ impl MethodOop {
         self.as_mem().set_body_oop(METHOD_LITERALS_INDEX, a.oop());
     }
 
+    #[inline]
     pub fn ics(self) -> ArrayOop {
         ArrayOop::try_from(self.as_mem().body_oop(METHOD_ICS_INDEX))
             .expect("method ics field is not an Array")
@@ -223,12 +230,14 @@ impl MethodOop {
     }
 
     /// The bytecode byte count (the size slot).
+    #[inline]
     pub fn bytecode_len(self) -> usize {
         self.as_mem().indexable_len()
     }
 
     /// Byte `bci` of the bytecode tail. Debug bounds-checked against
     /// `bytecode_len()`.
+    #[inline]
     pub fn bytecode_byte(self, bci: usize) -> u8 {
         let len = self.bytecode_len();
         debug_assert!(

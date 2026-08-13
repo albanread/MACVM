@@ -28,6 +28,7 @@ pub struct InterpreterIc {
 }
 
 impl InterpreterIc {
+    #[inline]
     pub fn at(method: MethodOop, ic_idx: u16) -> InterpreterIc {
         InterpreterIc {
             ics: method.ics(),
@@ -35,21 +36,25 @@ impl InterpreterIc {
         }
     }
 
+    #[inline]
     pub fn selector(&self) -> SymbolOop {
         SymbolOop::try_from(self.ics.at(self.base + IC_SEL_OFFSET))
             .expect("InterpreterIc::selector: sel slot is not a Symbol")
     }
 
+    #[inline]
     fn meta(&self) -> i64 {
         SmallInt::try_from(self.ics.at(self.base + IC_META_OFFSET))
             .expect("InterpreterIc::meta: meta slot is not a smi")
             .value()
     }
 
+    #[inline]
     pub fn argc(&self) -> u8 {
         ((self.meta() & IC_META_ARGC_MASK) >> IC_META_ARGC_SHIFT) as u8
     }
 
+    #[inline]
     pub fn epoch(&self) -> u32 {
         ((self.meta() & IC_META_EPOCH_MASK) >> IC_META_EPOCH_SHIFT) as u32
     }
@@ -65,6 +70,7 @@ impl InterpreterIc {
         self.ics.at(self.base + IC_GUARD_OFFSET)
     }
 
+    #[inline]
     pub fn target(&self) -> Oop {
         self.ics.at(self.base + IC_TARGET_OFFSET)
     }
