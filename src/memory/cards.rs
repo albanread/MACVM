@@ -43,8 +43,18 @@ impl CardTable {
             old_start: old_reserved.start,
             n_cards,
         };
-        for i in 0..n_cards {
-            table.entry(i).store(CARD_CLEAN, Ordering::Relaxed);
+        // One memset, NOT a per-entry atomic-store loop. The obvious
+        // `for i { entry(i).store(CLEAN) }` compiles to a byte-at-a-time
+        // `strb` loop — atomics are never vectorized — and at ~880K cards
+        // for a default heap that loop was the single largest line item in
+        // the whole VM primordial phase: 146 of ~600 profile samples, ~3 ms
+        // of every boot (MACVM_BOOT_TIMING, 2026-08-13 frontend review).
+        // SAFETY: `backing` reserves and commits exactly `n_cards` bytes
+        // (above), and `table` has not been shared yet — construction is
+        // single-threaded exclusive access, so a raw fill cannot race the
+        // atomic view handed out later (which has the same byte layout).
+        unsafe {
+            std::ptr::write_bytes(table.backing.base() as *mut u8, CARD_CLEAN, n_cards);
         }
         table
     }

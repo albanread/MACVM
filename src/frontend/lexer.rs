@@ -133,6 +133,15 @@ impl<'a> Lexer<'a> {
     }
 
     fn peek_char(&self) -> Option<char> {
+        // ASCII fast path: `.mst` source is overwhelmingly ASCII, and this
+        // is called once per character of the whole world — the iterator
+        // construction + UTF-8 decode showed as the lexer's residual cost
+        // in the 2026-08-13 boot profile once `consume_while` stopped
+        // building Strings. One byte probe replaces both for bytes < 0x80.
+        let b = *self.input.as_bytes().get(self.pos)?;
+        if b < 0x80 {
+            return Some(b as char);
+        }
         self.rest().chars().next()
     }
 
@@ -206,17 +215,23 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn consume_while(&mut self, pred: impl Fn(char) -> bool) -> String {
-        let mut s = String::new();
+    /// Answers the consumed run as a SLICE of the input, not a fresh
+    /// `String` — the old per-char `String::push` build was the lexer's
+    /// hottest path in the 2026-08-13 boot profile (the lexer family was
+    /// ~15% of the main thread, most of it here and in `bump`). The slice
+    /// borrows `self.input` (`'a`), not `self`, so callers may keep lexing
+    /// while holding it; the few sites that store a token field convert
+    /// once, as one bulk copy.
+    fn consume_while(&mut self, pred: impl Fn(char) -> bool) -> &'a str {
+        let start = self.pos;
         while let Some(c) = self.peek_char() {
             if pred(c) {
-                s.push(c);
                 self.bump();
             } else {
                 break;
             }
         }
-        s
+        &self.input[start..self.pos]
     }
 
     fn is_ident_start(c: char) -> bool {
@@ -233,11 +248,11 @@ impl<'a> Lexer<'a> {
             self.bump();
             Tok::Keyword(format!("{ident}:"))
         } else {
-            Tok::Ident(ident)
+            Tok::Ident(ident.to_string())
         }
     }
 
-    fn consume_radix_digit_run(&mut self) -> String {
+    fn consume_radix_digit_run(&mut self) -> &'a str {
         self.consume_while(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
     }
 
@@ -264,7 +279,7 @@ impl<'a> Lexer<'a> {
             self.bump();
         }
         let digits = self.consume_while(|c| c.is_ascii_digit());
-        Ok(Some((marker, neg, digits)))
+        Ok(Some((marker, neg, digits.to_string())))
     }
 
     /// Consumes an optional scaled-decimal `s [digits]` suffix, answering
@@ -325,7 +340,7 @@ impl<'a> Lexer<'a> {
             return Ok(Tok::IntLit {
                 negative,
                 radix: radix_val as u8,
-                digits: rdigits,
+                digits: rdigits.to_string(),
             });
         }
 
@@ -339,8 +354,8 @@ impl<'a> Lexer<'a> {
             if let Some(scale) = self.try_consume_scale(frac.len().min(u16::MAX as usize) as u16, start)? {
                 return Ok(Tok::ScaledLit {
                     negative,
-                    int_digits: lead,
-                    frac_digits: frac,
+                    int_digits: lead.to_string(),
+                    frac_digits: frac.to_string(),
                     scale,
                 });
             }
@@ -359,7 +374,7 @@ impl<'a> Lexer<'a> {
         if let Some(scale) = self.try_consume_scale(0, start)? {
             return Ok(Tok::ScaledLit {
                 negative,
-                int_digits: lead,
+                int_digits: lead.to_string(),
                 frac_digits: String::new(),
                 scale,
             });
@@ -383,7 +398,7 @@ impl<'a> Lexer<'a> {
                         "integer exponent too large (limit 10000 digits)",
                     ));
                 }
-                let mut digits = lead;
+                let mut digits = lead.to_string();
                 digits.extend(std::iter::repeat('0').take(exp as usize));
                 return Ok(Tok::IntLit {
                     negative,
@@ -401,7 +416,7 @@ impl<'a> Lexer<'a> {
         Ok(Tok::IntLit {
             negative,
             radix: 10,
-            digits: lead,
+            digits: lead.to_string(),
         })
     }
 
