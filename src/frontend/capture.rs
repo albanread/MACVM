@@ -170,6 +170,16 @@ pub fn inline_block_positions(
         {
             Some(vec![BlockPos::Receiver, BlockPos::Arg(0)])
         }
+        // The ZERO-ARG loop forms (Squeak/Pharo have these too): condition
+        // and side effects live in the one receiver block, which loops while
+        // it answers true (`whileTrue`) / false (`whileFalse`). Same
+        // literal-receiver rule as `repeat`. These can ONLY exist as inlines:
+        // a library method would need an unbounded loop to implement them,
+        // and the language has no loop except these constructs (recursion
+        // has no TCO). Found missing live — `[... . true] whileTrue` DNU'd.
+        ("whileTrue", 0) | ("whileFalse", 0) if block_argc(receiver) == Some(0) => {
+            Some(vec![BlockPos::Receiver])
+        }
         // S15 (the sieve unlock): `n timesRepeat: [body]` — a zero-arg
         // literal block repeated receiver-many times. Not inlining it made
         // any method using it permanently uncompilable (the block escapes

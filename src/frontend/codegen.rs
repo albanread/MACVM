@@ -756,6 +756,23 @@ fn emit_inlined(
             b.bind(l2);
             b.push_nil();
         }
+        // The zero-arg forms: the one-block loop — condition (and side
+        // effects) in the receiver, no body. `whileTrue:` minus its body
+        // dissolve; answers nil like its keyword sibling.
+        "whileTrue" | "whileFalse" => {
+            let l0 = b.new_label();
+            let l2 = b.new_label();
+            b.bind(l0);
+            emit_dissolved_body(cx, hoist, cache, b, scope_id, next_hoist_slot, recv_block())?;
+            if selector == "whileTrue" {
+                b.br_false_fwd(l2);
+            } else {
+                b.br_true_fwd(l2);
+            }
+            b.jump_back(l0);
+            b.bind(l2);
+            b.push_nil();
+        }
         // S15: `n timesRepeat: [body]` — `to:do:`'s shape minus the loop
         // variable. Answers the receiver (Smalltalk's own contract); zero
         // and negative receivers run the body zero times (`1 <= n` fails
@@ -1929,6 +1946,26 @@ mod tests {
             "[| sum | sum := 0. 1 to: 5 do: [:i | sum := sum + i]. sum] value",
         );
         assert_eq!(r2, SmallInt::new(15).oop());
+    }
+
+    #[test]
+    fn inlined_zero_arg_whiletrue_and_whilefalse() {
+        let mut vm = test_vm();
+        install_value(&mut vm);
+        install_smi_arith(&mut vm);
+        // Condition and side effects in the ONE receiver block; the loop
+        // runs while it answers true (i counts 1..6, exits at 6).
+        let r = run_top(
+            &mut vm,
+            "[| i | i := 0. [i := i + 1. i <= 5] whileTrue. i] value",
+        );
+        assert_eq!(r, SmallInt::new(6).oop());
+        // whileFalse loops while the receiver answers FALSE (exits at 6 > 5).
+        let r2 = run_top(
+            &mut vm,
+            "[| i | i := 0. [i := i + 1. i > 5] whileFalse. i] value",
+        );
+        assert_eq!(r2, SmallInt::new(6).oop());
     }
 
     #[test]
