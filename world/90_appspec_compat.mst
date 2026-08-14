@@ -1,0 +1,25 @@
+"90_appspec_compat.mst — the names WINARMVM's tools were written against.
+
+ `docs/appspec.md` §5.5. The acceptance test of this whole arc is the author's:
+ the Windows sprite and sound editors should port over with NO EFFORT AT ALL.
+ Their sources contain no Win32 whatsoever — verified, zero references — so the
+ only thing standing between them and running here is that they say `WinSpec`
+ and `WinToolWindow` where we say `AppSpec` and `AppToolWindow`.
+
+ THE ALIAS MUST BE THE SUBCLASS, NEVER THE SUPERCLASS, and that direction is
+ load-bearing rather than stylistic. Every type check inside the vendored model
+ reads `isKindOf: AppNode`; an instance of a subclass answers true to that,
+ while an AppNode asked `isKindOf: WinNode` would answer false and the differ
+ would refuse every node it was handed. Verified before adopting: a node built
+ through `WinSpec button:event:id:` is an AppNode, because the inherited
+ constructor names AppNode explicitly, and it validates and diffs like any
+ other.
+
+ These are TRANSITIONAL. The better end state is the same rename in WINARMVM,
+ after which this file is deleted; nothing depends on that happening, and until
+ it does this is what keeps one tool source running on two platforms."
+
+AppNode subclass: WinNode [ ]
+AppSpec subclass: WinSpec [ ]
+AppSpecLayout subclass: WinSpecLayout [ ]
+AppToolWindow subclass: WinToolWindow [ ]

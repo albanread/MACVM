@@ -240,6 +240,14 @@
 # AppSpecLayout: measure-then-place, metrics passed in, top-left rects. Pure,
 # so the geometry is checkable to the pixel with no window.
 88_appspec_layout.mst
+# AppToolWindow (docs/appspec.md A1): the lifecycle and the reconcile loop,
+# PORTABLE — registry, dispatch discipline, counters, damage, and the
+# republish -> validate -> diff -> ops pipeline. Everything platform-shaped is
+# behind a realizer; the null realizer runs the whole pipeline with no display.
+89_apptoolwin.mst
+# The names WINARMVM's tools were written against, so they load here unchanged.
+# Transitional — deleted when the sister repo adopts the AppSpec names.
+90_appspec_compat.mst
 # SUnit (docs/sunit_design.md): tests for the world, written in the world.
 # TestCase/TestFailure/TestResult/TestRunner. Loads last in the world list so
 # a test file in tests.list can subclass TestCase.

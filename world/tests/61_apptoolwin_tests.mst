@@ -1,0 +1,314 @@
+"61_apptoolwin_tests.mst — gates world/89_apptoolwin.mst and world/90_appspec_compat.mst.
+
+ A1's claims are about WHEN a reconcile happens and WHAT it produces, and both
+ are checkable with no window at all: the null realizer records the placements
+ and patches a real one would have performed, so `a click produced exactly one
+ setNodeProps naming clicks` is a statement about ops rather than about pixels.
+
+ THE COUNTERS ARE THE POINT OF MOST OF THESE. A declarative UI that rebuilds
+ its whole window on every keystroke still looks correct in a screenshot and is
+ wrong in the way that matters, so the assertions here are mostly of the form
+ `the patch count moved and the rebuild count did not`.
+
+ Class variables are image-wide, so every test starts with `AppToolWindow
+ reset` — otherwise a registry left behind by one test is read by the next."
+
+TestCase subclass: AppToolWindowTests [
+
+    "── helpers ─────────────────────────────────────────────────────────"
+
+    "A tool whose state is one counter held in the test, so a handler can move
+     it and the next spec can show it. Answers the window."
+    toolOn: aCell <Object> [
+        ^AppToolWindow
+            register: #probe title: 'Probe' width: 400 height: 300
+            render: [
+                AppSpec window: 'Probe' id: #probeWin body: (AppSpec stack: {
+                    AppSpec text: 'count: ' , (aCell at: 1) printString id: #countText.
+                    AppSpec button: 'Bump' event: #bump id: #bumpBtn } id: #root) ]
+            handler: [ :event :value |
+                event == #bump ifTrue: [ aCell at: 1 put: (aCell at: 1) + 1 ].
+                (AppToolWindow named: #probe) rerender ]
+    ]
+
+    "── the registry ────────────────────────────────────────────────────"
+
+    testRegisterKeepsNameAndOrder [
+        AppToolWindow reset.
+        AppToolWindow register: #a title: 'A' width: 100 height: 100
+            render: [ nil ] handler: [ :e :v | nil ].
+        AppToolWindow register: #b title: 'B' width: 100 height: 100
+            render: [ nil ] handler: [ :e :v | nil ].
+        self assert: (AppToolWindow named: #a) title equals: 'A'.
+        self assert: (AppToolWindow named: #b) title equals: 'B'.
+        self assert: AppToolWindow order asArray equals: #(#a #b).
+        self assert: (AppToolWindow named: #missing) isNil.
+    ]
+
+    "Re-registering the same id REPLACES the tool without growing the order —
+     a reloaded tool file must not appear twice in a Tools menu."
+    testReRegisterDoesNotDuplicateTheOrder [
+        AppToolWindow reset.
+        AppToolWindow register: #a title: 'A' width: 100 height: 100
+            render: [ nil ] handler: [ :e :v | nil ].
+        AppToolWindow register: #a title: 'A again' width: 100 height: 100
+            render: [ nil ] handler: [ :e :v | nil ].
+        self assert: AppToolWindow order size equals: 1.
+        self assert: (AppToolWindow named: #a) title equals: 'A again'.
+    ]
+
+    "── open / close ────────────────────────────────────────────────────"
+
+    testOpenRealizesAndCloseHidesWithoutLosingState [
+        | cell w |
+        AppToolWindow reset.
+        cell := Array with: 7.
+        w := self toolOn: cell.
+        self deny: w isOpen.
+        self assert: w open.
+        self assert: w isOpen.
+        self assert: AppToolWindow rebuildCount equals: 1.
+        "CLOSE IS HIDE: the window goes away, the spec and the state do not."
+        w closeRequested.
+        self deny: w isOpen.
+        self assert: w lastSpec isNil not.
+        "Reopening does not rebuild from scratch — there is nothing to change,
+         so it diffs to no ops at all."
+        self assert: w open.
+        self assert: AppToolWindow rebuildCount equals: 1.
+    ]
+
+    "── the claim the whole design rests on ─────────────────────────────"
+
+    testAClickPatchesInPlaceAndDoesNotRebuild [
+        | cell w before |
+        AppToolWindow reset.
+        cell := Array with: 0.
+        w := self toolOn: cell.
+        w open.
+        before := AppToolWindow rebuildCount.
+        w dispatch: #bump value: nil.
+        "The state moved..."
+        self assert: (cell at: 1) equals: 1.
+        "...the window was PATCHED, not rebuilt..."
+        self assert: AppToolWindow patchCount equals: 1.
+        self assert: AppToolWindow rebuildCount equals: before.
+        "...and exactly one node was touched, the one whose text changed."
+        self assert: w realizer patches size equals: 1.
+        self assert: ((w realizer patches at: 1) at: 1) equals: 'countText'.
+        self assert: (((w realizer patches at: 1) at: 2) at: 1) key equals: #text.
+        self assert: (((w realizer patches at: 1) at: 2) at: 1) value equals: 'count: 1'.
+    ]
+
+    "A spec that did not change at all diffs to no ops, so nothing is applied
+     and neither counter moves — the republish is free."
+    testAnUnchangedRepublishCostsNothing [
+        | cell w |
+        AppToolWindow reset.
+        cell := Array with: 0.
+        w := self toolOn: cell.
+        w open.
+        w rerender.
+        self assert: AppToolWindow patchCount equals: 0.
+        self assert: AppToolWindow rebuildCount equals: 1.
+        self assert: w realizer patches isEmpty.
+    ]
+
+    "── the dispatch discipline ─────────────────────────────────────────"
+
+    "FIVE STATE CHANGES IN ONE HANDLER COST ONE UPDATE. The handler here asks
+     for a rerender five times; depth is non-zero for all of them, so they
+     coalesce into the single reconcile that runs when depth returns to zero."
+    testNestedRerendersCoalesceIntoOne [
+        | cell w |
+        AppToolWindow reset.
+        cell := Array with: 0.
+        w := AppToolWindow
+            register: #probe title: 'Probe' width: 400 height: 300
+            render: [
+                AppSpec window: 'Probe' id: #probeWin body: (AppSpec stack: {
+                    AppSpec text: 'count: ' , (cell at: 1) printString id: #countText } id: #root) ]
+            handler: [ :event :value |
+                1 to: 5 do: [ :i |
+                    cell at: 1 put: (cell at: 1) + 1.
+                    (AppToolWindow named: #probe) rerender ] ].
+        w open.
+        w dispatch: #bump value: nil.
+        self assert: (cell at: 1) equals: 5.
+        "One patch, not five."
+        self assert: AppToolWindow patchCount equals: 1.
+        "And it carries the FINAL state, not an intermediate one."
+        self assert: (((w realizer patches at: 1) at: 2) at: 1) value equals: 'count: 5'.
+    ]
+
+    "Depth must come back to zero even when the handler raises, or the window
+     is deaf from then on. The report is kept rather than swallowed."
+    testAHandlerThatRaisesIsReportedAndLeavesDepthClean [
+        | w |
+        AppToolWindow reset.
+        w := AppToolWindow
+            register: #probe title: 'Probe' width: 400 height: 300
+            render: [ AppSpec window: 'P' id: #w body: (AppSpec text: 'x' id: #t) ]
+            handler: [ :event :value | self error: 'tool blew up' ].
+        w open.
+        w dispatch: #boom value: nil.
+        self assert: AppToolWindow eventDepth equals: 0.
+        self assert: AppToolWindow reports isEmpty not.
+    ]
+
+    "WHILE OPS ARE APPLIED, EVENTS ARE SUPPRESSED. A realizer that sets a
+     control's text can provoke a change notification from the toolkit; if that
+     re-entered the handler it would be a loop, and this is the guard."
+    testDispatchIsIgnoredWhileSuppressed [
+        | cell w |
+        AppToolWindow reset.
+        cell := Array with: 0.
+        w := self toolOn: cell.
+        w open.
+        AppToolWindow suppress: true.
+        w dispatch: #bump value: nil.
+        AppToolWindow suppress: false.
+        self assert: (cell at: 1) equals: 0.
+    ]
+
+    "── rebuild, when a patch cannot say it ─────────────────────────────"
+
+    "A node whose TYPE changed has a different identity, which no patch can
+     express — the differ declines and the window is rebuilt. That is the
+     escape hatch working, and the rebuild counter is how it is seen."
+    testAStructuralChangeRebuildsRatherThanPatching [
+        | cell w |
+        AppToolWindow reset.
+        cell := Array with: 0.
+        w := AppToolWindow
+            register: #probe title: 'Probe' width: 400 height: 300
+            render: [
+                AppSpec window: 'Probe' id: #probeWin body: (AppSpec stack: {
+                    (cell at: 1) = 0
+                        ifTrue: [ AppSpec text: 'plain' id: #slot ]
+                        ifFalse: [ AppSpec button: 'now a button' event: #x id: #slot ] }
+                    id: #root) ]
+            handler: [ :event :value |
+                cell at: 1 put: 1.
+                (AppToolWindow named: #probe) rerender ].
+        w open.
+        self assert: AppToolWindow rebuildCount equals: 1.
+        w dispatch: #swap value: nil.
+        self assert: AppToolWindow rebuildCount equals: 2.
+        self assert: AppToolWindow patchCount equals: 0.
+    ]
+
+    "── validation ──────────────────────────────────────────────────────"
+
+    "A malformed spec is refused where the tool can still be named, and NOTHING
+     is realized from it — a half-built window is worse than none."
+    testAnInvalidSpecIsRefusedAndNamed [
+        | w |
+        AppToolWindow reset.
+        w := AppToolWindow
+            register: #bad title: 'Bad' width: 200 height: 200
+            render: [ AppSpec stack: {} id: #notAWindow ]
+            handler: [ :e :v | nil ].
+        self deny: w open.
+        self assert: w lastSpec isNil.
+        self assert: AppToolWindow reports isEmpty not.
+    ]
+
+    "── damage ──────────────────────────────────────────────────────────"
+
+    testWholePaneDamageAbsorbsARegion [
+        | w |
+        AppToolWindow reset.
+        w := self toolOn: (Array with: 0).
+        self assert: (w damageFor: #grid) equals: #clean.
+        w invalidatePane: #grid rect: (Array with: 2 with: 3 with: 4 with: 5).
+        self assert: (w damageFor: #grid) equals: #(2 3 4 5).
+        w invalidatePane: #grid.
+        self assert: (w damageFor: #grid) isNil.
+        "Whole cannot be shrunk back to a region."
+        w invalidatePane: #grid rect: (Array with: 0 with: 0 with: 1 with: 1).
+        self assert: (w damageFor: #grid) isNil.
+    ]
+
+    "Two regions between paints become their bounding box — exact for the case
+     that matters, and still one Array."
+    testTwoRegionsUnionIntoTheirBoundingBox [
+        | w |
+        AppToolWindow reset.
+        w := self toolOn: (Array with: 0).
+        w invalidatePane: #grid rect: (Array with: 0 with: 0 with: 10 with: 10).
+        w invalidatePane: #grid rect: (Array with: 20 with: 5 with: 10 with: 10).
+        self assert: (w damageFor: #grid) equals: #(0 0 30 15).
+    ]
+
+    "PAINTING TAKES THE DAMAGE, so it cannot linger into the next paint or
+     loop if a paint block invalidates."
+    testPaintDirtyConsumesTheDamageAndCallsTheBlockOncePerPane [
+        | seen w |
+        AppToolWindow reset.
+        seen := OrderedCollection new.
+        w := AppToolWindow
+            register: #painty title: 'Painty' width: 300 height: 300
+            render: [ AppSpec window: 'P' id: #w body: (AppSpec text: 'x' id: #t) ]
+            handler: [ :e :v | nil ]
+            paint: [ :win :paneId :region | seen add: paneId ].
+        w invalidatePane: #one.
+        w invalidatePane: #two rect: (Array with: 1 with: 1 with: 2 with: 2).
+        w paintDirty.
+        self assert: seen size equals: 2.
+        self assert: (w damageFor: #one) equals: #clean.
+        self assert: (w damageFor: #two) equals: #clean.
+        "A second paint with nothing pending calls nobody."
+        w paintDirty.
+        self assert: seen size equals: 2.
+    ]
+
+    "── layout reaches the realizer ─────────────────────────────────────"
+
+    "The realizer is handed absolute rects and the KIND of each placement, so a
+     label and its control are two placements of one node. Pinned here because
+     the Cocoa realizer in A2 will be written against exactly this shape."
+    testTheRealizerIsHandedPlacedRectsPerNode [
+        | w place |
+        AppToolWindow reset.
+        w := self toolOn: (Array with: 0).
+        w open.
+        self assert: (w realizer placedIds includes: 'countText').
+        self assert: (w realizer placedIds includes: 'bumpBtn').
+        place := w realizer placementFor: #countText kind: #control.
+        self assert: place isNil not.
+        "Root padding is 16, and a stack's first child sits at the origin it
+         was given — so the first control is at (16, 16) exactly."
+        self assert: (place at: 2) equals: 16.
+        self assert: (place at: 3) equals: 16.
+    ]
+
+    "── the compatibility shims ─────────────────────────────────────────"
+
+    "The acceptance test in miniature: the names a WINARMVM tool was written
+     against resolve, and what they build is an ordinary AppNode that the
+     differ accepts."
+    testWinSpecAliasBuildsRealAppNodes [
+        | n spec |
+        n := WinSpec button: 'Click me' event: #bump id: #b1.
+        self assert: (n isKindOf: AppNode).
+        self assert: n type equals: #button.
+        self assert: (n at: #text) equals: 'Click me'.
+        spec := AppSpec normalize:
+            (WinSpec window: 'T' id: #w body: (WinSpec stack: { n } id: #root)).
+        self assert: (AppSpec validate: spec) isNil.
+        self assert: (AppSpec diff: spec against: spec) isEmpty.
+    ]
+
+    "A tool registered through the alias lands in the SAME registry — class
+     variables are shared down the hierarchy, which is what makes one Tools
+     menu see tools written under either name."
+    testWinToolWindowAliasSharesTheOneRegistry [
+        AppToolWindow reset.
+        WinToolWindow register: #legacy title: 'Legacy' width: 100 height: 100
+            render: [ nil ] handler: [ :e :v | nil ].
+        self assert: (AppToolWindow named: #legacy) isNil not.
+        self assert: (AppToolWindow named: #legacy) title equals: 'Legacy'.
+        self assert: WinToolWindow patchCount equals: AppToolWindow patchCount.
+    ]
+]

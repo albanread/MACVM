@@ -1,0 +1,533 @@
+"89_apptoolwin.mst — AppSpec A1: the lifecycle and the reconcile loop, PORTABLE.
+
+ `docs/appspec.md` is the decision record; this is stage A1 of its ladder.
+
+ WINARMVM keeps all of this in one class, `WinToolWindow`, mixed together with
+ the Win32 that draws it. WE SPLIT IT, and the split is the reason a tool
+ written on either platform runs on both: everything in this file is the
+ contract — the registry, the dispatch discipline, the counters, the damage
+ bookkeeping, and the republish -> validate -> diff -> ops pipeline — and
+ everything platform-shaped is behind a REALIZER, one instance per window,
+ which this file only ever talks to through nine messages.
+
+ THE REALIZER PROTOCOL, in full, so a new platform knows exactly what it owes:
+
+     newFor: aWindow          answer a realizer bound to that window
+     open                     create-or-front the native window; answer Boolean
+     hide                     make it invisible, keep the state (close = hide)
+     teardown                 destroy natives, in the platform's own order
+     isOpen                   Boolean
+     metrics                  {charWidth. lineHeight} of the window's font
+     clientWidth              pixels available to lay out in
+     destroyControls          drop every realized control (a rebuild)
+     createFor: aPlacement    {node. x. y. w. h. kind} -> one native control
+     applyNodeProps: c to: id patch one node's changed props in place
+     applyWindowProps: c      patch the window's own props (title, so far)
+
+ THE AUTHOR OF A TOOL SEES NONE OF THAT. A tool is a title, a block that
+ answers a spec and a block that handles an event — no window code, no control
+ code, no layout code, no teardown code. That is the whole point of the file,
+ and it is what `docs/appspec.md` means by the realizer owning the memory
+ management: you cannot leak a native object you never held.
+
+ THE DISPATCH DISCIPLINE is winscheme's, and it is why a handler that changes
+ five things costs one screen update: event depth is COUNTED; a `rerender`
+ asked for inside a handler only raises a flag; the one coalesced reconcile
+ runs when depth returns to zero. While ops are applied, events are
+ SUPPRESSED — a programmatic update that comes back as a user event is a loop,
+ and it is the trap every declarative UI over a native toolkit meets.
+
+ THE COUNTERS ARE NOT DECORATION. `patchCount` and `rebuildCount` are how an
+ id-strategy failure is SEEN rather than felt as flicker: a tool that rebuilds
+ its window on every keystroke still looks correct in a screenshot. The demo
+ tool puts them on its own face for exactly that reason."
+
+"────────────────────────────────────────────────────────────────────────
+ The null realizer: the whole pipeline, no platform.
+
+ It is not a stub for tests to tolerate — it is the correct behaviour for an
+ image with no display, and it is what makes A1's claims checkable before A2
+ exists. It RECORDS what a real realizer would have done (the placements it
+ was handed, the patches it was asked to apply), which is exactly the evidence
+ a test about a differ wants: `one click produced one setNodeProps naming
+ clicks` is a statement about the ops, and needs no window to be true."
+Object subclass: AppNullRealizer [
+    | window open placements patches windowPatches |
+
+    AppNullRealizer class >> newFor: aWindow <Object> ^ <AppNullRealizer> [
+        ^self new setWindow: aWindow
+    ]
+
+    setWindow: aWindow <Object> ^ <AppNullRealizer> [
+        window := aWindow.
+        open := false.
+        placements := OrderedCollection new.
+        patches := OrderedCollection new.
+        windowPatches := OrderedCollection new.
+        ^self
+    ]
+
+    "── the realizer protocol ───────────────────────────────────────────"
+
+    open ^ <Boolean> [ open := true. ^true ]
+    hide [ open := false. ^self ]
+    teardown [ open := false. self destroyControls. ^self ]
+    isOpen ^ <Boolean> [ ^open ]
+
+    "ROUND NUMBERS ON PURPOSE. A test that asserts exact pixels wants metrics
+     it can do arithmetic with in its head; the Cocoa realizer measures its
+     real font instead."
+    metrics ^ <Array> [ ^AppSpecLayout metricsCharWidth: 8 lineHeight: 16 ]
+    clientWidth ^ <Integer> [ ^window width ]
+
+    destroyControls [ placements := OrderedCollection new. ^self ]
+
+    createFor: aPlacement <Array> [ placements add: aPlacement. ^self ]
+
+    applyNodeProps: changed <OrderedCollection> to: nodeId <String> [
+        patches add: (Array with: nodeId with: changed).
+        ^self
+    ]
+
+    applyWindowProps: changed <OrderedCollection> [
+        windowPatches add: changed.
+        ^self
+    ]
+
+    tick [ ^self ]
+
+    "── what a test reads ───────────────────────────────────────────────"
+
+    placements ^ <OrderedCollection> [ ^placements ]
+    patches ^ <OrderedCollection> [ ^patches ]
+    windowPatches ^ <OrderedCollection> [ ^windowPatches ]
+
+    "The nodes actually realized, by id — `controls` in spirit, without a
+     control in sight."
+    placedIds ^ <OrderedCollection> [
+        | out |
+        out := OrderedCollection new.
+        placements do: [ :p | ((p at: 6) == #control) ifTrue: [ out add: (p at: 1) idOrEmpty ] ].
+        ^out
+    ]
+
+    placementFor: anId <Object> kind: aKind <Symbol> ^ <Object> [
+        placements do: [ :p |
+            (((p at: 1) idOrEmpty = anId asString) and: [ (p at: 6) == aKind ])
+                ifTrue: [ ^p ] ].
+        ^nil
+    ]
+]
+
+Object subclass: AppToolWindow [
+    <classVars: Windows Order EventDepth RerenderPending Suppress
+                PatchCount RebuildCount RealizerClass Reports>
+
+    "── the registry ────────────────────────────────────────────────────"
+
+    AppToolWindow class >> windows ^ <Dictionary> [
+        Windows isNil ifTrue: [ Windows := Dictionary new ].
+        ^Windows
+    ]
+
+    "REGISTRATION ORDER, kept beside the dictionary and not derived from it.
+     A Dictionary has no order, so a Tools menu built by iterating one would
+     hand the same tool a different position from run to run — invisible until
+     something drives the menu by index and opens the wrong window."
+    AppToolWindow class >> order ^ <OrderedCollection> [
+        Order isNil ifTrue: [ Order := OrderedCollection new ].
+        ^Order
+    ]
+
+    AppToolWindow class >> register: anId <Symbol> title: aTitle <String>
+                           width: w <Integer> height: h <Integer>
+                           render: renderBlock <Object> handler: handlerBlock <Object> ^ <Object> [
+        ^self register: anId title: aTitle width: w height: h
+              render: renderBlock handler: handlerBlock paint: nil
+    ]
+
+    AppToolWindow class >> register: anId <Symbol> title: aTitle <String>
+                           width: w <Integer> height: h <Integer>
+                           render: renderBlock <Object> handler: handlerBlock <Object>
+                           paint: paintBlock <Object> ^ <Object> [
+        "THE PAINT BLOCK IS FOR PANES AND ONLY FOR PANES. A control's contents
+         are its props and the differ carries those; a pane's contents are
+         PIXELS the tool computes, which no diff of a spec could express. So
+         the spec PLACES a pane and this block FILLS it.
+
+         Declared, not built: a tool that is never opened costs a dictionary
+         entry and no window, which is what makes it reasonable to register
+         every tool at load time."
+        | tool |
+        tool := AppToolWindow new
+            setId: anId title: aTitle width: w height: h
+            render: renderBlock handler: handlerBlock paint: paintBlock.
+        (self windows includesKey: anId) ifFalse: [ self order add: anId ].
+        self windows at: anId put: tool.
+        ^tool
+    ]
+
+    AppToolWindow class >> named: anId <Symbol> ^ <Object> [
+        ^self windows at: anId ifAbsent: [ nil ]
+    ]
+
+    AppToolWindow class >> open: anId <Symbol> ^ <Boolean> [
+        | tool |
+        tool := self named: anId.
+        tool isNil ifTrue: [ ^false ].
+        ^tool open
+    ]
+
+    "For tests and for a fresh environment: forget every registration."
+    AppToolWindow class >> reset [
+        Windows := nil. Order := nil.
+        EventDepth := nil. RerenderPending := nil. Suppress := nil.
+        Reports := nil.
+        self resetCounts.
+        ^self
+    ]
+
+    "── the realizer, chosen once for the image ─────────────────────────
+
+     Headless — a test, a worker with no UI, a `run` from the CLI — leaves this
+     as the null realizer, and the ENTIRE pipeline still runs: normalize,
+     validate, diff, ops, counters, damage. That is what makes A1 testable
+     before A2's Cocoa realizer exists, and it is also what a worker VM with no
+     display should do rather than fail."
+
+    AppToolWindow class >> realizerClass ^ <Object> [
+        RealizerClass isNil ifTrue: [ RealizerClass := AppNullRealizer ].
+        ^RealizerClass
+    ]
+
+    AppToolWindow class >> realizerClass: aClass <Object> [
+        RealizerClass := aClass.
+        ^self
+    ]
+
+    "── the beat ────────────────────────────────────────────────────────
+     One clock for the whole registry rather than a timer per window: easier
+     to reason about, and it makes `tick` a place every open window visits."
+
+    AppToolWindow class >> tickAll [
+        self order do: [ :k | | t |
+            t := self windows at: k.
+            t isOpen ifTrue: [ t tick ] ].
+        ^self
+    ]
+
+    AppToolWindow class >> closeAll [
+        self order do: [ :k | (self windows at: k) teardown ].
+        ^self
+    ]
+
+    "── the dispatch discipline, shared by every window ─────────────────"
+
+    AppToolWindow class >> eventDepth ^ <Integer> [
+        ^EventDepth isNil ifTrue: [ 0 ] ifFalse: [ EventDepth ]
+    ]
+
+    AppToolWindow class >> suppressing ^ <Boolean> [ ^Suppress == true ]
+    AppToolWindow class >> suppress: aBool <Boolean> [ Suppress := aBool. ^self ]
+
+    AppToolWindow class >> enterEvent [ EventDepth := self eventDepth + 1. ^self ]
+    AppToolWindow class >> leaveEvent [
+        EventDepth := (self eventDepth - 1) max: 0.
+        ^self
+    ]
+
+    AppToolWindow class >> rerenderPending ^ <Boolean> [ ^RerenderPending == true ]
+    AppToolWindow class >> rerenderPending: aBool <Boolean> [ RerenderPending := aBool. ^self ]
+
+    "── the metrics, because an id strategy fails QUIETLY ───────────────"
+
+    AppToolWindow class >> patchCount ^ <Integer> [
+        ^PatchCount isNil ifTrue: [ 0 ] ifFalse: [ PatchCount ]
+    ]
+    AppToolWindow class >> rebuildCount ^ <Integer> [
+        ^RebuildCount isNil ifTrue: [ 0 ] ifFalse: [ RebuildCount ]
+    ]
+    AppToolWindow class >> countPatch [ PatchCount := self patchCount + 1. ^self ]
+    AppToolWindow class >> countRebuild [ RebuildCount := self rebuildCount + 1. ^self ]
+    AppToolWindow class >> resetCounts [ PatchCount := 0. RebuildCount := 0. ^self ]
+
+    "The bounding box of two {x. y. w. h} rects — how damage coalesces between
+     paints."
+    AppToolWindow class >> union: a <Array> with: b <Array> ^ <Array> [
+        | x0 y0 x1 y1 |
+        x0 := (a at: 1) min: (b at: 1).
+        y0 := (a at: 2) min: (b at: 2).
+        x1 := ((a at: 1) + (a at: 3)) max: ((b at: 1) + (b at: 3)).
+        y1 := ((a at: 2) + (a at: 4)) max: ((b at: 2) + (b at: 4)).
+        ^Array with: x0 with: y0 with: x1 - x0 with: y1 - y0
+    ]
+
+    "── where a tool's own failure goes ─────────────────────────────────
+
+     A tool must not be able to take the environment down by raising in its
+     render or handler block, and it must not fail SILENTLY either. Reports are
+     kept in a list the tests can read, and a platform realizer is free to
+     mirror them into a transcript."
+
+    AppToolWindow class >> reports ^ <OrderedCollection> [
+        Reports isNil ifTrue: [ Reports := OrderedCollection new ].
+        ^Reports
+    ]
+
+    AppToolWindow class >> report: aString <String> [
+        self reports add: aString.
+        ^self
+    ]
+
+    "── an instance ─────────────────────────────────────────────────────"
+
+    | id title width height renderBlock handlerBlock paintBlock realizer lastSpec damage |
+
+    setId: anId <Symbol> title: aTitle <String> width: w <Integer> height: h <Integer>
+    render: r <Object> handler: hh <Object> paint: pp <Object> ^ <AppToolWindow> [
+        id := anId.
+        title := aTitle.
+        width := w.
+        height := h.
+        renderBlock := r.
+        handlerBlock := hh.
+        paintBlock := pp.
+        damage := Dictionary new.
+        lastSpec := nil.
+        realizer := nil.
+        ^self
+    ]
+
+    id ^ <Symbol> [ ^id ]
+    title ^ <String> [ ^title ]
+    title: aString <String> [ title := aString. ^self ]
+    width ^ <Integer> [ ^width ]
+    height ^ <Integer> [ ^height ]
+    lastSpec ^ <Object> [ ^lastSpec ]
+    paintBlock ^ <Object> [ ^paintBlock ]
+
+    "Built on first use, so registering a tool costs no realizer either."
+    realizer ^ <Object> [
+        realizer isNil ifTrue: [
+            realizer := AppToolWindow realizerClass newFor: self ].
+        ^realizer
+    ]
+
+    isOpen ^ <Boolean> [ ^self realizer isOpen ]
+
+    "── open: front or build, which is the Mac's own choice, kept ───────"
+
+    open ^ <Boolean> [
+        (self realizer open) ifFalse: [ ^false ].
+        lastSpec isNil ifTrue: [ ^self realize ].
+        ^self rerender
+    ]
+
+    "CLOSE IS HIDE, NEVER DIE, and it is bound here so that no tool can forget
+     it. The state is the tool's own and outlives the window, so reopening is
+     instant and loses nothing."
+    closeRequested ^ <Object> [
+        self realizer hide.
+        ^self
+    ]
+
+    teardown [
+        self realizer teardown.
+        lastSpec := nil.
+        damage := Dictionary new.
+        ^self
+    ]
+
+    "── damage: the patch discipline, extended to pane pixels ───────────
+
+     A pane's contents are pixels, so no diff of a spec can ever say they
+     changed — but the HANDLER knows exactly which cell it touched, and that
+     information was in the system all along. A handler that changes what a
+     pane shows SAYS SO; painting takes the damage, so it cannot linger or
+     loop. Minimal update is the FEATURE of a patching UI, not an optimisation
+     of one."
+
+    invalidatePane: anId <Object> [
+        "The whole pane. nil damage MEANS everything, and it absorbs any region
+         already recorded — whole beats parts, and cannot be shrunk back."
+        damage at: anId asString put: nil.
+        ^self
+    ]
+
+    invalidatePane: anId <Object> rect: r <Array> [
+        "A region, {x. y. w. h} in the pane's OWN pixels — the same space its
+         events arrive in. Regions union into one bounding box between paints:
+         between two paints there is rarely more than one event, and a box is
+         exact for the case that matters."
+        | k |
+        k := anId asString.
+        (damage includesKey: k)
+            ifTrue: [
+                (damage at: k) isNil ifTrue: [ ^self ].
+                damage at: k put: (AppToolWindow union: (damage at: k) with: r) ]
+            ifFalse: [ damage at: k put: r ].
+        ^self
+    ]
+
+    damageFor: anId <Object> ^ <Object> [
+        "#clean when nothing is pending, nil for the whole pane, a rect for a
+         region. Named for tests, which is why it does not answer nil for both."
+        ^damage at: anId asString ifAbsent: [ #clean ]
+    ]
+
+    invalidateAllPanes [
+        "A rebuild replaced the pane surfaces, so everything they showed is
+         gone whether or not anyone said so."
+        lastSpec isNil ifTrue: [ ^self ].
+        self panesIn: lastSpec do: [ :node | damage at: node idOrEmpty put: nil ].
+        ^self
+    ]
+
+    panesIn: aNode <Object> do: aBlock <Object> [
+        (aNode isKindOf: AppNode) ifFalse: [ ^self ].
+        (AppSpec paneTypes includes: aNode type) ifTrue: [ aBlock value: aNode ].
+        aNode children do: [ :c | self panesIn: c do: aBlock ].
+        ^self
+    ]
+
+    paintDirty [
+        "Take the damage FIRST and clear it, so a paint block that invalidates
+         (it should not, but an error handler might) cannot loop this."
+        | pending |
+        damage isEmpty ifTrue: [ ^self ].
+        pending := damage.
+        damage := Dictionary new.
+        paintBlock isNil ifTrue: [ ^self ].
+        pending keysAndValuesDo: [ :paneId :region |
+            [ paintBlock value: self value: paneId value: region ]
+                on: Error do: [ :e | AppToolWindow report: e messageText ] ].
+        ^self
+    ]
+
+    "── the beat ────────────────────────────────────────────────────────"
+
+    tick [
+        self isOpen ifFalse: [ ^self ].
+        AppToolWindow suppressing ifTrue: [ ^self ].
+        self realizer tick.
+        ^self
+    ]
+
+    "── dispatch: depth in, handler, depth out ──────────────────────────
+
+     Only at depth zero does a pending rerender actually happen, which is what
+     turns N state changes in one handler into one diff and one screen update."
+
+    dispatch: event <Symbol> value: aValue <Object> ^ <Object> [
+        handlerBlock isNil ifTrue: [ ^0 ].
+        AppToolWindow suppressing ifTrue: [ ^0 ].
+        AppToolWindow enterEvent.
+        [ handlerBlock value: event value: aValue ]
+            on: Error do: [ :e | AppToolWindow report: e messageText ].
+        AppToolWindow leaveEvent.
+        (AppToolWindow eventDepth = 0 and: [ AppToolWindow rerenderPending ])
+            ifTrue: [
+                AppToolWindow rerenderPending: false.
+                self rerender ].
+        ^0
+    ]
+
+    "── rerender: the whole programming model in one method ─────────────"
+
+    rerender ^ <Boolean> [
+        | spec ops |
+        "THE DEPTH GUARD COMES FIRST, before asking whether there is even a
+         window. The discipline is about WHEN a reconcile may happen, not about
+         whether one is worth doing — and a deferred rerender that finds a
+         closed window at depth zero simply answers false, which costs nothing
+         and keeps one rule instead of two."
+        AppToolWindow eventDepth > 0 ifTrue: [
+            AppToolWindow rerenderPending: true.
+            ^true ].
+        self isOpen ifFalse: [ ^false ].
+        spec := self currentSpec.
+        spec isNil ifTrue: [ ^false ].
+        lastSpec isNil ifTrue: [ ^self realizeSpec: spec ].
+        ops := AppSpec diff: lastSpec against: spec.
+        ops isNil ifTrue: [ ^self realizeSpec: spec ].
+        ops isEmpty ifTrue: [
+            "NO OPS IS NOT NOTHING TO DO. A tool that painted a pane changed
+             what is on screen without changing a single prop — a pencil stroke
+             is exactly that. `nothing changed` means nothing changed about the
+             CONTROLS; what changed about the PANES is whatever the handler
+             invalidated, and only that is painted."
+            lastSpec := spec.
+            self paintDirty.
+            ^true ].
+        ^self apply: ops spec: spec
+    ]
+
+    currentSpec ^ <Object> [
+        | spec bad |
+        renderBlock isNil ifTrue: [ ^nil ].
+        spec := [ renderBlock value ] on: Error do: [ :e |
+            AppToolWindow report: e messageText. nil ].
+        spec isNil ifTrue: [ ^nil ].
+        spec := AppSpec normalize: spec.
+        bad := AppSpec validate: spec.
+        bad isNil ifFalse: [
+            "A malformed spec is refused HERE, where the tool that built it can
+             still be named, rather than half-realized into a window."
+            AppToolWindow report: 'tool ' , id printString , ': ' , bad.
+            ^nil ].
+        ^spec
+    ]
+
+    "── the two outcomes ────────────────────────────────────────────────"
+
+    realize ^ <Boolean> [
+        | spec |
+        spec := self currentSpec.
+        spec isNil ifTrue: [ ^false ].
+        ^self realizeSpec: spec
+    ]
+
+    realizeSpec: spec <AppNode> ^ <Boolean> [
+        | places |
+        AppToolWindow countRebuild.
+        AppToolWindow suppress: true.
+        self realizer destroyControls.
+        places := AppSpecLayout
+            layout: spec width: self realizer clientWidth metrics: self realizer metrics.
+        places do: [ :p | self realizer createFor: p ].
+        AppToolWindow suppress: false.
+        lastSpec := spec.
+        self invalidateAllPanes.
+        self paintDirty.
+        ^true
+    ]
+
+    apply: ops <OrderedCollection> spec: spec <AppNode> ^ <Boolean> [
+        "IN PLACE, or not at all. Only prop patches are applied here; anything
+         structural falls back to a rebuild, which is honest and is exactly
+         what the rebuild counter is for — it says when that stops being good
+         enough."
+        | ok |
+        ok := true.
+        ops do: [ :op |
+            ((op at: 1) == #setNodeProps or: [ (op at: 1) == #setWindowProps ])
+                ifFalse: [ ok := false ] ].
+        ok ifFalse: [ ^self realizeSpec: spec ].
+        AppToolWindow suppress: true.
+        ops do: [ :op |
+            (op at: 1) == #setWindowProps
+                ifTrue: [ self applyWindowProps: (op at: 2) ]
+                ifFalse: [ self realizer applyNodeProps: (op at: 3) to: (op at: 2) ] ].
+        AppToolWindow suppress: false.
+        AppToolWindow countPatch.
+        lastSpec := spec.
+        self paintDirty.
+        ^true
+    ]
+
+    applyWindowProps: changed <OrderedCollection> [
+        changed do: [ :a | a key == #title ifTrue: [ title := a value ] ].
+        self realizer applyWindowProps: changed.
+        ^self
+    ]
+]
