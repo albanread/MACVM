@@ -1,286 +1,261 @@
-"93_appvm.mst — AppSpec A5: an app in a VM of its own.
+"93_appvm.mst — AppSpec A5: an app in a VM of its own, talking to the display.
 
- `docs/appspec.md` §3.2. The author's reason, verbatim: *I do like apps
- running in their own VMs and it scales, at least the logic in the app runs in
- its own thread; we have so many cores on systems now, even the toy Snapdragon
- has eight of them.*
+ `docs/appspec.md` §3.2. The author's reason, verbatim: *I do like apps running
+ in their own VMs and it scales, at least the logic in the app runs in its own
+ thread; we have so many cores on systems now, even the toy Snapdragon has
+ eight of them.*
 
- So an app's MODEL, its render block, its handler and its paint block all live
- in a worker VM of their own, off the main thread, on their own core. The UI
- worker keeps only what AppKit requires it to keep: the window, the controls,
- and the reconcile that touches them. That makes the realizer a small shared
- DISPLAY SERVER rather than the place applications live, and it is why two
- open apps cannot block each other however much arithmetic either one does.
+ So an app's MODEL, its render block and its handler live in a worker VM of
+ its own, off the main thread, on their own core. The UI worker keeps only
+ what AppKit requires it to keep: the window, the controls, and the reconcile
+ that touches them. That makes the realizer a small shared DISPLAY SERVER
+ rather than the place applications live, and it is why two open apps cannot
+ block each other however much arithmetic either one does.
 
- THE SEAM COST NOTHING TO INVENT, because `Worker pickle:` already carries
- whole object graphs between VMs — measured before designing anything: a
- normalized spec tree pickles to 689 bytes, unpickles as a real AppNode,
- answers `sameNodeAs:` true, validates, and diffs against its original to zero
- ops. So an app VM does not serialize its UI into some wire format and the
- display side does not parse one; the spec IS the message. Blocks, contexts,
- classes and aliens cannot cross, which is exactly why a spec was designed to
- hold event NAMES rather than handlers — a decision made for the differ that
- turns out to be what makes the tree shippable.
+ THREE VMS, AND EACH DOES ONE THING (`docs/worker_peer_links.md`):
 
- WHAT RUNS WHERE, precisely, because this is the part worth being able to
- point at:
+     primary     spawns app VMs. That is all it does here — it is NOT in the
+                 path of a single frame or event.
+     app VM      the model, the render block, the handler. Sends FRAMES.
+     UI worker   realizes frames; sends EVENTS back. Talks to Cocoa on behalf
+                 of VMs, which is the only thing it is for.
 
-     app VM        the model, the render block, the handler, the paint block
-     UI worker     normalize, validate, diff, and the realizer's native work
+ The two ends talk DIRECTLY, because a spawned worker is introduced to the
+ display when it is born and holds its link from then on. Relaying through the
+ primary was considered and rejected: it has no interest in this traffic.
 
- Diffing on the display side is a deliberate v1 choice, not an oversight. The
- author's priority was that the app's LOGIC runs on its own thread, and it
- does; moving the diff across as well is a change to WHAT this file ships (ops
- instead of a spec) and nothing else, because both sides already have the
- whole model. The comment at `specArrived:` says what that would take.
+ THE SPEC IS THE MESSAGE. `Worker pickle:` carries whole object graphs, so a
+ frame is a real `AppNode` on both sides — measured before any of this was
+ designed: a normalized spec pickles to 689 bytes, arrives as a real node,
+ validates, and diffs against its original to ZERO ops. No wire format, no
+ parser, and an app's first frame costs the display nothing to accept. It
+ works because blocks cannot pickle and a spec holds event NAMES rather than
+ handlers — a rule adopted for the differ that turns out to be what makes the
+ tree shippable.
 
- FAILURE IS A STATE, NOT AN ACCIDENT. An app VM can die — that is the point of
- giving it one — so every crossing here is failure-soft: a send to a dead
- worker is caught and reported, the window keeps its last frame, and
- `isAlive` is what a supervisor asks. The window outlives the VM behind it.
+ WHAT RUNS WHERE, precisely: the app VM renders; the UI normalizes, validates,
+ diffs and realizes. Diffing on the display side is a deliberate v1 choice —
+ the author's priority was that the app's LOGIC runs on its own thread, and it
+ does. Moving the diff across is a change to WHAT crosses (ops instead of a
+ tree) and nothing else, since both sides already hold the whole model."
 
- THE ONE THING THIS FILE CANNOT DO YET, found by running it and stated here
- rather than discovered again: **the UI worker cannot spawn.** The Cocoa host
- registers the worker boot closure on the PRIMARY alone
- (`cocoa_gui/src/boot.rs:275`, `primary.set_worker_boot(...)`), and a worker
- inherits its spawner's — so `Worker spawn:` from the UI worker answers
- `no boot registered` and `AppVm start:` reports it and gives up. That is a
- host wiring fact, not a design fault: the primary is where app VMs must be
- hosted, and the realizer is where they must be drawn.
-
- SO THE ROUTE IS TWO HOPS, and A5's remaining work is exactly that plumbing:
- the UI asks the primary to start an app (the primary can spawn), the app VM
- answers its spawner (peer 0 = the primary), and the primary forwards the
- frame to the UI worker, which is a registered peer it can already address.
- Nothing above changes shape — `specArrived:` still receives a real AppNode,
- because pickling is transitive and a second hop copies it again. The
- alternative, and probably the better one, is to give the UI worker a boot
- closure of its own in `boot.rs`, which would make this file work as written;
- that is a Rust change to the host and wants its own decision.
-
- What IS proven, and pinned by `world/tests/65_appvm_tests.mst`: the seam
- itself. A spec tree pickles, arrives as a real AppNode, validates, and diffs
- against its original to ZERO ops — so an app VM's frame costs no wire format
- and arrives as nothing to do. Placements and patch ops cross intact too."
-
+"────────────────────────────────────────────────────────────────────────
+ IN THE APP'S OWN VM."
 Object subclass: AppVmClient [
-    <classVars: Tool>
+    <classVars: Tool AppId>
 
-    "Installed INSIDE the app's own VM by the init source `AppVm` ships. From
-     here on this VM answers two questions and asks none: `what does your
-     window look like` and `here is an event, what does it look like now`."
-
-    AppVmClient class >> serve: aToolClassName <String> [
+    "Installed by the init source `AppVmHost` ships. From here on this VM
+     answers one question and asks none: what does your window look like now."
+    AppVmClient class >> serve: aToolClassName <String> as: anAppId <Symbol> [
         Tool := Worker classNamed: aToolClassName asSymbol.
-        Worker onMessage: [ :payload | AppVmClient handle: payload ].
-        ^self
+        AppId := anAppId.
+        "A SPAWNED worker drains through `dispatchPending`, so its inbound
+         messages arrive at the `onMessage:` handler — unlike the UI worker,
+         which is shape-routed. The two halves of this file use different
+         hooks for that reason and it is not an inconsistency."
+        Worker onMessage: [ :m | AppVmClient handle: m payload ].
+        ^self publish
     ]
 
     AppVmClient class >> tool ^ <Object> [ ^Tool ]
+    AppVmClient class >> appId ^ <Object> [ ^AppId ]
 
-    AppVmClient class >> handle: payload <Object> [
-        | verb |
-        (payload isKindOf: Array) ifFalse: [ ^self ].
-        verb := payload at: 1.
-        verb == #spec ifTrue: [ ^Worker reply: (Array with: #spec with: self currentSpec) ].
-        verb == #event ifTrue: [
-            "THE HANDLER RUNS HERE — in this VM, on this thread. Whatever it
-             costs, it costs the app rather than the display."
-            Tool isNil ifFalse: [
-                [ Tool handle: (payload at: 2) value: (payload at: 3) ]
-                    on: Error do: [ :e |
-                        ^Worker reply: (Array with: #failed with: e messageText) ] ].
-            ^Worker reply: (Array with: #spec with: self currentSpec) ].
+    "A FRAME. Sent straight to the display — the primary is not consulted and
+     does not see it."
+    AppVmClient class >> publish [
+        | spec |
+        Worker hasUi ifFalse: [ ^self ].
+        spec := self currentSpec.
+        spec isNil ifTrue: [ ^self ].
+        Worker ui send: (Array with: #appFrame with: AppId with: spec).
         ^self
     ]
 
-    "Answers the tool's spec, or nil if it cannot build one — a tool that
-     raises in its render block must not take its own VM down."
+    AppVmClient class >> handle: payload <Object> [
+        ((payload isKindOf: Array) and: [ (payload at: 1) == #appEvent ])
+            ifFalse: [ ^self ].
+        "THE HANDLER RUNS HERE — in this VM, on this thread. Whatever it costs,
+         it costs the app rather than the display. A handler that raises must
+         not take its own VM down: the app keeps its last frame and the window
+         keeps showing it."
+        Tool isNil ifFalse: [
+            [ Tool handle: (payload at: 2) value: (payload at: 3) ]
+                on: Error do: [ :e | Transcript showCr: 'app handler: ' , e messageText ] ].
+        ^self publish
+    ]
+
+    "A tool that raises in its render block answers nothing rather than dying
+     — but it SAYS SO. Swallowing the error silently produces the worst
+     failure this framework has: a window that never appears, with nothing
+     anywhere explaining why. The transcript forwards to the display, so the
+     reason arrives where somebody is looking."
     AppVmClient class >> currentSpec ^ <Object> [
-        Tool isNil ifTrue: [ ^nil ].
-        ^[ Tool spec ] on: Error do: [ :e | nil ]
+        Tool isNil ifTrue: [
+            Transcript showCr: 'app: no tool class to render'.
+            ^nil ].
+        ^[ Tool spec ]
+            on: Error do: [ :e |
+                Transcript showCr: 'app render failed: ' , e messageText.
+                nil ]
     ]
 ]
 
-Object subclass: AppVm [
+"────────────────────────────────────────────────────────────────────────
+ ON THE PRIMARY — the only VM that can spawn, and the only thing it does."
+Object subclass: AppVmHost [
     <classVars: Apps>
 
-    "── the registry of running apps ────────────────────────────────────"
-
-    AppVm class >> apps ^ <Dictionary> [
+    AppVmHost class >> apps ^ <Dictionary> [
         Apps isNil ifTrue: [ Apps := Dictionary new ].
         ^Apps
     ]
 
-    AppVm class >> named: anId <Symbol> ^ <Object> [
+    AppVmHost class >> named: anId <Symbol> ^ <Object> [
         ^self apps at: anId ifAbsent: [ nil ]
     ]
 
-    AppVm class >> reset [ Apps := nil. ^self ]
+    "Boot an app into a VM of its own. `aToolClassName` names a class that
+     answers `spec` and takes `handle:value:` — the SAME two messages a tool
+     implements for the in-process path, so a tool does not know or care which
+     side of a VM boundary it is on."
+    AppVmHost class >> start: anId <Symbol> tool: aToolClassName <String> ^ <Object> [
+        | w |
+        w := [ Worker spawn: (self initSourceFor: anId tool: aToolClassName) ]
+            on: Error do: [ :e |
+                Transcript showCr: 'app ' , anId printString , ': ' , e messageText.
+                nil ].
+        w isNil ifTrue: [ ^nil ].
+        self apps at: anId put: w.
+        ^w
+    ]
 
-    "Every app VM still running — what a supervisor sweeps."
-    AppVm class >> liveCount ^ <Integer> [
+    "Runs ONCE in the fresh VM, before anything else. It names the tool's
+     class and nothing more — the class is already there, because a worker
+     boots the same world its parent did."
+    AppVmHost class >> initSourceFor: anId <Symbol> tool: aToolClassName <String> ^ <String> [
+        ^'AppVmClient serve: ''' , aToolClassName , ''' as: #' , anId asString , '.'
+    ]
+
+    AppVmHost class >> stop: anId <Symbol> [
+        | w |
+        w := self named: anId.
+        w isNil ifFalse: [ w terminate ].
+        self apps removeKey: anId ifAbsent: [ nil ].
+        ^self
+    ]
+
+    AppVmHost class >> liveCount ^ <Integer> [
         | n |
         n := 0.
-        self apps do: [ :a | a isAlive ifTrue: [ n := n + 1 ] ].
+        self apps do: [ :w | w isAlive ifTrue: [ n := n + 1 ] ].
         ^n
     ]
+]
 
-    "── starting one ────────────────────────────────────────────────────
+"────────────────────────────────────────────────────────────────────────
+ ON THE UI WORKER — the display server."
+Object subclass: AppVmDisplay [
+    <classVars: Frames Peers Previous Installed>
 
-     `toolClass` is a class that answers `spec` and takes `handle:value:` —
-     the SAME two messages a tool already implements for the in-process path,
-     so a tool does not know or care which side of a VM boundary it is on."
-
-    AppVm class >> start: anId <Symbol> tool: aToolClassName <String>
-                   title: aTitle <String> width: w <Integer> height: h <Integer> ^ <Object> [
-        | app |
-        app := AppVm new setId: anId tool: aToolClassName title: aTitle width: w height: h.
-        app spawn isNil ifTrue: [ ^nil ].
-        self apps at: anId put: app.
-        app register.
-        ^app
+    "The last frame each app sent, and the link to answer it on."
+    AppVmDisplay class >> frames ^ <Dictionary> [
+        Frames isNil ifTrue: [ Frames := Dictionary new ].
+        ^Frames
     ]
 
-    "── an app ──────────────────────────────────────────────────────────"
+    AppVmDisplay class >> peers ^ <Dictionary> [
+        Peers isNil ifTrue: [ Peers := Dictionary new ].
+        ^Peers
+    ]
 
-    | id toolName title width height worker lastSpec failures |
+    AppVmDisplay class >> frameFor: anId <Symbol> ^ <Object> [
+        ^self frames at: anId ifAbsent: [ nil ]
+    ]
 
-    setId: anId <Symbol> tool: aName <String> title: aTitle <String>
-    width: w <Integer> height: h <Integer> ^ <AppVm> [
-        id := anId.
-        toolName := aName.
-        title := aTitle.
-        width := w.
-        height := h.
-        failures := 0.
+    "THE UI WORKER IS SHAPE-ROUTED, so an unsolicited message arrives at the
+     REPLY handler and never at `onMessage:` — the opposite of the app VM,
+     and the single most confusing fact in this seam. Chained rather than
+     replaced: anything this does not recognize goes on to whoever was there
+     before, so installing a display cannot silently eat somebody else's
+     traffic."
+    AppVmDisplay class >> install [
+        Installed == true ifTrue: [ ^self ].
+        Installed := true.
+        Worker onReply: [ :m | AppVmDisplay receive: m ].
         ^self
     ]
 
-    id ^ <Symbol> [ ^id ]
-    title ^ <String> [ ^title ]
-    worker ^ <Object> [ ^worker ]
-    lastSpec ^ <Object> [ ^lastSpec ]
-    failures ^ <Integer> [ ^failures ]
-    isAlive ^ <Boolean> [ ^worker isNil not and: [ worker isAlive ] ]
-
-    "The init source runs ONCE in the fresh VM. It names the tool's class and
-     nothing else — the class itself is already there, because a worker boots
-     the same world this one did."
-    initSource ^ <String> [
-        ^'AppVmClient serve: ''' , toolName , '''.'
+    AppVmDisplay class >> receive: m <Object> [
+        | payload |
+        payload := m payload.
+        "NESTED, not chained: `and:and:` is not a selector, and writing it cost
+         a `doesNotUnderstand` INSIDE the reply handler — every arriving frame
+         raised, the drain logged it to stderr, and the display showed
+         nothing. The frame path worked the whole time; this guard was eating
+         the frames."
+        ((payload isKindOf: Array)
+            and: [ payload size >= 3 and: [ (payload at: 1) == #appFrame ] ])
+                ifFalse: [ ^self passOn: m ].
+        ^self frame: (payload at: 3) for: (payload at: 2) from: m from
     ]
 
-    spawn ^ <Object> [
-        worker := [ Worker spawn: self initSource ]
-            on: Error do: [ :e |
-                AppToolWindow report: 'app ' , id printString , ': ' , e messageText.
-                nil ].
-        ^worker
+    AppVmDisplay class >> passOn: m <Object> [
+        Previous isNil ifFalse: [ Previous value: m ].
+        ^self
     ]
 
-    "── the window this app drives ──────────────────────────────────────
+    "A FRAME ARRIVED — a real AppNode, pickled across rather than parsed, so
+     everything from here is the ordinary in-process path: the window's render
+     block answers this, and the reconcile that follows is the same one an
+     in-process tool gets."
+    AppVmDisplay class >> frame: aSpec <Object> for: anId <Object> from: aPeer <Integer> [
+        | key win |
+        key := anId asString asSymbol.
+        self frames at: key put: aSpec.
+        self peers at: key put: aPeer.
+        win := AppToolWindow named: key.
+        win isNil ifTrue: [
+            self registerWindowFor: key spec: aSpec.
+            win := AppToolWindow named: key ].
+        win isNil ifTrue: [ ^self ].
+        win isOpen
+            ifTrue: [ win rerender ]
+            ifFalse: [ win open ].
+        ^self
+    ]
 
-     ITS RENDER BLOCK ANSWERS A CACHE, and that is the whole trick. A render
-     block must answer NOW, and the app VM answers WHEN IT ANSWERS; so the
-     window renders whatever spec last arrived, and an arriving spec triggers
-     the rerender that shows it. That is what a display server is: it draws
-     the last frame it was given and never waits for the next one."
-    register [
+    "The window is a THIN one: its render block answers the last frame that
+     arrived, and its handler ships the event back to the VM that sent it.
+     That is the whole of a display server — draw the last frame you were
+     given, and never wait for the next."
+    AppVmDisplay class >> registerWindowFor: anId <Symbol> spec: aSpec <Object> [
         AppToolWindow
-            register: id title: title width: width height: height
-            render: [ (AppVm named: id) lastSpec ]
-            handler: [ :event :value | (AppVm named: id) sendEvent: event value: value ]
-            paint: [ :tool :paneId :region |
-                "Painting stays with the app: it owns the pixels, and A3's
-                 surfaces are reachable from any VM by handle."
-                (AppVm named: id) paintPane: paneId damage: region in: tool ].
+            register: anId
+            title: ((aSpec at: #title) ifNil: [ anId asString ]) asString
+            width: 520 height: 640
+            render: [ AppVmDisplay frameFor: anId ]
+            handler: [ :event :value | AppVmDisplay send: event value: value to: anId ].
         ^self
     ]
 
-    "Ask the app VM for its first frame, then open. Opening BEFORE the spec
-     arrives would realize an empty window and immediately rebuild it."
-    open ^ <Boolean> [
-        self isAlive ifFalse: [ ^false ].
-        self requestSpec.
-        Worker runLoopWhile: [ lastSpec isNil and: [ self isAlive ] ].
-        lastSpec isNil ifTrue: [ ^false ].
-        ^(AppToolWindow named: id) open
-    ]
-
-    "── the two crossings ───────────────────────────────────────────────"
-
-    requestSpec [
-        ^self ask: (Array with: #spec)
-    ]
-
-    sendEvent: event <Symbol> value: aValue <Object> [
-        ^self ask: (Array with: #event with: event with: aValue)
-    ]
-
-    "One crossing, and every one of them can fail. A dead worker is REPORTED
-     and the window keeps its last frame — the alternative is a UI that dies
-     with the app it was showing, which is the whole thing an app VM is for."
-    ask: payload <Array> [
-        self isAlive ifFalse: [
-            failures := failures + 1.
-            AppToolWindow report: 'app ' , id printString , ' is not running'.
-            ^false ].
-        [ worker send: payload onReply: [ :reply | self replyArrived: reply ] ]
+    "AN EVENT GOES STRAIGHT BACK to the app's VM, on the link its frame
+     arrived over. Failure is a state, not an accident: an app VM can die —
+     that is the point of giving it one — so a send to a dead peer is reported
+     and the window keeps its last frame. The window outlives the VM behind it."
+    AppVmDisplay class >> send: event <Symbol> value: aValue <Object> to: anId <Symbol> [
+        | peer |
+        peer := self peers at: anId ifAbsent: [ nil ].
+        peer isNil ifTrue: [ ^false ].
+        ^[ (Worker new setId: peer)
+                send: (Array with: #appEvent with: event with: aValue).
+           true ]
             on: Error do: [ :e |
-                failures := failures + 1.
-                AppToolWindow report: 'app ' , id printString , ': ' , e messageText.
-                ^false ].
-        ^true
+                AppToolWindow report: 'app ' , anId printString , ': ' , e messageText.
+                false ]
     ]
 
-    replyArrived: reply <Object> [
-        ((reply isKindOf: Array) and: [ (reply at: 1) == #spec ])
-            ifTrue: [ ^self specArrived: (reply at: 2) ].
-        ((reply isKindOf: Array) and: [ (reply at: 1) == #failed ])
-            ifTrue: [
-                failures := failures + 1.
-                ^AppToolWindow report: 'app ' , id printString , ' handler: ' , (reply at: 2) ].
-        ^self
-    ]
-
-    "A FRAME ARRIVED. It is a real AppNode — pickled across, not parsed — so
-     everything downstream is the ordinary in-process path: normalize,
-     validate, diff against what is on screen, patch what changed.
-
-     TO MOVE THE DIFF INTO THE APP VM, which §3.2 wants eventually: have
-     AppVmClient keep its own `lastSpec`, send `AppSpec diff:against:` ops
-     instead of the tree, and call `apply:spec:` here instead of `rerender`.
-     Both sides already have the whole model, so nothing else changes — the
-     reason it is not done yet is that the ops path wants its own failure
-     story for `the display and the app disagree about what is on screen`."
-    specArrived: aSpec <Object> [
-        aSpec isNil ifTrue: [ ^self ].
-        lastSpec := aSpec.
-        (AppToolWindow named: id) isOpen ifTrue: [ (AppToolWindow named: id) rerender ].
-        ^self
-    ]
-
-    "── painting ────────────────────────────────────────────────────────
-
-     A pane's pixels are the app's, and `AppSurfaces` is reached by HANDLE, so
-     the app VM can be told which handle to draw into and do the drawing on its
-     own thread. v1 keeps the paint call here and asks the app to do the work
-     by RPC — the surface itself is shared, so nothing is copied."
-    paintPane: paneId <Object> damage: region <Object> in: tool <Object> [
-        self isAlive ifFalse: [ ^self ].
-        ^self ask: (Array with: #event with: #paint
-                          with: (Array with: paneId asString
-                                       with: (tool paneHandle: paneId)
-                                       with: region))
-    ]
-
-    "── the end of one ──────────────────────────────────────────────────"
-
-    stop [
-        (AppToolWindow named: id) isNil ifFalse: [ (AppToolWindow named: id) teardown ].
-        worker isNil ifFalse: [ worker terminate ].
-        worker := nil.
+    AppVmDisplay class >> reset [
+        Frames := nil. Peers := nil.
         ^self
     ]
 ]

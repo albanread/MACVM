@@ -180,6 +180,11 @@ Object subclass: CocoaUI [
         (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc register ].
         (Worker classNamed: #CocoaTests) ifNotNil: [ :tc | tc register ].
         (Worker classNamed: #CocoaMonitor) ifNotNil: [ :mc | mc register ].
+        "The display server (docs/appspec.md A5): start listening for frames
+         from app VMs BEFORE any can arrive. It is not a view — it registers
+         no tab and draws nothing itself; it turns a frame from another VM
+         into a tool window, which is the only thing this VM is for."
+        (Worker classNamed: #AppVmDisplay) ifNotNil: [ :dd | dd install ].
         "A- / A+ and Do It / Print It, after every view's switcher item."
         self buildFontButtons.
         "Every item is registered now, so the toolbar can ask for the full
