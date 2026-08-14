@@ -1,0 +1,319 @@
+"59_appspec_tests.mst — gates world/87_appspec.mst.
+
+ `world/87_appspec.mst` is pure by construction, so this file can check
+ the ENTIRE declarative model with no window, no Cocoa and no primary: what a
+ spec is, what normalize stamps on it, what validate rejects, and — the part
+ that matters — exactly which patch ops the differ emits and when it declines.
+
+ THE DIFFER IS THE DESIGN, so it gets the most assertions. Its contract has
+ two halves and both are load-bearing: what it CAN express (a changed prop on
+ a stable identity is a patch, a named child list reconciles by id) and what
+ it must REFUSE to express (a changed type, a changed id, a vanished prop, an
+ unnamed sibling), because a differ that guesses at those produces a screen
+ that disagrees with the model and no error anywhere. Every `assert: ... isNil`
+ below is a refusal being pinned, and they are not defects — they are the
+ escape hatch working, and the caller republishes.
+
+ VENDORED from WINARMVM's 69_winui_spec_tests.mst (branch wg3-subfloor-fix),
+ renamed to the AppSpec contract. Its platform gate and hand-rolled `runAll`
+ are dropped: MACVM's SUnit discovers `test*` reflectively, and this half is
+ pure, so it runs on every platform."
+
+TestCase subclass: AppSpecTests [
+
+    "── helpers ─────────────────────────────────────────────────────────"
+
+    twoButtonWindowNamed: aName <String> ^ <AppNode> [
+        ^AppSpec window: aName id: #w body: (AppSpec stack: {
+            AppSpec button: 'One' event: #one id: #b1.
+            AppSpec button: 'Two' event: #two id: #b2 } id: #root)
+    ]
+
+    opNames: ops <Object> ^ <OrderedCollection> [
+        | out |
+        out := OrderedCollection new.
+        ops do: [ :o | out add: (o at: 1) ].
+        ^out
+    ]
+
+    "── the node ────────────────────────────────────────────────────────"
+
+    testANodeCarriesTypeIdPropsAndChildren [
+        | n |
+        n := AppSpec button: 'Go' event: #go id: #btn.
+        self assert: n type equals: #button description: 'the type is the type'.
+        self assert: n id equals: 'btn' description: 'ids are Strings on the wire'.
+        self assert: (n at: #text) equals: 'Go' description: 'the caption is a prop'.
+        self assert: (n at: #event) equals: #go
+             description: 'the event is a NAME, never a block'.
+        self assert: n children isEmpty description: 'a button has no children'.
+    ]
+
+    testPropsKeepInsertionOrder [
+        "Order is not cosmetic: canonical text has to be stable for the JSON
+         emitter, for comparison and for these tests."
+        | n keys |
+        n := AppSpec input: 'Name' value: 'Ada' event: #named id: #f.
+        keys := OrderedCollection new.
+        n props do: [ :a | keys add: a key ].
+        self assert: keys asArray equals: #(#label #value #event)
+             description: 'props come back in the order they went in'.
+    ]
+
+    testANilPropIsNotStoredAtAll [
+        "An absent prop and a nil prop are the same fact. Keeping one spelling
+         is what stops the differ seeing a change between them."
+        | n |
+        n := (AppSpec node: #text id: #t) at: #text put: nil; yourself.
+        self assert: n props isEmpty description: 'nil never becomes a prop'.
+        self assert: (n includesKey: #text) not description: 'and is not a key'.
+    ]
+
+    "── normalize ───────────────────────────────────────────────────────"
+
+    testNormalizeStampsAutoIdsByPath [
+        | w kids |
+        w := AppSpec normalize: (AppSpec window: 'W' id: nil body: (AppSpec stack: {
+            AppSpec text: 'a' id: nil.
+            AppSpec text: 'b' id: nil } id: nil)).
+        self assert: w id equals: '__auto__:window' description: 'the root is `window`'.
+        self assert: w body id equals: '__auto__:window/body'
+             description: 'the single child is the BODY, under that name'.
+        kids := w body children.
+        self assert: (kids at: 1) id equals: '__auto__:window/body/children/0'
+             description: 'children count from zero, as the contract says'.
+        self assert: (kids at: 2) id equals: '__auto__:window/body/children/1'
+             description: 'and positionally, which is exactly the risk'.
+    ]
+
+    testNormalizeLeavesNamedNodesAlone [
+        | w |
+        w := AppSpec normalize: (self twoButtonWindowNamed: 'W').
+        self assert: w id equals: 'w' description: 'a named root keeps its name'.
+        self assert: (w body children at: 2) id equals: 'b2'
+             description: 'and so does a named child'.
+    ]
+
+    "── validate ────────────────────────────────────────────────────────"
+
+    testValidateAcceptsAWellFormedSpec [
+        self assert: (AppSpec validate: (self twoButtonWindowNamed: 'W')) isNil
+             description: 'a good spec answers nil, meaning no complaint'.
+    ]
+
+    testValidateRejectsWhatTheRealizerCouldNotBuild [
+        "Each of these would otherwise fail at publish time, inside the
+         realizer, with the guest holding no clue why."
+        self assert: (AppSpec validate: (AppSpec stack: {} id: #s)) isNil not
+             description: 'a root that is not a window is refused'.
+        self assert: (AppSpec validate:
+            ((AppSpec node: #window id: #w) at: #title put: 'W'; yourself)) isNil not
+             description: 'a window with no body is refused'.
+        self assert: (AppSpec validate: (AppSpec window: 'W' id: #w body:
+            (AppSpec node: #wombat id: #x))) isNil not
+             description: 'an unknown node type is refused'.
+        self assert: (AppSpec validate: (AppSpec window: 'W' id: #w body:
+            (AppSpec indexedPane: nil width: 8 height: 8))) isNil not
+             description: 'an unnamed PANE is refused - the name is how it is found'.
+    ]
+
+    "── the differ: what it can express ─────────────────────────────────"
+
+    testAnIdenticalSpecDiffsToNoOpsAtAll [
+        "The commonest republish of all: state changed somewhere that does not
+         show. It must cost nothing on screen."
+        | ops |
+        ops := AppSpec diff: (self twoButtonWindowNamed: 'W')
+                    against: (self twoButtonWindowNamed: 'W').
+        self assert: ops isNil not description: 'and it is expressible'.
+        self assert: ops isEmpty description: 'no ops, so nothing is touched'.
+    ]
+
+    testAChangedPropIsOnePatchOnTheNodeThatChanged [
+        | old new ops op |
+        old := self twoButtonWindowNamed: 'W'.
+        new := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec button: 'One' event: #one id: #b1.
+            AppSpec button: 'CHANGED' event: #two id: #b2 } id: #root).
+        ops := AppSpec diff: old against: new.
+        self assert: ops isNil not description: 'a caption change is patchable'.
+        self assert: ops size equals: 1 description: 'and costs exactly one op'.
+        op := ops first.
+        self assert: (op at: 1) equals: #setNodeProps description: 'a prop patch'.
+        self assert: (op at: 2) equals: 'b2'
+             description: 'aimed at the node that changed, not its parent'.
+        self assert: (op at: 3) size equals: 1 description: 'carrying one prop'.
+        self assert: (op at: 3) first value equals: 'CHANGED'
+             description: 'which is the new value'.
+    ]
+
+    testAChangedWindowTitleIsAWindowOp [
+        | ops |
+        ops := AppSpec diff: (self twoButtonWindowNamed: 'Before')
+                    against: (self twoButtonWindowNamed: 'After').
+        self assert: ops size equals: 1 description: 'one op'.
+        self assert: (ops first at: 1) equals: #setWindowProps
+             description: 'the window is patched, not rebuilt'.
+    ]
+
+    "── the differ: what it refuses ─────────────────────────────────────"
+
+    testChangedIdentityRefusesRatherThanGuesses [
+        "Node identity is (type, id), and where there is no sibling list to
+         reconcile against, changing either must make the differ DECLINE so
+         the caller republishes. Answering nil here is the feature.
+
+         WRITTEN THE OTHER WAY ROUND FIRST, and the differ was right: a
+         renamed child of a NAMED list is not a refusal at all, it is a
+         remove and an append, which is exactly what the realizer would have
+         to do anyway. The refusal is for identity changes with nowhere to
+         put that pair — see the two cases below and the one after them."
+        | old |
+        old := self twoButtonWindowNamed: 'W'.
+        "Same id, different type: the id lists match, so this is compared node
+         to node, and a button cannot become a text."
+        self assert: (AppSpec diff: old against: (AppSpec window: 'W' id: #w body:
+            (AppSpec stack: {
+                AppSpec button: 'One' event: #one id: #b1.
+                AppSpec text: 'Two' id: #b2 } id: #root))) isNil
+             description: 'a changed TYPE refuses'.
+        "The window's body has no siblings, so a change of identity there has
+         no structural op available and the whole window republishes."
+        self assert: (AppSpec diff: old against: (AppSpec window: 'W' id: #w body:
+            (AppSpec stack: {
+                AppSpec button: 'One' event: #one id: #b1.
+                AppSpec button: 'Two' event: #two id: #b2 } id: #otherRoot))) isNil
+             description: 'a changed id on the BODY refuses - nothing can carry it'.
+    ]
+
+    testRenamingAChildIsARemoveAndAnAdd [
+        "The truthful counterpart to the refusals above, and the reason the
+         differ is worth having: within a named list, an identity change is
+         expressible, so only that one control is destroyed and rebuilt
+         instead of the whole container."
+        | ops names |
+        ops := AppSpec diff: (self twoButtonWindowNamed: 'W')
+                    against: (AppSpec window: 'W' id: #w body:
+            (AppSpec stack: {
+                AppSpec button: 'One' event: #one id: #b1.
+                AppSpec button: 'Two' event: #two id: #renamed } id: #root)).
+        self assert: ops isNil not description: 'a rename inside a named list is expressible'.
+        names := self opNames: ops.
+        self assert: (names includes: #removeChild) description: 'the old identity goes'.
+        self assert: (names includes: #appendChild) description: 'the new one arrives'.
+        self assert: (names includes: #replaceChildren) not
+             description: 'and its unchanged sibling is left standing'.
+    ]
+
+    testAVanishedPropRefuses [
+        "There is no `unset` op, so a prop that disappears cannot be patched."
+        | old new |
+        old := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec input: 'Name' value: 'Ada' event: #e id: #f } id: #root).
+        new := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            (AppSpec node: #input id: #f)
+                at: #label put: 'Name'; at: #event put: #e; yourself } id: #root).
+        self assert: (AppSpec diff: old against: new) isNil
+             description: 'losing `value` is a rebuild, not a patch'.
+    ]
+
+    "── the differ: children ────────────────────────────────────────────"
+
+    testNamedChildrenReconcileByIdRatherThanRebuild [
+        | old new ops names |
+        old := self twoButtonWindowNamed: 'W'.
+        new := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec button: 'One' event: #one id: #b1.
+            AppSpec button: 'Two' event: #two id: #b2.
+            AppSpec button: 'Three' event: #three id: #b3 } id: #root).
+        ops := AppSpec diff: old against: new.
+        self assert: ops isNil not description: 'an append is expressible'.
+        names := self opNames: ops.
+        self assert: (names includes: #appendChild)
+             description: 'the new child is appended'.
+        self assert: (names includes: #replaceChildren) not
+             description: 'and the two that did not change are NOT rebuilt'.
+        "And the reverse trip removes."
+        ops := AppSpec diff: new against: old.
+        self assert: ((self opNames: ops) includes: #removeChild)
+             description: 'dropping a child removes just that one'.
+    ]
+
+    testAnUnnamedSiblingCostsTheWholeContainer [
+        "The rule that pays for everything else: reconciliation needs every
+         sibling named on both sides. One anonymous child and the container
+         rebuilds — which is why house style names them all."
+        | old new |
+        old := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec text: 'a' id: #t1 } id: #root).
+        new := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec text: 'a' id: #t1.
+            AppSpec text: 'b' id: nil } id: #root).
+        self assert: (AppSpec diff: old against: new) isNil
+             description: 'an unnamed sibling refuses the whole diff'.
+    ]
+
+    testReorderingIsMovesNotRemovesAndAdds [
+        | old new ops names |
+        old := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec text: 'a' id: #t1.
+            AppSpec text: 'b' id: #t2.
+            AppSpec text: 'c' id: #t3 } id: #root).
+        new := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec text: 'c' id: #t3.
+            AppSpec text: 'a' id: #t1.
+            AppSpec text: 'b' id: #t2 } id: #root).
+        ops := AppSpec diff: old against: new.
+        self assert: ops isNil not description: 'a reorder is expressible'.
+        names := self opNames: ops.
+        self assert: (names includes: #moveChild)
+             description: 'the moved child MOVES'.
+        self assert: (names includes: #removeChild) not
+             description: 'nothing is destroyed to achieve it'.
+        self assert: (names includes: #appendChild) not
+             description: 'and nothing is recreated'.
+    ]
+
+    "── structured props ────────────────────────────────────────────────"
+
+    testOptionsPatchInPlaceButAnArbitraryArrayDoesNot [
+        "The whitelist exists because the realizer can repopulate a combo box
+         without rebuilding it, and cannot do the equivalent for a prop it has
+         never heard of."
+        | old new |
+        old := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec select: 'P' value: 'a' options: #('a' 'b') event: #pick id: #sel } id: #root).
+        new := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec select: 'P' value: 'a' options: #('a' 'b' 'c') event: #pick id: #sel } id: #root).
+        self assert: (AppSpec diff: old against: new) isNil not
+             description: 'select options are patchable in place'.
+        old := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            (AppSpec text: 'x' id: #t) at: #wombats put: #(1 2); yourself } id: #root).
+        new := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            (AppSpec text: 'x' id: #t) at: #wombats put: #(1 2 3); yourself } id: #root).
+        self assert: (AppSpec diff: old against: new) isNil
+             description: 'an array prop nobody whitelisted forces a rebuild'.
+    ]
+
+    "── the wire shape ──────────────────────────────────────────────────"
+
+    testJsonRoundsTheShapeTheContractDescribes [
+        "Not the hot path — specs stay Smalltalk data. This exists so a spec
+         can be checked against wingui's own validator one day, and so the
+         emitted SHAPE is pinned: `body` for the window's child, `children`
+         for everyone else's."
+        | json |
+        json := AppSpec asJson: (AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec button: 'Go' event: #go id: #b } id: #root)).
+        self assert: (json includesSubstring: '"type":"window"')
+             description: 'the root names itself'.
+        self assert: (json includesSubstring: '"body":')
+             description: 'the window emits its child as `body`'.
+        self assert: (json includesSubstring: '"children":[')
+             description: 'and a container emits `children`'.
+        self assert: (json includesSubstring: '"event":"go"')
+             description: 'an event crosses as a STRING, not a Symbol'.
+        json do: [ :ch |
+            self assert: ch asInteger < 128 description: 'the emitter is ASCII' ].
+    ]
+]

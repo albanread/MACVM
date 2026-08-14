@@ -232,6 +232,14 @@
 # deepCopy, storeOn:/storeString, the missing type predicates, and
 # ReadStream contents/skipTo:/collect: + WriteStream position/reset.
 84_object_stream_completion.mst
+# AppSpec (docs/appspec.md): the declarative app framework's PURE half —
+# node model, builder, normalize, validate, and the id-based differ. Vendored
+# from WINARMVM so the contract stays identical across the family; contains no
+# Cocoa and no OS, which is why it is a world file and the realizer is not.
+87_appspec.mst
+# AppSpecLayout: measure-then-place, metrics passed in, top-left rects. Pure,
+# so the geometry is checkable to the pixel with no window.
+88_appspec_layout.mst
 # SUnit (docs/sunit_design.md): tests for the world, written in the world.
 # TestCase/TestFailure/TestResult/TestRunner. Loads last in the world list so
 # a test file in tests.list can subclass TestCase.

@@ -1,0 +1,277 @@
+"60_appspec_layout_tests.mst — gates world/88_appspec_layout.mst.
+
+ `world/88_appspec_layout.mst` takes a spec, a width and a font's metrics, and
+ answers where every control goes. It touches no window, so every rule in it
+ is checkable to the pixel — and the assertions below are equalities for that
+ reason, not tolerances.
+
+ THE METRICS ARE ROUND ON PURPOSE: 10 pixels a character, 20 a line. Real
+ ones are neither, and a test that used them would be asserting the font
+ rather than the layout.
+
+ WHAT IS DELIBERATELY NOT HERE: that a control appears where the rect says.
+ That needs a window and belongs to the realizer's own gate. What IS here is
+ everything the realizer will be TOLD, which is the whole of the geometry."
+
+TestCase subclass: AppSpecLayoutTests [
+
+    "── helpers ─────────────────────────────────────────────────────────"
+
+    metrics ^ <Array> [
+        ^AppSpecLayout metricsCharWidth: 10 lineHeight: 20
+    ]
+
+    "Placements for `body` laid out in a 400-wide window."
+    place: body <AppNode> ^ <OrderedCollection> [
+        ^AppSpecLayout
+            layout: (AppSpec window: 'W' id: #w body: body)
+            width: 400
+            metrics: self metrics
+    ]
+
+    "The one placement of kind `aKind` whose node has id `anId`."
+    in: places <OrderedCollection> find: anId <String> kind: aKind <Symbol> ^ <Object> [
+        places do: [ :p |
+            (((p at: 1) idOrEmpty = anId) and: [ (p at: 6) == aKind ])
+                ifTrue: [ ^p ] ].
+        ^nil
+    ]
+
+    xOf: p <Array> ^ <Integer> [ ^p at: 2 ]
+    yOf: p <Array> ^ <Integer> [ ^p at: 3 ]
+    wOf: p <Array> ^ <Integer> [ ^p at: 4 ]
+    hOf: p <Array> ^ <Integer> [ ^p at: 5 ]
+
+    "── stack ───────────────────────────────────────────────────────────"
+
+    testAStackFlowsDownByItsGap [
+        "Root padding 16, so the first child sits at y=16; a text is one line
+         tall (20); the default gap is 12; so the second starts at 48."
+        | places a b |
+        places := self place: (AppSpec stack: {
+            AppSpec text: 'one' id: #a.
+            AppSpec text: 'two' id: #b } id: #root).
+        a := self in: places find: 'a' kind: #control.
+        b := self in: places find: 'b' kind: #control.
+        self assert: a isNil not description: 'the first child is placed'.
+        self assert: (self xOf: a) equals: 16 description: 'inset by the root padding'.
+        self assert: (self yOf: a) equals: 16 description: 'and down by it too'.
+        self assert: (self hOf: a) equals: 20 description: 'a text is one line'.
+        self assert: (self yOf: b) equals: 48
+             description: '16 + 20 + a 12 gap, exactly'.
+        self assert: (self xOf: b) equals: 16
+             description: 'a stack does not indent as it goes'.
+    ]
+
+    testALabelCostsALineAboveItsControl [
+        "The label rule, which four control types share: a STATIC above, then
+         a gap of 8, then the control."
+        | places lab ctl |
+        places := self place: (AppSpec stack: {
+            AppSpec input: 'Name' value: 'Ada' event: #e id: #f } id: #root).
+        lab := self in: places find: 'f' kind: #label.
+        ctl := self in: places find: 'f' kind: #control.
+        self assert: lab isNil not description: 'a labelled control gets TWO placements'.
+        self assert: (self yOf: lab) equals: 16 description: 'the label is on top'.
+        self assert: (self hOf: lab) equals: 20 description: 'and is one line tall'.
+        self assert: (self yOf: ctl) equals: 44
+             description: '16 + 20 + the 8-pixel label gap'.
+        self assert: ((lab at: 1) == (ctl at: 1))
+             description: 'both carry the same node - the KIND tells them apart'.
+    ]
+
+    "── row ─────────────────────────────────────────────────────────────"
+
+    testARowRunsAcrossAndKeepsNaturalWidths [
+        "Two short buttons in 368 available pixels: they fit, so neither is
+         stretched. No stretch-to-fill is the rule that surprises people."
+        | places a b |
+        places := self place: (AppSpec row: {
+            AppSpec button: 'ab' event: #x id: #a.
+            AppSpec button: 'cd' event: #y id: #b } id: #root).
+        a := self in: places find: 'a' kind: #control.
+        b := self in: places find: 'b' kind: #control.
+        self assert: (self yOf: a) equals: (self yOf: b)
+             description: 'a row shares one baseline'.
+        self assert: (self xOf: a) equals: 16 description: 'the first is at the left'.
+        self assert: (self wOf: a) equals: 48
+             description: 'two characters at 10 plus the 28 of a button'.
+        self assert: (self xOf: b) equals: 76
+             description: '16 + 48 + the 12 gap, and no stretching'.
+    ]
+
+    testARowThatDoesNotFitShrinksToExactlyTheSpace [
+        "Four wide buttons in 368: they cannot fit, so they scale down — and
+         the shaving step means the total is EXACTLY the space, never one or
+         two pixels over from the rounding."
+        | places total last |
+        places := self place: (AppSpec row: {
+            AppSpec button: 'a wide caption' event: #x id: #a.
+            AppSpec button: 'another wide one' event: #y id: #b.
+            AppSpec button: 'and a third here' event: #z id: #c } id: #root).
+        total := 0.
+        #('a' 'b' 'c') do: [ :each |
+            total := total + (self wOf: (self in: places find: each kind: #control)) ].
+        self assert: total + 24 <= 368
+             description: 'three widths and two gaps fit the 368 available'.
+        last := self in: places find: 'c' kind: #control.
+        self assert: (self xOf: last) + (self wOf: last) <= 384
+             description: 'and the last one ends inside the window'.
+    ]
+
+    testShrinkingNeverGoesBelowTheFloor [
+        "Eight children cannot each have 72 pixels in 368, and the floor wins
+         over the fit — which is deliberate: unreadable is worse than clipped."
+        | kids places p |
+        kids := OrderedCollection new.
+        1 to: 8 do: [ :i |
+            kids add: (AppSpec button: 'wide caption here' event: #x
+                               id: 'b' , i printString) ].
+        places := self place: (AppSpec row: kids id: #root).
+        1 to: 8 do: [ :i |
+            p := self in: places find: 'b' , i printString kind: #control.
+            self assert: (self wOf: p) >= 72
+                 description: 'no child is squeezed under the floor' ].
+    ]
+
+    "── grid ────────────────────────────────────────────────────────────"
+
+    testAGridFillsRowMajorInUniformColumns [
+        "Three cells in two columns: the third wraps to a second line, at the
+         first column's x."
+        | places a b c |
+        places := self place: (AppSpec grid: {
+            AppSpec text: 'a' id: #a.
+            AppSpec text: 'b' id: #b.
+            AppSpec text: 'c' id: #c } columns: 2 id: #root).
+        a := self in: places find: 'a' kind: #control.
+        b := self in: places find: 'b' kind: #control.
+        c := self in: places find: 'c' kind: #control.
+        self assert: (self yOf: a) equals: (self yOf: b)
+             description: 'the first two share a row'.
+        self assert: (self xOf: b) > (self xOf: a)
+             description: 'and the second is further right'.
+        self assert: (self yOf: c) > (self yOf: a)
+             description: 'the third wrapped'.
+        self assert: (self xOf: c) equals: (self xOf: a)
+             description: 'back to the first column'.
+    ]
+
+    "── card ────────────────────────────────────────────────────────────"
+
+    testACardIgnoresPaddingAndReservesItsTitle [
+        "A card's padding and gap are FIXED at 12 and 10 whatever the spec
+         says — wingui's own behaviour, and a spec that sets them is quietly
+         wrong, so the test states it rather than leaving it to be discovered."
+        | places title first |
+        places := self place: ((AppSpec card: 'Frame' children: {
+            AppSpec text: 'inside' id: #a } id: #c)
+                at: #padding put: 99; yourself).
+        title := self in: places find: 'c' kind: #cardTitle.
+        first := self in: places find: 'a' kind: #control.
+        self assert: title isNil not description: 'a titled card places its title'.
+        self assert: (self xOf: title) equals: 28
+             description: '16 root + 12 card padding, NOT the 99 asked for'.
+        self assert: (self yOf: first) equals: 54
+             description: '16 + 12 padding + 26 reserved for the title'.
+    ]
+
+    "── the window ──────────────────────────────────────────────────────"
+
+    testEveryPlacementIsInsideTheWindow [
+        "The property that matters most and is easiest to lose: nothing is
+         ever placed off the left or above the top, and nothing runs past the
+         right edge."
+        | places |
+        places := self place: (AppSpec stack: {
+            AppSpec heading: 'Title' id: #h.
+            AppSpec row: {
+                AppSpec button: 'One' event: #a id: #b1.
+                AppSpec button: 'Two' event: #b id: #b2 } id: #r.
+            AppSpec card: 'Box' children: {
+                AppSpec input: 'Name' value: '' event: #e id: #f.
+                AppSpec checkbox: 'On' checked: true event: #t id: #cb } id: #card } id: #root).
+        self assert: places isEmpty not description: 'something was placed'.
+        places do: [ :p |
+            self assert: (self xOf: p) >= 0 description: 'never off the left'.
+            self assert: (self yOf: p) >= 0 description: 'never above the top'.
+            self assert: (self wOf: p) > 0 description: 'never zero-width'.
+            self assert: (self hOf: p) > 0 description: 'never zero-height'.
+            self assert: (self xOf: p) + (self wOf: p) <= 400
+                 description: 'and never past the right edge' ].
+    ]
+
+    testAPaneAsksForItsOwnSize [
+        "A pane is not text and does not get measured like it — it says how
+         big it is, because what it shows is pixels the guest computed."
+        | places p |
+        places := self place: (AppSpec stack: {
+            AppSpec indexedPane: #grid width: 300 height: 120 } id: #root).
+        p := self in: places find: 'grid' kind: #control.
+        self assert: (self wOf: p) equals: 300 description: 'the width it asked for'.
+        self assert: (self hOf: p) equals: 120 description: 'and the height'.
+    ]
+
+    "── weights: the landscape feature ──────────────────────────────────"
+
+    testWeightedColumnsSplitTheWidthExactly [
+        "Two 1:1 columns in a 400 window: avail is 368, one 12 gap leaves 356,
+         so 178 each — and the second column starts at 16 + 178 + 12, whether
+         or not the first column's content wanted all of its slot. Columns
+         hold still; that is what makes them columns."
+        | places a b |
+        places := self place: (AppSpec row: {
+            AppSpec stack: { AppSpec text: 'left' id: #a } id: #colA.
+            AppSpec stack: { AppSpec text: 'right' id: #b } id: #colB
+        } weights: #(1 1) id: #main).
+        a := self in: places find: 'a' kind: #control.
+        b := self in: places find: 'b' kind: #control.
+        self assert: (self xOf: a) equals: 16 description: 'first column at the left'.
+        self assert: (self xOf: b) equals: 206
+             description: '16 + a 178 slot + the 12 gap, exactly'.
+        self assert: (self yOf: a) equals: (self yOf: b)
+             description: 'columns share their top edge'.
+    ]
+
+    testUnequalWeightsDivideByProportion [
+        "2:3 of 356 is 142 and 214 — and they SUM to 356, the last weighted
+         child taking the rounding remainder, so the split is exact."
+        | places b |
+        places := self place: (AppSpec row: {
+            AppSpec stack: { AppSpec text: 'l' id: #a } id: #colA.
+            AppSpec stack: { AppSpec text: 'r' id: #b } id: #colB
+        } weights: #(2 3) id: #main).
+        b := self in: places find: 'b' kind: #control.
+        self assert: (self xOf: b) equals: 170
+             description: '16 + (356 * 2 // 5 = 142) + 12'.
+    ]
+
+    testANaturalChildKeepsItsWidthBesideAWeightedOne [
+        "The no-stretch rule, SCOPED rather than lost: an unweighted button in
+         a weighted row is measured as ever, and only the remainder is shared."
+        | places btn inside |
+        places := self place: (AppSpec row: {
+            AppSpec button: 'ab' event: #x id: #btn.
+            AppSpec stack: { AppSpec text: 'fill' id: #inside } id: #col
+        } weights: #(0 1) id: #main).
+        btn := self in: places find: 'btn' kind: #control.
+        inside := self in: places find: 'inside' kind: #control.
+        self assert: (self wOf: btn) equals: 48
+             description: 'the button is its natural 48, not a share'.
+        self assert: (self xOf: inside) equals: 76
+             description: 'and the column starts right after it: 16 + 48 + 12'.
+    ]
+
+    testAWeightlessRowIsUntouchedByTheFeature [
+        "Yesterday's rows must lay out to yesterday's pixels — the feature is
+         opt-in per child, not a new default."
+        | places a b |
+        places := self place: (AppSpec row: {
+            AppSpec button: 'ab' event: #x id: #a.
+            AppSpec button: 'cd' event: #y id: #b } id: #root).
+        a := self in: places find: 'a' kind: #control.
+        b := self in: places find: 'b' kind: #control.
+        self assert: (self wOf: a) equals: 48 description: 'natural width'.
+        self assert: (self xOf: b) equals: 76 description: 'the same 76 as before'.
+    ]
+]

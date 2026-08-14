@@ -1,0 +1,694 @@
+"87_appspec.mst — the declarative app framework's pure half.
+
+ `docs/appspec.md` is the decision record. VENDORED from WINARMVM's
+ `world/122_winui_spec.mst` (branch wg3-subfloor-fix), byte-identical except
+ for the rename WinNode -> AppNode, WinSpec -> AppSpec: this file IS the
+ cross-platform contract, and it is meant to stay that way. Edit it only to
+ change the contract, and expect to make the same edit in the sister repo.
+
+ There is no Cocoa here, and no OS of any kind. A spec is data: build it,
+ normalize it, validate it, diff two of them into patch ops. Every one of
+ those is a function, so the whole model is checkable headless — which is why
+ this half is a WORLD file (portable, loads everywhere) while the realizer
+ that draws it is a cocoaui one.
+
+ THE CONTRACT IS WINGUI'S (github.com/albanread/wingui, the extraction of
+ winscheme's declarative Win32 UI): a tree of typed nodes with ids, props and
+ children; handlers never in the tree, only event NAMES; and a host that
+ repaints by REPUBLISHING THE WHOLE SPEC rather than by poking controls. The
+ differ is what makes republishing affordable, and its rule is the whole
+ design: NODE IDENTITY IS (type, id). Same identity, changed props -> patch
+ in place. Different identity -> rebuild that subtree. A child list whose
+ members are all named reconciles by id; one that is not, rebuilds.
+
+ SO EVERY NODE GETS AN EXPLICIT ID. `normalize` will stamp `__auto__:<path>`
+ on anything unnamed, matching wingui's own grammar, but those are POSITIONAL
+ — the moment a sibling is inserted above one, its identity changes and the
+ subtree rebuilds. Auto-ids are a safety net for leaves, not a naming policy.
+
+ DEPARTURES FROM THE JSON, recorded so they are choices rather than drift:
+ the `body` slot is modelled as the window's single CHILD, so the tree has
+ one child concept instead of two and the differ has one recursion instead of
+ two; it is emitted as `body` again in `asJson:`. Events are Symbols here and
+ strings on the wire. Props keep INSERTION ORDER (an OrderedCollection of
+ Associations, not a Dictionary), because canonical text has to be stable for
+ comparison and for tests."
+
+Object subclass: AppNode [
+    | type id props children |
+
+    "── construction ────────────────────────────────────────────────────"
+
+    AppNode class >> type: aType <Symbol> id: anId <Object> ^ <AppNode> [
+        ^self new setType: aType id: anId
+    ]
+
+    setType: aType <Symbol> id: anId <Object> ^ <AppNode> [
+        type := aType.
+        id := anId isNil ifTrue: [ nil ] ifFalse: [ anId asString ].
+        props := OrderedCollection new.
+        children := OrderedCollection new.
+        ^self
+    ]
+
+    "── accessors ───────────────────────────────────────────────────────"
+
+    type ^ <Symbol> [ ^type ]
+    id ^ <Object> [ ^id ]
+    id: anId <Object> [ id := anId isNil ifTrue: [ nil ] ifFalse: [ anId asString ]. ^self ]
+    props ^ <OrderedCollection> [ ^props ]
+    children ^ <OrderedCollection> [ ^children ]
+
+    "The window's single child, under the name the wire gives it."
+    body ^ <Object> [ ^children isEmpty ifTrue: [ nil ] ifFalse: [ children first ] ]
+
+    idOrEmpty ^ <String> [ ^id isNil ifTrue: [ '' ] ifFalse: [ id ] ]
+
+    "── props, in insertion order ───────────────────────────────────────"
+
+    at: aKey <Symbol> ^ <Object> [
+        props do: [ :a | a key == aKey ifTrue: [ ^a value ] ].
+        ^nil
+    ]
+
+    includesKey: aKey <Symbol> ^ <Boolean> [
+        props do: [ :a | a key == aKey ifTrue: [ ^true ] ].
+        ^false
+    ]
+
+    at: aKey <Symbol> put: aValue <Object> ^ <AppNode> [
+        "Nil is NOT stored — an absent prop and a nil prop are the same fact,
+         and keeping only one of them spelling it means the differ never sees
+         a spurious change between `no gap` and `gap: nil`."
+        aValue isNil ifTrue: [ ^self ].
+        props do: [ :a | a key == aKey ifTrue: [ a value: aValue. ^self ] ].
+        props add: (Association key: aKey value: aValue).
+        ^self
+    ]
+
+    add: aChild <AppNode> ^ <AppNode> [
+        aChild isNil ifFalse: [ children add: aChild ].
+        ^self
+    ]
+
+    addAll: aCollection <Object> ^ <AppNode> [
+        aCollection isNil ifFalse: [
+            aCollection do: [ :c | self add: c ] ].
+        ^self
+    ]
+
+    "── equality, which the differ leans on ─────────────────────────────
+
+     These live on the NODE rather than on the builder because they are facts
+     about node values, and because a node must be comparable without knowing
+     what is going to diff it."
+
+    AppNode class >> isScalar: v <Object> ^ <Boolean> [
+        v isNil ifTrue: [ ^true ].
+        (v isKindOf: Boolean) ifTrue: [ ^true ].
+        v isNumber ifTrue: [ ^true ].
+        v isString ifTrue: [ ^true ].
+        v isSymbol ifTrue: [ ^true ].
+        ^false
+    ]
+
+    AppNode class >> sameValue: a <Object> as: b <Object> ^ <Boolean> [
+        (a isNil and: [ b isNil ]) ifTrue: [ ^true ].
+        (a isNil or: [ b isNil ]) ifTrue: [ ^false ].
+        ((self isScalar: a) and: [ self isScalar: b ]) ifTrue: [ ^a = b ].
+        ((a isKindOf: AppNode) and: [ b isKindOf: AppNode ])
+            ifTrue: [ ^a sameNodeAs: b ].
+        ((a isKindOf: Collection) and: [ b isKindOf: Collection ]) ifTrue: [
+            a size = b size ifFalse: [ ^false ].
+            1 to: a size do: [ :i |
+                (self sameValue: (a at: i) as: (b at: i)) ifFalse: [ ^false ] ].
+            ^true ].
+        ^a = b
+    ]
+
+    propsMatch: other <AppNode> ^ <Boolean> [
+        props size = other props size ifFalse: [ ^false ].
+        props do: [ :assoc |
+            (other includesKey: assoc key) ifFalse: [ ^false ].
+            (AppNode sameValue: assoc value as: (other at: assoc key))
+                ifFalse: [ ^false ] ].
+        ^true
+    ]
+
+    sameNodeAs: other <Object> ^ <Boolean> [
+        (other isKindOf: AppNode) ifFalse: [ ^false ].
+        type == other type ifFalse: [ ^false ].
+        self idOrEmpty = other idOrEmpty ifFalse: [ ^false ].
+        (self propsMatch: other) ifFalse: [ ^false ].
+        children size = other children size ifFalse: [ ^false ].
+        1 to: children size do: [ :i |
+            ((children at: i) sameNodeAs: (other children at: i))
+                ifFalse: [ ^false ] ].
+        ^true
+    ]
+
+    printOn: aStream [
+        aStream nextPutAll: 'a AppNode(', type printString, ' ', self idOrEmpty, ')'
+    ]
+]
+
+Object subclass: AppSpec [
+
+    "── the node vocabulary ─────────────────────────────────────────────
+
+     Keyword messages, deliberately. winscheme's constructors are positional
+     with a trailing property plist, and its own shipped demo calls three of
+     them with the wrong arity and cannot run — `(user-app-tabs value event
+     tabs)` against a four-argument signature. A keyword message cannot be
+     miscounted, and that is most of the argument for building this here."
+
+    AppSpec class >> node: aType <Symbol> id: anId <Object> ^ <AppNode> [
+        ^AppNode type: aType id: anId
+    ]
+
+    "── the root ────────────────────────────────────────────────────────"
+
+    AppSpec class >> window: aTitle <String> id: anId <Object> body: aNode <AppNode> ^ <AppNode> [
+        ^((self node: #window id: anId)
+            at: #title put: aTitle;
+            add: aNode;
+            yourself)
+    ]
+
+    "── containers ──────────────────────────────────────────────────────"
+
+    AppSpec class >> stack: children <Object> id: anId <Object> ^ <AppNode> [
+        ^((self node: #stack id: anId) addAll: children; yourself)
+    ]
+
+    AppSpec class >> row: children <Object> id: anId <Object> ^ <AppNode> [
+        ^((self node: #row id: anId) addAll: children; yourself)
+    ]
+
+    AppSpec class >> row: children <Object> weights: someWeights <Array> id: anId <Object> ^ <AppNode> [
+        "A row whose children take SHARES of the width rather than their
+         natural sizes — the landscape constructor. A weight of 0 leaves that
+         child natural; see the layout's own note for the arithmetic. The two
+         collections are walked together, and a missing weight is 0."
+        | node kids |
+        node := self node: #row id: anId.
+        kids := OrderedCollection new.
+        children do: [ :c | kids add: c ].
+        1 to: kids size do: [ :i |
+            (someWeights size >= i and: [ (someWeights at: i) > 0 ])
+                ifTrue: [ (kids at: i) at: #weight put: (someWeights at: i) ] ].
+        ^(node addAll: kids; yourself)
+    ]
+
+    AppSpec class >> grid: children <Object> columns: n <Integer> id: anId <Object> ^ <AppNode> [
+        ^((self node: #grid id: anId)
+            at: #columns put: (n max: 1);
+            addAll: children;
+            yourself)
+    ]
+
+    AppSpec class >> card: aTitle <String> children: children <Object> id: anId <Object> ^ <AppNode> [
+        ^((self node: #card id: anId)
+            at: #title put: aTitle;
+            addAll: children;
+            yourself)
+    ]
+
+    AppSpec class >> divider: anId <Object> ^ <AppNode> [
+        ^self node: #divider id: anId
+    ]
+
+    "── text ────────────────────────────────────────────────────────────"
+
+    AppSpec class >> text: aString <String> id: anId <Object> ^ <AppNode> [
+        ^((self node: #text id: anId) at: #text put: aString; yourself)
+    ]
+
+    AppSpec class >> heading: aString <String> id: anId <Object> ^ <AppNode> [
+        ^((self node: #heading id: anId) at: #text put: aString; yourself)
+    ]
+
+    "── controls ────────────────────────────────────────────────────────"
+
+    AppSpec class >> button: aTitle <String> event: anEvent <Symbol> id: anId <Object> ^ <AppNode> [
+        ^((self node: #button id: anId)
+            at: #text put: aTitle;
+            at: #event put: anEvent;
+            yourself)
+    ]
+
+    AppSpec class >> input: aLabel <String> value: aValue <String> event: anEvent <Symbol>
+                     id: anId <Object> ^ <AppNode> [
+        ^((self node: #input id: anId)
+            at: #label put: aLabel;
+            at: #value put: aValue;
+            at: #event put: anEvent;
+            yourself)
+    ]
+
+    AppSpec class >> checkbox: aLabel <String> checked: aBool <Boolean> event: anEvent <Symbol>
+                     id: anId <Object> ^ <AppNode> [
+        ^((self node: #checkbox id: anId)
+            at: #label put: aLabel;
+            at: #checked put: aBool;
+            at: #event put: anEvent;
+            yourself)
+    ]
+
+    AppSpec class >> slider: aLabel <String> value: v <Number> min: lo <Number> max: hi <Number>
+                     event: anEvent <Symbol> id: anId <Object> ^ <AppNode> [
+        ^((self node: #slider id: anId)
+            at: #label put: aLabel;
+            at: #value put: v;
+            at: #min put: lo;
+            at: #max put: hi;
+            at: #event put: anEvent;
+            yourself)
+    ]
+
+    AppSpec class >> select: aLabel <String> value: aValue <String> options: opts <Object>
+                     event: anEvent <Symbol> id: anId <Object> ^ <AppNode> [
+        "`options` is one of the few ARRAY props that patches in place — see
+         `structuredPatchable:key:`. Each option is an Association or a
+         two-element Array of value and text."
+        ^((self node: #select id: anId)
+            at: #label put: aLabel;
+            at: #value put: aValue;
+            at: #options put: opts;
+            at: #event put: anEvent;
+            yourself)
+    ]
+
+    AppSpec class >> listBox: aLabel <String> value: aValue <String> options: opts <Object>
+                     event: anEvent <Symbol> id: anId <Object> ^ <AppNode> [
+        "A LIST BOX IS A SELECT THAT SHOWS ITS OPTIONS. Same props, same
+         patch rules, same event; the difference is only that a combo hides
+         its list until asked and a list box does not — which is a choice
+         about how many options there are and how often you switch, not about
+         what the control MEANS. Keeping the props identical is what lets a
+         tool change its mind by editing one word."
+        ^((self node: #listBox id: anId)
+            at: #label put: aLabel;
+            at: #value put: aValue;
+            at: #options put: opts;
+            at: #event put: anEvent;
+            yourself)
+    ]
+
+    "── options: what one IS, decided once ──────────────────────────────
+
+     An option may be written three ways, because all three read naturally
+     depending on what you have: a plain String when the value IS the text,
+     an Association `#a -> 'Alpha'`, or a two-element Array. The realizer and
+     the differ must agree about which is which, so the answer lives HERE and
+     is pure — a test can check every spelling without a window."
+
+    AppSpec class >> optionValue: opt <Object> ^ <Object> [
+        (opt isKindOf: Association) ifTrue: [ ^opt key ].
+        ((opt isKindOf: Collection) and: [ opt isString not ])
+            ifTrue: [ ^opt isEmpty ifTrue: [ nil ] ifFalse: [ opt at: 1 ] ].
+        ^opt
+    ]
+
+    AppSpec class >> optionText: opt <Object> ^ <String> [
+        (opt isKindOf: Association) ifTrue: [ ^opt value asString ].
+        ((opt isKindOf: Collection) and: [ opt isString not ]) ifTrue: [
+            ^opt size >= 2
+                ifTrue: [ (opt at: 2) asString ]
+                ifFalse: [ (self optionValue: opt) printString ] ].
+        ^opt asString
+    ]
+
+    "The 0-BASED index of `aValue` among `opts`, or -1. Zero-based because
+     that is what both CB_SETCURSEL and LB_SETCURSEL take, and converting at
+     the boundary rather than in the realizer keeps one convention in one
+     place."
+    AppSpec class >> indexOfValue: aValue <Object> in: opts <Object> ^ <Integer> [
+        | i |
+        opts isNil ifTrue: [ ^-1 ].
+        i := 0.
+        opts do: [ :opt |
+            (self optionValue: opt) = aValue ifTrue: [ ^i ].
+            i := i + 1 ].
+        ^-1
+    ]
+
+    "── the GPU panes ───────────────────────────────────────────────────
+     The three that already exist as pixel shaders in `winui_render` — which
+     is why adopting this contract costs a realizer and not a renderer."
+
+    AppSpec class >> textGrid: anId <Object> columns: cols <Integer> rows: rows <Integer> ^ <AppNode> [
+        ^((self node: #textGrid id: anId)
+            at: #columns put: cols;
+            at: #rows put: rows;
+            at: #event put: (self eventFor: anId);
+            yourself)
+    ]
+
+    AppSpec class >> indexedPane: anId <Object> width: w <Integer> height: h <Integer> ^ <AppNode> [
+        ^((self node: #indexedPane id: anId)
+            at: #width put: w;
+            at: #height put: h;
+            at: #event put: (self eventFor: anId);
+            yourself)
+    ]
+
+    AppSpec class >> rgbaPane: anId <Object> width: w <Integer> height: h <Integer> ^ <AppNode> [
+        ^((self node: #rgbaPane id: anId)
+            at: #width put: w;
+            at: #height put: h;
+            at: #event put: (self eventFor: anId);
+            yourself)
+    ]
+
+    "A PANE'S EVENT DEFAULTS TO ITS ID, which is wingui's own rule for menu and
+     command items and reads even better here: a pane is named because
+     something has to find it, and the thing that finds it is the same thing
+     that wants its clicks. Without this a pane is silent, and silently so —
+     it draws perfectly and reports nothing, which cost an afternoon."
+    AppSpec class >> eventFor: anId <Object> ^ <Object> [
+        anId isNil ifTrue: [ ^nil ].
+        ^anId asString asSymbol
+    ]
+
+    "── kinds ───────────────────────────────────────────────────────────"
+
+    AppSpec class >> containerTypes ^ <Array> [
+        ^#(#window #stack #row #grid #card)
+    ]
+
+    AppSpec class >> paneTypes ^ <Array> [
+        ^#(#textGrid #indexedPane #rgbaPane)
+    ]
+
+    AppSpec class >> knownTypes ^ <Array> [
+        ^#(#window #stack #row #grid #card #divider
+           #text #heading #button #input #checkbox #slider #select #listBox
+           #textGrid #indexedPane #rgbaPane)
+    ]
+
+    "The two that offer a CHOICE among options — validated and realized
+     together, because everything about them but their shape is the same."
+    AppSpec class >> choiceTypes ^ <Array> [ ^#(#select #listBox) ]
+
+    AppSpec class >> isContainer: aType <Symbol> ^ <Boolean> [
+        ^self containerTypes includes: aType
+    ]
+
+    "── normalize: stamp an id on everything that lacks one ─────────────
+
+     wingui's own grammar: `__auto__:` and the node's PATH. The root is
+     `window`, the window's single child is `window/body`, and a child is
+     `<parent>/children/<index>` counting from zero. Positional by nature, so
+     it holds only while indices do not move — the comment at the head of this
+     file says why that matters."
+
+    AppSpec class >> normalize: aNode <AppNode> ^ <AppNode> [
+        self stamp: aNode path: 'window'.
+        ^aNode
+    ]
+
+    AppSpec class >> stamp: aNode <AppNode> path: aPath <String> [
+        | kids childPath |
+        aNode id isNil ifTrue: [ aNode id: '__auto__:' , aPath ].
+        kids := aNode children.
+        1 to: kids size do: [ :i |
+            childPath := aNode type == #window
+                ifTrue: [ aPath , '/body' ]
+                ifFalse: [ aPath , '/children/' , (i - 1) printString ].
+            self stamp: (kids at: i) path: childPath ].
+        ^self
+    ]
+
+    "── validate: the publish-time contract, checked at BUILD time ──────
+
+     wingui validates on publish and rejects the whole patch if the result is
+     malformed — silently, from the guest's point of view. Running the same
+     checks here means a shape error surfaces where it was written. Answers
+     nil when the spec is good, or a path-prefixed reason."
+
+    AppSpec class >> validate: aNode <AppNode> ^ <Object> [
+        (aNode isKindOf: AppNode) ifFalse: [ ^'spec is not a AppNode' ].
+        aNode type == #window ifFalse: [ ^'window: root type must be #window' ].
+        aNode children size = 1
+            ifFalse: [ ^'window: needs exactly one body child' ].
+        ^self validateNode: aNode body path: 'window/body'
+    ]
+
+    AppSpec class >> validateNode: aNode <Object> path: aPath <String> ^ <Object> [
+        | bad kids |
+        (aNode isKindOf: AppNode) ifFalse: [ ^aPath , ': not a AppNode' ].
+        aNode type isNil ifTrue: [ ^aPath , ': node has no type' ].
+        (self knownTypes includes: aNode type)
+            ifFalse: [ ^aPath , ': unknown type ' , aNode type printString ].
+        (aNode id isNil or: [ aNode id isString ])
+            ifFalse: [ ^aPath , ': id must be a String' ].
+        ((self choiceTypes includes: aNode type) and: [ (aNode at: #options) isNil ])
+            ifTrue: [ ^aPath , ': ' , aNode type printString , ' needs options' ].
+        ((self paneTypes includes: aNode type) and: [ aNode id isNil ])
+            ifTrue: [ ^aPath , ': a pane must be named, it is how it is found' ].
+        kids := aNode children.
+        1 to: kids size do: [ :i |
+            bad := self validateNode: (kids at: i)
+                        path: aPath , '/children/' , (i - 1) printString.
+            bad isNil ifFalse: [ ^bad ] ].
+        ^nil
+    ]
+
+    "── the differ ──────────────────────────────────────────────────────
+
+     Answers nil for I CANNOT EXPRESS THIS, and the caller republishes the
+     whole window. That escape hatch is winscheme's cleanest idea: a differ
+     that must handle every case grows wrong answers, and a differ allowed to
+     decline stays small and stays right.
+
+     An op is an Array whose first element names it:
+        {#setWindowProps. props}
+        {#setNodeProps. id. props}
+        {#removeChild. parentId. childId}
+        {#moveChild. parentId. childId. index}
+        {#appendChild. parentId. node}
+        {#insertChild. parentId. index. node}
+        {#replaceChildren. parentId. children}"
+
+    AppSpec class >> diff: old <Object> against: new <Object> ^ <Object> [
+        | ops changed |
+        ((old isKindOf: AppNode) and: [ new isKindOf: AppNode ]) ifFalse: [ ^nil ].
+        (old type == #window and: [ new type == #window ]) ifFalse: [ ^nil ].
+        ops := OrderedCollection new.
+        changed := self changedProps: old against: new.
+        changed isNil ifTrue: [ ^nil ].
+        changed isEmpty ifFalse: [ ops add: { #setWindowProps. changed } ].
+        (old children size = 1 and: [ new children size = 1 ]) ifFalse: [ ^nil ].
+        (self diffNode: old body against: new body into: ops) ifFalse: [ ^nil ].
+        ^ops
+    ]
+
+    AppSpec class >> diffNode: old <Object> against: new <Object> into: ops <OrderedCollection> ^ <Boolean> [
+        | changed |
+        ((old isKindOf: AppNode) and: [ new isKindOf: AppNode ]) ifFalse: [ ^false ].
+        old type == new type ifFalse: [ ^false ].
+        old idOrEmpty = new idOrEmpty ifFalse: [ ^false ].
+        changed := self changedProps: old against: new.
+        changed isNil ifTrue: [ ^false ].
+        changed isEmpty ifFalse: [
+            ops add: { #setNodeProps. new idOrEmpty. changed } ].
+        ^self diffChildrenOf: old against: new into: ops
+    ]
+
+    "Which props changed, as an OrderedCollection of Associations — or nil,
+     meaning one of them changed in a way a patch cannot carry."
+    AppSpec class >> changedProps: old <AppNode> against: new <AppNode> ^ <Object> [
+        | out v |
+        out := OrderedCollection new.
+        new props do: [ :a |
+            v := old at: a key.
+            (self value: v same: a value) ifFalse: [
+                ((self isScalar: a value) and: [ self isScalar: v ])
+                    ifTrue: [ out add: (Association key: a key value: a value) ]
+                    ifFalse: [
+                        (self structuredPatchable: new type key: a key)
+                            ifTrue: [ out add: (Association key: a key value: a value) ]
+                            ifFalse: [ ^nil ] ] ] ].
+        "A prop that VANISHED is a shape change; the realizer has no `unset`."
+        old props do: [ :a |
+            (new includesKey: a key) ifFalse: [ ^nil ] ].
+        ^out
+    ]
+
+    AppSpec class >> isScalar: v <Object> ^ <Boolean> [ ^AppNode isScalar: v ]
+
+    AppSpec class >> value: a same: b ^ <Boolean> [ ^AppNode sameValue: a as: b ]
+
+    "The array props the realizer can replace WITHOUT rebuilding the control.
+     Everything else non-scalar forces a rebuild — wingui's own whitelist,
+     and the reason to keep props scalar wherever a choice exists."
+    AppSpec class >> structuredPatchable: aType <Symbol> key: aKey <Symbol> ^ <Boolean> [
+        aKey == #options ifTrue: [
+            ^#(#select #listBox #radioGroup) includes: aType ].
+        aKey == #items ifTrue: [ ^#(#treeView #contextMenu) includes: aType ].
+        aKey == #rows ifTrue: [ ^aType == #table ].
+        aKey == #columns ifTrue: [ ^aType == #table ].
+        aKey == #expandedIds ifTrue: [ ^aType == #treeView ].
+        aKey == #commands ifTrue: [ ^aType == #canvas ].
+        ^false
+    ]
+
+    "── children ────────────────────────────────────────────────────────"
+
+    AppSpec class >> diffChildrenOf: old <AppNode> against: new <AppNode>
+                     into: ops <OrderedCollection> ^ <Boolean> [
+        | oldK newK parentId sub |
+        oldK := old children.
+        newK := new children.
+        "THE FAST PATH, and the one almost every republish takes: the same
+         children in the same order, so recurse pairwise and emit no
+         structural ops at all."
+        (self idsOf: oldK) = (self idsOf: newK) ifTrue: [
+            1 to: oldK size do: [ :i |
+                (self diffNode: (oldK at: i) against: (newK at: i) into: ops)
+                    ifFalse: [ ^false ] ].
+            ^true ].
+        "Structural reconciliation needs every party NAMED — the parent, so
+         the op has somewhere to land, and every child on both sides, so a
+         move can be told from a delete-and-add."
+        parentId := new idOrEmpty.
+        parentId isEmpty ifTrue: [ ^false ].
+        (self allNamed: oldK) ifFalse: [ ^false ].
+        (self allNamed: newK) ifFalse: [ ^false ].
+        sub := self childOps: oldK against: newK parent: parentId.
+        sub isNil ifTrue: [ ^false ].
+        ops addAll: sub.
+        ^true
+    ]
+
+    AppSpec class >> childOps: oldK <OrderedCollection> against: newK <OrderedCollection>
+                     parent: parentId <String> ^ <Object> [
+        | ops oldIds newIds order sub found idx child |
+        ops := OrderedCollection new.
+        oldIds := self idsOf: oldK.
+        newIds := self idsOf: newK.
+        "Shared ids diff first: if any of them cannot be expressed, the whole
+         list is replaced rather than half-patched."
+        sub := OrderedCollection new.
+        1 to: newK size do: [ :i |
+            child := newK at: i.
+            idx := oldIds indexOf: (child idOrEmpty).
+            idx = 0 ifFalse: [
+                (self diffNode: (oldK at: idx) against: child into: sub)
+                    ifFalse: [
+                        ^(OrderedCollection new)
+                            add: { #replaceChildren. parentId. newK };
+                            yourself ] ] ].
+        "Gone."
+        1 to: oldIds size do: [ :i |
+            (newIds includes: (oldIds at: i)) ifFalse: [
+                ops add: { #removeChild. parentId. (oldIds at: i) } ] ].
+        "Then walk the new order against a simulated current one."
+        order := OrderedCollection new.
+        oldIds do: [ :each |
+            (newIds includes: each) ifTrue: [ order add: each ] ].
+        1 to: newIds size do: [ :i |
+            found := order indexOf: (newIds at: i).
+            found = 0
+                ifTrue: [
+                    i > order size
+                        ifTrue: [
+                            ops add: { #appendChild. parentId. (newK at: i) }.
+                            order add: (newIds at: i) ]
+                        ifFalse: [
+                            ops add: { #insertChild. parentId. i - 1. (newK at: i) }.
+                            order add: (newIds at: i) beforeIndex: i ] ]
+                ifFalse: [
+                    found = i ifFalse: [
+                        ops add: { #moveChild. parentId. (newIds at: i). i - 1 }.
+                        order removeAtIndex: found.
+                        order add: (newIds at: i) beforeIndex: i ] ] ].
+        ops addAll: sub.
+        ^ops
+    ]
+
+    AppSpec class >> idsOf: aCollection <Object> ^ <OrderedCollection> [
+        | out |
+        out := OrderedCollection new.
+        aCollection do: [ :c | out add: c idOrEmpty ].
+        ^out
+    ]
+
+    AppSpec class >> allNamed: aCollection <Object> ^ <Boolean> [
+        aCollection do: [ :c | c idOrEmpty isEmpty ifTrue: [ ^false ] ].
+        ^true
+    ]
+
+    "── JSON, for interop and for tests ─────────────────────────────────
+
+     NOT the hot path — specs stay Smalltalk data end to end, and this exists
+     so a spec can be compared against wingui's own validator one day, and so
+     a test can assert on a string rather than on an object graph."
+
+    AppSpec class >> asJson: aNode <AppNode> ^ <String> [
+        | out |
+        out := WriteStream on: String new.
+        self writeNode: aNode on: out.
+        ^out contents
+    ]
+
+    AppSpec class >> writeNode: aNode <AppNode> on: aStream [
+        | first |
+        aStream nextPutAll: '{"type":'.
+        self writeString: aNode type asString on: aStream.
+        aNode id isNil ifFalse: [
+            aStream nextPutAll: ',"id":'.
+            self writeString: aNode id on: aStream ].
+        aNode props do: [ :a |
+            aStream nextPut: $,.
+            self writeString: a key asString on: aStream.
+            aStream nextPut: $:.
+            self writeValue: a value on: aStream ].
+        aNode type == #window
+            ifTrue: [
+                aNode body isNil ifFalse: [
+                    aStream nextPutAll: ',"body":'.
+                    self writeNode: aNode body on: aStream ] ]
+            ifFalse: [
+                aNode children isEmpty ifFalse: [
+                    aStream nextPutAll: ',"children":['.
+                    first := true.
+                    aNode children do: [ :c |
+                        first ifFalse: [ aStream nextPut: $, ].
+                        first := false.
+                        self writeNode: c on: aStream ].
+                    aStream nextPut: $] ] ].
+        aStream nextPut: $}
+    ]
+
+    AppSpec class >> writeValue: v on: aStream [
+        | first |
+        v isNil ifTrue: [ ^aStream nextPutAll: 'null' ].
+        (v isKindOf: Boolean) ifTrue: [
+            ^aStream nextPutAll: (v ifTrue: [ 'true' ] ifFalse: [ 'false' ]) ].
+        v isNumber ifTrue: [ ^aStream nextPutAll: v printString ].
+        (v isString or: [ v isSymbol ]) ifTrue: [ ^self writeString: v asString on: aStream ].
+        (v isKindOf: AppNode) ifTrue: [ ^self writeNode: v on: aStream ].
+        (v isKindOf: Collection) ifTrue: [
+            aStream nextPut: $[.
+            first := true.
+            v do: [ :e |
+                first ifFalse: [ aStream nextPut: $, ].
+                first := false.
+                self writeValue: e on: aStream ].
+            ^aStream nextPut: $] ].
+        ^self writeString: v printString on: aStream
+    ]
+
+    AppSpec class >> writeString: aString <String> on: aStream [
+        aStream nextPut: $".
+        aString do: [ :ch |
+            ch = $" ifTrue: [ aStream nextPutAll: '\"' ] ifFalse: [
+            ch = $\ ifTrue: [ aStream nextPutAll: '\\' ] ifFalse: [
+            ch asInteger < 32
+                ifTrue: [ aStream nextPutAll: ' ' ]
+                ifFalse: [ aStream nextPut: ch ] ] ] ].
+        aStream nextPut: $"
+    ]
+]

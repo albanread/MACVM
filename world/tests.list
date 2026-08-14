@@ -77,3 +77,5 @@ tests/56_cocoastring_tests.mst
 tests/57_string_completion_tests.mst
 tests/58_object_stream_tests.mst
 tests/55_exception_resume_tests.mst
+tests/59_appspec_tests.mst
+tests/60_appspec_layout_tests.mst
