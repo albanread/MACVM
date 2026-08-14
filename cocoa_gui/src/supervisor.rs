@@ -366,6 +366,22 @@ fn primary_generation_main(
         return;
     };
 
+    // THE DISPLAY IS NAMED (`docs/worker_peer_links.md` §3): every app VM this
+    // primary spawns is introduced to the UI worker and the UI worker to it,
+    // so the two talk directly and the primary is out of the path.
+    //
+    // RE-DONE ON EVERY GENERATION, exactly like the transcript re-aim above
+    // and for the same reason: a respawned primary is a NEW VM with a new
+    // registry, and the handle it hands out for the UI belongs to this
+    // generation's link. Setting it once at first boot would leave every
+    // generation after a crash introducing nobody.
+    if !primary.set_ui_peer(id) {
+        let _ = reg_tx.send(Err(VmError {
+            msg: "set_ui_peer failed (the UI worker is not a live link of this primary)".into(),
+        }));
+        return;
+    }
+
     // The primary's own transcript now forwards to the UI worker's Transcript
     // view (§7.4), re-aimed at THIS generation's link.
     primary.forward_transcript_to_ui(id);

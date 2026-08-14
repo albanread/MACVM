@@ -339,6 +339,16 @@ Object subclass: Worker [
         | peer corr k msg |
         peer := env at: 1.
         corr := env at: 2.
+        "A PAYLOAD-LESS ENVELOPE IS A NUDGE, and carries nothing to dispatch.
+         The boot handshake sends one to prove the primary->UI link is wired,
+         and a peer INTRODUCTION (docs/worker_peer_links.md §3) is another —
+         its whole content is the `from` and the reply link that Rust has
+         already learned from by the time this runs. Both were documented as
+         no-ops and neither was: `unpickle:` below raised `bad pickle bytes`
+         on every one, which surfaced only as a drain-error line on stderr
+         because nothing downstream depended on the nudge. Answering early is
+         what the comments always claimed happened."
+        (env at: 3) isEmpty ifTrue: [ ^self ].
         CurrentPeer := peer.        "so a primary-side reply: targets the sender"
         CurrentCorr := corr.        "so reply: echoes the inbound corr"
         msg := WorkerMessage from: peer
