@@ -104,6 +104,25 @@ pub fn rt_osr_request(vm: &mut VmState, fp: usize, target_bci: u16) -> OsrOutcom
         return OsrOutcome::Declined;
     }
 
+    // Permanently ineligible? Decline WITHOUT re-deriving it every
+    // LoopCounterLimit back-edges. `compile_disabled` is set by a NoPermanent
+    // verdict (`compile_method_full`, driver.rs:786) — argc > 5, a send site
+    // with argc > 7, an unshimmable primitive, oversized bytecode — none of
+    // which a running method grows out of. Without this a permanently-
+    // ineligible hot loop calls `compile_method_osr` below on every trip
+    // forever, re-running the whole eligibility scan only to re-decline. The
+    // three call-path triggers already consult this bit (send.rs:205,
+    // blocks.rs:71, stubs.rs:1555); OSR was the lone gap. It also closes the
+    // matching debugger hole: a breakpoint sets the SAME bit (debug.rs) and
+    // the compiler never checks `has_bp` (interpreter/mod.rs:467 is the only
+    // consumer), so this decline is the only thing keeping a breakpointed
+    // method that runs a hot loop from being OSR-compiled around its own
+    // breakpoint.
+    if method.compile_disabled() {
+        vm.stats.osr_declined += 1;
+        return OsrOutcome::Declined;
+    }
+
     // OSR-heal: while the existing OSR nmethod is HALF-WARM
     // (`Nmethod::is_half_warm_osr` — cold-site generic sends baked in), do
     // NOT re-enter it and do NOT compile another: DECLINE, so this
