@@ -6259,12 +6259,17 @@ mod tests {
             send_failed,
             "a send to the corpse must eventually fail (its channel drops)"
         );
-        // Drain: died#1 → restart #1 (slot reused — the failed send marked
-        // it dead); stale died#2 → defensive terminate of the healthy
-        // incarnation + restart #2.
-        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 400) and: [ SupTest restarts < 2 ] ].")
-            .expect("run until both deaths are processed");
-        assert_eq!(vm.eval("SupTest restarts").expect("restarts").trim(), "2");
+        // Drain: died#1 → restart #1, and THAT IS ALL, which is the point of
+        // generational handles. This test used to assert TWO restarts: the
+        // stale died#2 still named the slot the replacement had just taken,
+        // so the supervisor defensively terminated a perfectly healthy
+        // incarnation and restarted again. A handle now names slot AND
+        // generation, so the stale notice matches nothing, `terminate`
+        // refuses it, and the live worker is left alone. The extra restart it
+        // used to cost was a real defect this test was pinning in place.
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 400) and: [ SupTest restarts < 1 ] ].")
+            .expect("run until the death is processed");
+        assert_eq!(vm.eval("SupTest restarts").expect("restarts").trim(), "1");
         assert_eq!(vm.eval("SupTest state").expect("state").trim(), "#running");
         vm.exec("(WorkerNames named: #echo) send: 42 onReply: [:r | WkTest bump: r = 42 ].")
             .expect("service resumed");

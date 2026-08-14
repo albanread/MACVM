@@ -253,6 +253,80 @@ impl InboxSender {
 pub struct WorkerLink {
     inbox: InboxSender,
     alive: bool,
+    /// WHICH OCCUPANT OF THIS SLOT — bumped every time the slot is reclaimed
+    /// by a new spawn. See the handle helpers below for why this exists.
+    gen: u32,
+}
+
+// ── worker handles: a slot, and which occupant of it ────────────────────
+//
+// A worker id as the rest of the system sees it is a HANDLE, not an index:
+// the slot in `links` in the low bits, the slot's GENERATION in the high
+// ones. So a handle names one particular worker for the life of the process
+// and is never handed out twice, while `links` stays an O(1) `Vec` and a
+// dead slot is still RECLAIMED — which is load-bearing, because MAX_WORKERS
+// caps CONCURRENT workers and reclamation is what fixed the exhaustion bug
+// documented in `spawn` (rounds of spawn-then-terminate hitting the cap with
+// nothing alive).
+//
+// It matters because ids key things that outlive the worker they named:
+// `send`/`terminate`/`alive` look a handle up in `links`, reply
+// continuations are keyed by peer, and a Smalltalk `Worker` holds its id
+// across the death of the VM behind it. Without a generation, all of those
+// silently address whoever holds the slot NOW; with one, a stale handle is
+// refused. Peer links need no such check — a link is a channel endpoint to
+// one VM's inbox, so a dead peer's send simply fails.
+//
+// 16 bits of slot (MAX_WORKERS is 16) and 16 of generation. A slot would
+// have to be recycled 65_535 times in one process to wrap, which no workload
+// approaches; if one ever did, the wrap reintroduces exactly the ambiguity
+// this removes, so it is worth knowing rather than assuming away.
+
+const SLOT_BITS: u32 = 16;
+const SLOT_MASK: u32 = (1 << SLOT_BITS) - 1;
+
+/// The handle naming generation `gen` of slot `slot` (1-based, as ids have
+/// always been).
+fn make_handle(slot: u32, gen: u32) -> u32 {
+    (gen << SLOT_BITS) | (slot & SLOT_MASK)
+}
+
+/// The `links` index a handle names, or `None` for handle 0 (the parent) and
+/// anything out of range.
+fn slot_index_of(handle: u32) -> Option<usize> {
+    let slot = handle & SLOT_MASK;
+    (slot != 0).then(|| slot as usize - 1)
+}
+
+fn generation_of(handle: u32) -> u32 {
+    handle >> SLOT_BITS
+}
+
+/// The SLOT a handle names — what a human means by "worker 3". Anything
+/// user-facing (a transcript tag, a Monitor row) should render this rather
+/// than the raw handle, which is an internal token and reads as a large
+/// meaningless number.
+pub fn handle_slot(handle: u32) -> u32 {
+    handle & SLOT_MASK
+}
+
+/// Which occupant of that slot — 1 for the first, bumped on every reclaim.
+pub fn handle_generation(handle: u32) -> u32 {
+    generation_of(handle)
+}
+
+/// The link a handle names, ONLY if the slot is still on that generation —
+/// the one check that turns a stale handle into a refusal instead of a
+/// message delivered to a stranger.
+fn link_for(links: &[WorkerLink], handle: u32) -> Option<&WorkerLink> {
+    let link = links.get(slot_index_of(handle)?)?;
+    (link.gen == generation_of(handle)).then_some(link)
+}
+
+fn link_for_mut(links: &mut [WorkerLink], handle: u32) -> Option<&mut WorkerLink> {
+    let idx = slot_index_of(handle)?;
+    let link = links.get_mut(idx)?;
+    (link.gen == generation_of(handle)).then_some(link)
 }
 
 /// The receiving side of an *externally-hosted* worker's inbound inbox
@@ -500,7 +574,10 @@ impl crate::embed::TranscriptSink for ForwardTranscript {
             self.at_line_start = text.ends_with('\n');
             text.to_string()
         } else {
-            let tag = format!("[w{}] ", self.id);
+            // THE SLOT, not the handle: `[w1]` is what a reader means by
+            // "the first worker"; the handle carries a generation too and
+            // renders as a five-digit token that means nothing in a log.
+            let tag = format!("[w{}] ", handle_slot(self.id));
             let mut out = String::with_capacity(text.len() + tag.len());
             for piece in text.split_inclusive('\n') {
                 if self.at_line_start {
@@ -514,7 +591,13 @@ impl crate::embed::TranscriptSink for ForwardTranscript {
         let _ = self.dest.send(Envelope {
             from: self.id,
             corr: 0,
-            bytes: crate::runtime::mop::encode_worker_transcript(i64::from(self.id), &out),
+            // THE TAG SHOWS THE SLOT, not the handle: `[w1]` is what a
+            // reader means by "the first worker", where the handle renders as
+            // a five-digit token that means nothing to them.
+            bytes: crate::runtime::mop::encode_worker_transcript(
+                i64::from(handle_slot(self.id)),
+                &out,
+            ),
             reply_to: None,
         });
     }
@@ -548,15 +631,19 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
     // is documented as "a pool of up to 16 CONCURRENT worker VMs" (README) —
     // a monotonic ever-spawned counter was never the intent.
     let reuse_idx = links.iter().position(|l| !l.alive);
-    let id = match reuse_idx {
-        Some(idx) => (idx + 1) as u32,
+    // The slot, and WHICH OCCUPANT of it: reclaiming bumps the generation, so
+    // the handle handed out below has never been handed out before even
+    // though the slot has been used.
+    let (slot, gen) = match reuse_idx {
+        Some(idx) => ((idx + 1) as u32, links[idx].gen.wrapping_add(1)),
         None => {
             if links.len() >= MAX_WORKERS {
                 return None;
             }
-            links.len() as u32 + 1
+            (links.len() as u32 + 1, 1)
         }
     };
+    let id = make_handle(slot, gen);
     let (tx, rx) = channel::<Envelope>();
     // The worker's OWN inbox, cloned before the primary's link takes the
     // sender: this is what the new VM offers as `reply_to` so a peer it
@@ -587,6 +674,7 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
     let link = WorkerLink {
         inbox: InboxSender::detached(tx),
         alive: true,
+        gen,
     };
     match reuse_idx {
         Some(idx) => links[idx] = link,
@@ -632,7 +720,12 @@ pub fn register_hosted_worker(
         return None;
     }
     let (tx, rx) = channel::<Envelope>();
-    let id = links.len() as u32 + 1;
+    // A hosted worker takes a fresh slot (it is registered once, at boot) and
+    // so is always generation 1 — but it is HANDLED the same way, because
+    // nothing downstream should care which kind of worker a handle names.
+    let slot = links.len() as u32 + 1;
+    let gen = 1;
+    let id = make_handle(slot, gen);
     let wake_pending = Arc::new(AtomicBool::new(false));
     let inbox = InboxSender {
         tx,
@@ -640,7 +733,11 @@ pub fn register_hosted_worker(
         wake: Arc::new(Mutex::new(Some(wake))),
     };
     let to_primary = inbox_tx.clone();
-    links.push(WorkerLink { inbox, alive: true });
+    links.push(WorkerLink {
+        inbox,
+        alive: true,
+        gen,
+    });
     Some((id, HostedInbox { rx, wake_pending }, to_primary))
 }
 
@@ -751,7 +848,10 @@ pub fn send(vm: &mut VmState, id: u32, corr: u64, bytes: Vec<u8>) -> bool {
             if id == 0 {
                 return false;
             }
-            let Some(link) = links.get_mut(id as usize - 1) else {
+            // A STALE HANDLE IS REFUSED, not redirected: if this slot has
+            // been reclaimed since the handle was minted, its generation no
+            // longer matches and there is nobody here by that name.
+            let Some(link) = link_for_mut(links, id) else {
                 return false;
             };
             if !link.alive {
@@ -830,7 +930,7 @@ pub fn terminate(vm: &mut VmState, id: u32) -> bool {
     let WorkerState::Primary { links, .. } = &mut **ws else {
         return false;
     };
-    let Some(link) = links.get_mut(id as usize - 1) else {
+    let Some(link) = link_for_mut(links, id) else {
         return false;
     };
     link.alive = false;
@@ -851,7 +951,7 @@ pub fn alive(vm: &VmState, id: u32) -> bool {
     let WorkerState::Primary { links, .. } = &**ws else {
         return false;
     };
-    links.get(id as usize - 1).map(|l| l.alive).unwrap_or(false)
+    link_for(links, id).map(|l| l.alive).unwrap_or(false)
 }
 
 /// The PRIMARY's own inbox sender, cloned for the Cocoa bridge (C4): a
@@ -877,7 +977,7 @@ pub fn worker_inbox_sender(vm: &crate::runtime::vm_state::VmState, id: u32) -> O
     let WorkerState::Primary { links, .. } = vm.workers.as_deref()? else {
         return None;
     };
-    let link = links.get(id.checked_sub(1)? as usize)?;
+    let link = link_for(links, id)?;
     link.alive.then(|| link.inbox.clone())
 }
 
@@ -951,6 +1051,50 @@ mod peer_link_tests {
             panic!("worker role");
         };
         assert!(peers.is_empty());
+    }
+
+    /// ── generational handles ────────────────────────────────────────
+    ///
+    /// A handle names a slot AND which occupant of it, so reclaiming a slot
+    /// does not make the previous occupant's handle address the new one.
+
+    fn link(gen: u32) -> WorkerLink {
+        let (tx, _rx) = channel::<Envelope>();
+        WorkerLink {
+            inbox: InboxSender::detached(tx),
+            alive: true,
+            gen,
+        }
+    }
+
+    #[test]
+    fn a_handle_names_a_slot_and_which_occupant_of_it() {
+        let h = make_handle(3, 7);
+        assert_eq!(handle_slot(h), 3);
+        assert_eq!(handle_generation(h), 7);
+        assert_eq!(slot_index_of(h), Some(2), "slots are 1-based, links is 0-based");
+        assert_eq!(slot_index_of(0), None, "handle 0 is the parent, never a slot");
+    }
+
+    /// THE CLAIM. A slot is reclaimed — as it must be, because MAX_WORKERS
+    /// caps concurrent workers — and the handle minted for its previous
+    /// occupant stops resolving instead of quietly naming the new one.
+    #[test]
+    fn a_stale_handle_is_refused_rather_than_redirected() {
+        let mut links = vec![link(1)];
+        let first = make_handle(1, 1);
+        assert!(link_for(&links, first).is_some(), "the live handle resolves");
+
+        // The worker dies and the slot is reclaimed by a new spawn.
+        links[0] = link(2);
+        let second = make_handle(1, 2);
+
+        assert!(
+            link_for(&links, first).is_none(),
+            "the dead worker's handle names nobody — this is the whole point"
+        );
+        assert!(link_for(&links, second).is_some(), "the new occupant resolves");
+        assert_ne!(first, second, "and the two handles were never equal");
     }
 
     /// A respawned worker reusing an id must not be reachable through its
