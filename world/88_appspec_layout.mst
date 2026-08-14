@@ -142,6 +142,12 @@ Object subclass: AppSpecLayout [
                         * (self charWidthIn: m)) min: maxW)
                 with: (((aNode at: #rows) isNil ifTrue: [ 10 ] ifFalse: [ aNode at: #rows ])
                         * (self lineHeightIn: m)) ].
+        "A foreign view measures exactly as a pane does — a box the spec
+         sized, contents the platform's business."
+        t == #foreignView ifTrue: [
+            ^Array
+                with: (((aNode at: #width) isNil ifTrue: [ 200 ] ifFalse: [ aNode at: #width ]) min: maxW)
+                with: ((aNode at: #height) isNil ifTrue: [ 100 ] ifFalse: [ aNode at: #height ]) ].
         (AppSpec paneTypes includes: t) ifTrue: [
             ^Array
                 with: (((aNode at: #width) isNil ifTrue: [ 320 ] ifFalse: [ aNode at: #width ]) min: maxW)

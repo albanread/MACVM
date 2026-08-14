@@ -72,6 +72,7 @@ Object subclass: CocoaToolbarAction [
  every view against the fresh environment."
 Object subclass: CocoaUI [
     <classVars: Win ContentHost Transcript TranscriptScroll ActTarget
+                ToolsMenu ToolMenuIds
                 TranscriptText Views ActiveView ToolbarDelegates
                 MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
                 WorkspaceTextDelegate TabItems TabIndexes
@@ -185,6 +186,7 @@ Object subclass: CocoaUI [
          no tab and draws nothing itself; it turns a frame from another VM
          into a tool window, which is the only thing this VM is for."
         (Worker classNamed: #AppVmDisplay) ifNotNil: [ :dd | dd install ].
+        (Worker classNamed: #CocoaMixedStrip) ifNotNil: [ :ms | ms install ].
         "A- / A+ and Do It / Print It, after every view's switcher item."
         self buildFontButtons.
         "Every item is registered now, so the toolbar can ask for the full
@@ -1048,11 +1050,95 @@ Object subclass: CocoaUI [
         menu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
         self toolsMenu: menu item: 'Sprite Editor…' opens: #CocoaSpriteEditor.
         self toolsMenu: menu item: 'Sound Editor…' opens: #CocoaSoundEditor.
+        "── the declarative tools (docs/appspec.md A6) ─────────────────────
+         Below the separator, the AppSpec tool windows. The KNOWN ones get
+         lazy entries — their register: runs a class-side `install` on first
+         use, because the vendored editors' trailing doits never run under
+         image boot — and the onRegister: hook appends an item for ANY tool
+         that registers later (a user app, an AppVm window arriving with its
+         first frame), which is WINARMVM's own rule: a tool registered in a
+         later sprint appears without anyone remembering to add it."
+        menu onMain addItem: ((Cocoa classNamed: 'NSMenuItem') onMain separatorItem).
+        ToolsMenu := menu.
+        ToolMenuIds := Dictionary new.
+        "APPS LAUNCH IN THEIR OWN VM — that is the deployment mode
+         (docs/appspec.md §3.2), and the Monitor showing one VM per open app
+         is the visible proof. The item asks the PRIMARY to spawn (only it
+         can); the window appears when the app's first frame arrives. The
+         pane tools stay in-process for now: a paint block runs app-side and
+         the display's thin window carries none — cross-VM pane painting is
+         the recorded next step, not an oversight."
+        self appVmMenu: menu item: 'Declarative Demo…' id: #vmdemo tool: 'WinDemoTool'.
+        self appVmMenu: menu item: 'Mixed Demo…' id: #mixed tool: 'AppMixedDemo'.
+        self appToolsMenu: menu item: 'Sprite Editor (AppSpec)…' id: #spriteEd installs: #WinSpriteEd.
+        self appToolsMenu: menu item: 'Sound Editor (AppSpec)…' id: #soundEd installs: #WinSoundEd.
+        self appToolsMenu: menu item: 'Pane Demo…' id: #panedemo installs: #AppDemoPane.
+        AppToolWindow onRegister: [ :id | CocoaUI appToolRegistered: id ].
         toolsItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
             initWithTitle: 'Tools' action: nil keyEquivalent: ''.
         toolsItem onMain setSubmenu: menu.
         mainMenu onMain addItem: toolsItem.
         ^toolsItem
+    ]
+
+    CocoaUI class >> appToolsMenu: menu item: aTitle id: anId installs: aClassSymbol [
+        "One AppSpec tool as a menu item: ensure it is registered (running its
+         class-side `install` late-bound, the toolsMenu:item:opens: discipline)
+         then front it through the registry."
+        | item holder delegate |
+        ToolMenuIds at: anId put: true.
+        item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: aTitle action: 'macvmAction:' keyEquivalent: ''.
+        holder := CocoaToolbarAction on: [
+            ((AppToolWindow named: anId) isNil and: [ aClassSymbol isNil not ])
+                ifTrue: [ (Worker classNamed: aClassSymbol) ifNotNil: [ :c | c install ] ].
+            AppToolWindow open: anId ].
+        delegate := MacvmDelegate actionTargetOn: holder.
+        item onMain setTarget: delegate.
+        menu onMain addItem: item.
+        ToolbarDelegates add: delegate.
+        ^item
+    ]
+
+    "A menu item that launches an app IN ITS OWN VM. First use ships the
+     spawn to the primary and the window arrives with the first frame; once
+     registered, the item just fronts it — including a dead app's window,
+     which keeps its last frame by design."
+    CocoaUI class >> appVmMenu: menu item: aTitle id: anId tool: aClassName [
+        | item holder delegate |
+        ToolMenuIds at: anId put: true.
+        item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: aTitle action: 'macvmAction:' keyEquivalent: ''.
+        holder := CocoaToolbarAction on: [
+            (AppToolWindow named: anId) isNil
+                ifTrue: [
+                    Worker uiRequest: #doitq
+                        args: (Array with: 'AppVmHost start: #' , anId asString
+                                          , ' tool: ''' , aClassName , '''')
+                        onReply: [ :x | nil ] ]
+                ifFalse: [ AppToolWindow open: anId ] ].
+        delegate := MacvmDelegate actionTargetOn: holder.
+        item onMain setTarget: delegate.
+        menu onMain addItem: item.
+        ToolbarDelegates add: delegate.
+        ^item
+    ]
+
+    "For a scripted probe: the Tools submenu itself."
+    CocoaUI class >> toolsMenuRef [ ^ToolsMenu ]
+
+    CocoaUI class >> appToolRegistered: anId [
+        "The onRegister: hook — a tool registered AFTER the menu was built.
+         Ids already in the menu are re-registrations and add nothing; a new
+         one appends an item titled with the tool's own title. This is how an
+         app started in its own VM turns up in Tools the moment its first
+         frame arrives."
+        ToolsMenu isNil ifTrue: [ ^self ].
+        (ToolMenuIds includesKey: anId) ifTrue: [ ^self ].
+        self appToolsMenu: ToolsMenu
+             item: ((AppToolWindow named: anId) title , '…')
+             id: anId installs: nil.
+        ^self
     ]
     CocoaUI class >> toolsMenu: menu item: aTitle opens: aClassSymbol [
         | item holder delegate |

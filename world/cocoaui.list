@@ -68,3 +68,7 @@
 # which is what makes declarative tools draw here. Loaded only by the UI
 # worker, so headless images keep the null realizer.
 92_cocoarealize.mst
+# CocoaMixedStrip (docs/appspec.md A6): the Cocoa half of the Mixed Demo —
+# the hand-built NSView its foreignView names, with an imperatively wired
+# NSButton dispatching the same #bump the declarative one sends.
+92a_appmixedstrip.mst

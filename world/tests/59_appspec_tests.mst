@@ -316,4 +316,44 @@ TestCase subclass: AppSpecTests [
         json do: [ :ch |
             self assert: ch asInteger < 128 description: 'the emitter is ASCII' ].
     ]
+
+    "── the escape hatch (A6) ───────────────────────────────────────────
+     A foreignView is a HOLE the platform fills: the node carries a name and
+     a size and nothing else — the view itself could never be in the tree (it
+     would not pickle, diff, or port), so the spec names it and a realizer-
+     side provider supplies it."
+    testAForeignViewIsANamedHole [
+        | n |
+        n := AppSpec foreignView: #clock width: 200 height: 60.
+        self assert: n type equals: #foreignView.
+        self assert: (AppSpec knownTypes includes: #foreignView).
+        self assert: (n at: #width) equals: 200.
+        self assert: (n at: #height) equals: 60.
+        self deny: (AppSpec paneTypes includes: #foreignView)
+             description: 'not a pane — it gets no pixel surface, the platform owns its contents'.
+    ]
+
+    "Its name IS the provider key, so an unnamed one is refused at build time
+     rather than rendering as an anonymous hole nobody can fill."
+    testAnUnnamedForeignViewIsRefused [
+        | bad |
+        bad := AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec foreignView: nil width: 100 height: 40 } id: #root).
+        self assert: ((AppSpec validate: bad) includesSubstring: 'foreignView')
+             description: 'the validator names the rule'.
+    ]
+
+    "Size changes patch like any scalar prop — the hole can move and resize
+     without the window rebuilding around it."
+    testAForeignViewsSizePatchesInPlace [
+        | a b ops |
+        a := AppSpec normalize: (AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec foreignView: #strip width: 100 height: 40 } id: #root)).
+        b := AppSpec normalize: (AppSpec window: 'W' id: #w body: (AppSpec stack: {
+            AppSpec foreignView: #strip width: 160 height: 40 } id: #root)).
+        ops := AppSpec diff: a against: b.
+        self assert: ops size equals: 1.
+        self assert: ((ops at: 1) at: 1) == #setNodeProps.
+        self assert: ((ops at: 1) at: 2) equals: 'strip'.
+    ]
 ]

@@ -1,0 +1,64 @@
+"92a_appmixedstrip.mst — the Cocoa half of the Mixed Demo: the hand-built view.
+
+ The provider `world/91d_appmixed.mst`'s spec names. This is DELIBERATELY the
+ kind of code the framework exists to remove — alloc/initWithFrame:, colours,
+ wiring — written out by hand to prove the escape hatch carries real AppKit:
+ a dark strip, a label, and an NSButton built and wired IMPERATIVELY whose
+ action dispatches the SAME #bump event the declarative button sends. The
+ model cannot tell them apart, which is the point being made.
+
+ THE VIEW IS REBUILT PER REALIZE (the provider block runs on every rebuild),
+ and the realizer adopts it into the window's tree, so teardown removes it
+ with everything else. The author holds no window and frees nothing — the
+ bargain is unchanged even inside the hatch."
+
+Object subclass: CocoaMixedStrip [
+    <classVars: Delegates>
+
+    CocoaMixedStrip class >> install [
+        CocoaRealize provideForeign: #nativeStrip with: [ :node |
+            CocoaMixedStrip buildStripFor: node ].
+        ^self
+    ]
+
+    CocoaMixedStrip class >> buildStripFor: node <Object> ^ <Object> [
+        | box label btn holder delegate |
+        box := ((Cocoa classNamed: 'NSBox') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0
+                                  with: ((node at: #width) ifNil: [ 430 ]) asFloat
+                                  with: ((node at: #height) ifNil: [ 64 ]) asFloat).
+        box onMain setBoxType: 4.            "NSBoxCustom"
+        box onMain setCornerRadius: 8.0.
+        box onMain setFillColor:
+            ((Cocoa classNamed: 'NSColor') onMain colorWithCalibratedRed: 0.13 green: 0.15 blue: 0.20 alpha: 1.0).
+        label := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: 14.0 with: 20.0 with: 240.0 with: 18.0).
+        label onMain setEditable: false. label onMain setBordered: false.
+        label onMain setDrawsBackground: false. label onMain setSelectable: false.
+        label onMain setStringValue: 'I am a hand-built NSView'.
+        label onMain setTextColor: ((Cocoa classNamed: 'NSColor') onMain whiteColor).
+        box onMain addSubview: label.
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain
+            initWithFrame: (Array with: 280.0 with: 14.0 with: 130.0 with: 28.0).
+        btn onMain setTitle: 'Bump (native)'.
+        btn onMain setBezelStyle: 1.
+        "Wired BY HAND — and into the app's own event loop: the same #bump
+         the declarative button sends, through the same dispatch."
+        holder := CocoaToolbarAction on: [
+            (AppToolWindow named: #mixed) ifNotNil: [ :w | w dispatch: #bump value: nil ] ].
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        "RETAIN THE DELEGATE, and this line was earned the honest way: without
+         it the strip WORKED, then went silently dead a GC later. An
+         NSControl's target is weak; the holder survives in the world-side
+         ticket registry but the ObjcRef delegate does not, and once it was
+         collected every click went nowhere with nothing raised anywhere.
+         The framework's own wire:to: retains for exactly this reason — a
+         provider that hand-wires must hand-retain. In the cookbook's traps."
+        Delegates isNil ifTrue: [ Delegates := OrderedCollection new ].
+        Delegates add: delegate.
+        box onMain addSubview: btn.
+        ^box
+    ]
+]

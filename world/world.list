@@ -270,6 +270,10 @@
 # surface the tool draws with AppPixels, clicks in the pane's own pixels, and
 # one-cell damage. The sprite editor in miniature.
 91a_appdemopane.mst
+# AppMixedDemo (docs/appspec.md A6): the mixed-app gate — every control a
+# spec node except one foreignView hole the platform fills. Portable: names
+# the hole, never the view.
+91d_appmixed.mst
 # WINARMVM's world/126 and 127 — the sprite and sound editors, VENDORED BYTE
 # FOR BYTE. The acceptance test of docs/appspec.md: tools written for Win32,
 # never edited, running here on the Cocoa realizer.

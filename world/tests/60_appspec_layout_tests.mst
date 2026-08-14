@@ -294,4 +294,16 @@ TestCase subclass: AppSpecLayoutTests [
         self assert: (self wOf: d) > 100
              description: 'a divider spans its container, not one pixel'.
     ]
+    "A foreign view measures exactly as a pane does: the box the spec sized,
+     contents the platform's business (A6)."
+    testAForeignViewMeasuresItsDeclaredSize [
+        | places f |
+        places := self place: (AppSpec stack: {
+            AppSpec text: 'above' id: #a.
+            AppSpec foreignView: #strip width: 180 height: 44 } id: #root).
+        f := self in: places find: 'strip' kind: #control.
+        self assert: f isNil not.
+        self assert: (self wOf: f) equals: 180.
+        self assert: (f at: 5) equals: 44.
+    ]
 ]

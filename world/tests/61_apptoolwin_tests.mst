@@ -311,4 +311,28 @@ TestCase subclass: AppToolWindowTests [
         self assert: (AppToolWindow named: #legacy) title equals: 'Legacy'.
         self assert: WinToolWindow patchCount equals: AppToolWindow patchCount.
     ]
+    "── the registration hook (A6) ──────────────────────────────────────
+     The Tools menu's seam: it subscribes here so a tool that registers after
+     the menu was built still appears in it. Fired on every register:, with
+     the id; the subscriber owns dedup."
+    testRegisteringAToolFiresTheHook [
+        | fired |
+        fired := OrderedCollection new.
+        AppToolWindow onRegister: [ :id | fired add: id ].
+        [ AppToolWindow
+            register: #hooked title: 'Hooked' width: 100 height: 100
+            render: [ AppSpec window: 'H' id: #w body: (AppSpec text: 'x' id: #t) ]
+            handler: [ :e :v | nil ] ]
+            ensure: [ AppToolWindow onRegister: nil ].
+        self assert: (fired includes: #hooked).
+        "And a RE-registration fires too — dedup is the subscriber's job,
+         because only it knows what it has already built."
+        AppToolWindow onRegister: [ :id | fired add: id ].
+        [ AppToolWindow
+            register: #hooked title: 'Hooked' width: 100 height: 100
+            render: [ AppSpec window: 'H' id: #w body: (AppSpec text: 'x' id: #t) ]
+            handler: [ :e :v | nil ] ]
+            ensure: [ AppToolWindow onRegister: nil ].
+        self assert: (fired occurrencesOf: #hooked) equals: 2.
+    ]
 ]

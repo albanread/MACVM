@@ -36,7 +36,29 @@
  wrong on screen, never invisibly absent."
 
 Object subclass: CocoaRealize [
+    <classVars: ForeignProviders>
     | toolWindow nsWin content controls delegates winDelegate panes fittedHeight |
+
+    "── foreign views (docs/appspec.md A6) ──────────────────────────────
+
+     THE PROVIDER REGISTRY. A `foreignView` node names a hole; a provider is
+     the platform-side block that fills it, registered here under the node's
+     id and answering a native view (an ObjcRef) when handed the node. The
+     block lives on THIS side and never crosses a VM: the spec stays
+     picklable, the tool stays portable, and only the realizer knows a real
+     NSView is involved — the same division of labour a pane's pixels have.
+     A provider that ANSWERS NIL declines, and the node renders as the same
+     visible placeholder an unregistered one gets: a hole that says whose."
+    CocoaRealize class >> provideForeign: anId <Symbol> with: aBlock <Object> [
+        ForeignProviders isNil ifTrue: [ ForeignProviders := Dictionary new ].
+        ForeignProviders at: anId put: aBlock.
+        ^self
+    ]
+
+    CocoaRealize class >> foreignProviderFor: anId <Object> ^ <Object> [
+        ForeignProviders isNil ifTrue: [ ^nil ].
+        ^ForeignProviders at: anId asString asSymbol ifAbsent: [ nil ]
+    ]
 
     CocoaRealize class >> newFor: aWindow <Object> ^ <CocoaRealize> [
         ^self new setToolWindow: aWindow
@@ -218,6 +240,7 @@ Object subclass: CocoaRealize [
         t == #select ifTrue: [ ^self makeSelect: node rect: rect ].
         t == #slider ifTrue: [ ^self makeSlider: node rect: rect ].
         t == #rgbaPane ifTrue: [ ^self makePane: node rect: rect ].
+        t == #foreignView ifTrue: [ ^self makeForeign: node rect: rect ].
         "NOT YET REALIZED: say so on screen. An unimplemented node that drew
          nothing would look like a layout bug rather than a missing feature,
          and the difference matters when someone else reads it. `listBox`
@@ -272,6 +295,30 @@ Object subclass: CocoaRealize [
         handle := AppSurfaces register: w height: h present: [ :surface |
             self blast: surface to: view ].
         panes at: node idOrEmpty put: handle.
+        ^view
+    ]
+
+    "THE ESCAPE HATCH REALIZED. The provider hands back a view IT built —
+     alloc'd, wired, styled by hand, whatever the author wanted that the
+     vocabulary cannot say — and the realizer does to it exactly what it does
+     to its own controls: frame it, adopt it into the tree, and (because it
+     was adopted) remove it at teardown with everything else. The author
+     keeps whatever handles they like; the WINDOW's lifecycle is still owned
+     here, which is the bargain the framework makes everywhere else."
+    makeForeign: node <AppNode> rect: rect <Array> ^ <Object> [
+        | provider view |
+        provider := CocoaRealize foreignProviderFor: node idOrEmpty.
+        view := provider isNil ifTrue: [ nil ] ifFalse: [
+            [ provider value: node ]
+                on: Error do: [ :e |
+                    AppToolWindow report: 'foreign provider ' , node idOrEmpty , ': ' , e messageText.
+                    nil ] ].
+        view isNil ifTrue: [
+            "No provider, or it declined/raised: a VISIBLE hole that says
+             whose — never an invisible absence."
+            ^self makeLabel: '[foreignView ' , node idOrEmpty , ' — no provider]' rect: rect ].
+        view onMain setFrame: rect.
+        content onMain addSubview: view.
         ^view
     ]
 

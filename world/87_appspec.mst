@@ -361,6 +361,23 @@ Object subclass: AppSpec [
             yourself)
     ]
 
+    "── the escape hatch (docs/appspec.md A6) ───────────────────────────
+     A FOREIGN VIEW IS A HOLE IN THE SPEC that the PLATFORM fills: the node
+     carries only a name and a size, and the realizer asks a provider
+     registered under that name to supply the native view (an NSView here, an
+     HWND there). The view itself can never be in the tree — it would not
+     pickle, would not diff, and would not be portable — so the spec NAMES it
+     and the platform supplies it, which is the same division of labour a
+     pane's pixels already have. This is the `do not wall off NSWindow` rule
+     as a node type: a mostly-declarative app embeds one hand-built view
+     instead of leaving the framework entirely."
+    AppSpec class >> foreignView: anId <Object> width: w <Integer> height: h <Integer> ^ <AppNode> [
+        ^((self node: #foreignView id: anId)
+            at: #width put: w;
+            at: #height put: h;
+            yourself)
+    ]
+
     "A PANE'S EVENT DEFAULTS TO ITS ID, which is wingui's own rule for menu and
      command items and reads even better here: a pane is named because
      something has to find it, and the thing that finds it is the same thing
@@ -384,7 +401,7 @@ Object subclass: AppSpec [
     AppSpec class >> knownTypes ^ <Array> [
         ^#(#window #stack #row #grid #card #divider
            #text #heading #button #input #checkbox #slider #select #listBox
-           #textGrid #indexedPane #rgbaPane)
+           #textGrid #indexedPane #rgbaPane #foreignView)
     ]
 
     "The two that offer a CHOICE among options — validated and realized
@@ -447,6 +464,8 @@ Object subclass: AppSpec [
             ifTrue: [ ^aPath , ': ' , aNode type printString , ' needs options' ].
         ((self paneTypes includes: aNode type) and: [ aNode id isNil ])
             ifTrue: [ ^aPath , ': a pane must be named, it is how it is found' ].
+        (aNode type == #foreignView and: [ aNode id isNil ])
+            ifTrue: [ ^aPath , ': a foreignView must be named, its name is the provider key' ].
         kids := aNode children.
         1 to: kids size do: [ :i |
             bad := self validateNode: (kids at: i)

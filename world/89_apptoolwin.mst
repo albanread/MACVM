@@ -161,7 +161,7 @@ Object subclass: AppNullRealizer [
 
 Object subclass: AppToolWindow [
     <classVars: Windows Order EventDepth RerenderPending Suppress
-                PatchCount RebuildCount RealizerClass Reports>
+                PatchCount RebuildCount RealizerClass Reports RegisterHook>
 
     "── the registry ────────────────────────────────────────────────────"
 
@@ -204,8 +204,22 @@ Object subclass: AppToolWindow [
             render: renderBlock handler: handlerBlock paint: paintBlock.
         (self windows includesKey: anId) ifFalse: [ self order add: anId ].
         self windows at: anId put: tool.
+        "TELL WHOEVER ASKED (docs/appspec.md A6): the Tools menu registers a
+         hook here so a tool that registers AFTER the menu was built — a user
+         app, an AppVm window arriving with its first frame — appears in it
+         without anyone remembering to add it. That is WINARMVM's own rule
+         (`a tool registered in a later sprint appears without anyone
+         remembering`), which its declarative menu got for free and our
+         NSMenu needs a hook for. Fired on RE-registration too, and the
+         hook's job includes ignoring ids it has already seen."
+        RegisterHook isNil ifFalse: [ RegisterHook value: anId ].
         ^tool
     ]
+
+    "The hook above. One block, not a list: the only subscriber is the
+     platform's menu, and a second subscriber should force the conversation
+     about what this is becoming rather than silently queue behind the first."
+    AppToolWindow class >> onRegister: aBlock <Object> [ RegisterHook := aBlock. ^self ]
 
     AppToolWindow class >> named: anId <Symbol> ^ <Object> [
         ^self windows at: anId ifAbsent: [ nil ]

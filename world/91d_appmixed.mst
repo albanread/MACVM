@@ -1,0 +1,64 @@
+"91d_appmixed.mst — AppSpec A6's gate: a MIXED declarative/AppKit app.
+
+ `docs/appspec.md` A6. Everything on this window is a spec node except one:
+ `foreignView: #nativeStrip` names a hole, and the PLATFORM fills it with a
+ view somebody built by hand — alloc, wiring, styling and all. The point being
+ made is the `do not wall off NSWindow` rule: the framework is a default, not
+ a fence, and an author who needs one hand-built view embeds it instead of
+ leaving.
+
+ THIS FILE IS STILL PORTABLE. It names no NSView and no provider — only the
+ HOLE. On a platform with no provider registered the hole renders as a visible
+ placeholder saying whose it is, and everything else works; the Cocoa provider
+ lives in `world/92a_appmixedstrip.mst`, in cocoaui.list, where platform code
+ belongs. The two directions the strip demonstrates are the interesting part:
+ its native button dispatches INTO the declarative model (the count moves, the
+ spec republishes, the window patches), and the model's own state is read back
+ OUT by the provider when it builds the view."
+
+Object subclass: AppMixedDemo [
+    <classVars: Count Note>
+
+    AppMixedDemo class >> count ^ <Integer> [ ^Count isNil ifTrue: [ 0 ] ifFalse: [ Count ] ]
+    AppMixedDemo class >> note ^ <String> [ ^Note isNil ifTrue: [ 'from a spec' ] ifFalse: [ Note ] ]
+
+    AppMixedDemo class >> spec ^ <AppNode> [
+        ^AppSpec window: 'Mixed Demo' id: #mixedWin body: (AppSpec stack: {
+            AppSpec heading: 'Declarative around, native within' id: #head.
+            AppSpec text: 'Every control here is a spec node — except the strip below.' id: #blurb.
+            AppSpec foreignView: #nativeStrip width: 430 height: 64.
+            AppSpec divider: #rule.
+            AppSpec card: 'The model both sides share' children: {
+                AppSpec text: 'count: ' , self count printString id: #countText.
+                AppSpec input: 'Note' value: self note event: #note id: #noteField.
+                AppSpec row: {
+                    AppSpec button: 'Bump (declarative)' event: #bump id: #bumpBtn.
+                    AppSpec button: 'Reset' event: #reset id: #resetBtn } id: #verbs
+            } id: #modelCard.
+            AppSpec text: 'patches: ' , AppToolWindow patchCount printString
+                    , '   rebuilds: ' , AppToolWindow rebuildCount printString
+                    id: #counts
+        } id: #root)
+    ]
+
+    "ONE HANDLER FOR BOTH WORLDS: #bump arrives from the declarative button
+     AND from the native one — the strip's provider wires its NSButton to
+     dispatch the same event name, and nothing here can tell which was
+     pressed. That indistinguishability is the demonstration."
+    AppMixedDemo class >> handle: event <Symbol> value: value <Object> [
+        event == #bump ifTrue: [ Count := self count + 1 ].
+        event == #reset ifTrue: [ Count := 0. Note := nil ].
+        event == #note ifTrue: [ Note := value ].
+        ^self
+    ]
+
+    AppMixedDemo class >> install [
+        AppToolWindow
+            register: #mixed title: 'Mixed Demo' width: 480 height: 560
+            render: [ AppMixedDemo spec ]
+            handler: [ :event :value |
+                AppMixedDemo handle: event value: value.
+                (AppToolWindow named: #mixed) rerender ].
+        ^self
+    ]
+]
