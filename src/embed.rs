@@ -1758,8 +1758,35 @@ impl VmHandle {
     /// `GameStep` pattern): the host loop calls this, then execs
     /// `Worker dispatchPending.`, whose `primPoll` takes it. Rust bytes only
     /// — nothing here is visible to the GC.
+    /// Hand this (worker-role) VM its own inbox — the link it offers as an
+    /// envelope's `reply_to` so a peer can answer it directly
+    /// (`docs/worker_peer_links.md`). Called by the worker thread right after
+    /// `install_worker_role`; a hosted worker whose host never calls it simply
+    /// offers no link and behaves as it did before peer links.
+    pub fn set_self_inbox(&mut self, inbox: crate::runtime::workers::InboxSender) {
+        if let Some(ws) = self.vm.workers.as_mut() {
+            ws.set_self_inbox(inbox);
+        }
+    }
+
+    /// Introduce a peer to this (worker-role) VM: it may then `send` to `id`.
+    /// The primary uses this at spawn to hand a new worker the UI's link —
+    /// the bootstrap that learning cannot provide, because learning only
+    /// answers *how do I reply*.
+    pub fn add_worker_peer(&mut self, id: u32, inbox: crate::runtime::workers::InboxSender) {
+        if let Some(ws) = self.vm.workers.as_mut() {
+            ws.add_peer(id, inbox);
+        }
+    }
+
     pub(crate) fn stage_pending(&mut self, env: crate::runtime::workers::Envelope) {
         if let Some(ws) = self.vm.workers.as_mut() {
+            // LEARN BEFORE STAGING (`docs/worker_peer_links.md`): if the
+            // sender offered its inbox, remember it, so answering this
+            // message is a direct send rather than a trip through the
+            // primary. An envelope with no `reply_to` teaches nothing, which
+            // is every message that predates peer links.
+            ws.learn_peer_from(&env);
             if let crate::runtime::workers::WorkerState::Worker { pending, .. } = &mut **ws {
                 *pending = Some(env);
             }

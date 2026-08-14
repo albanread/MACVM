@@ -303,6 +303,20 @@ pub enum WorkerState {
         /// whose `primPoll` takes it. Rust bytes — invisible to GC.
         pending: Option<Envelope>,
         to_primary: InboxSender,
+        /// THIS worker's own inbox, when it has one to hand out — what goes
+        /// in an outgoing envelope's `reply_to` so a peer can answer directly
+        /// (`docs/worker_peer_links.md`). A spawned worker gets one from
+        /// `spawn`; an externally-hosted worker may have none, and then it
+        /// simply offers no link and behaves exactly as it did before peer
+        /// links existed.
+        self_inbox: Option<InboxSender>,
+        /// LINKS THIS WORKER HOLDS, not addresses it can resolve — id ->
+        /// inbox for the peers it was introduced to at spawn and the ones it
+        /// has learned by being messaged. There is no directory and no
+        /// lookup service: a worker can reach its parent, whoever it was
+        /// introduced to, and whoever has spoken to it. Two or three entries
+        /// in practice, which is why a Vec is the right shape.
+        peers: Vec<(u32, InboxSender)>,
     },
 }
 
@@ -339,6 +353,41 @@ impl WorkerState {
             self_id,
             pending: None,
             to_primary,
+            self_inbox: None,
+            peers: Vec::new(),
+        }
+    }
+
+    /// Hand this worker its own inbox — the link it offers as `reply_to`.
+    /// Separate from `new_worker` because the role is installed by the worker
+    /// thread before the spawner's side of the channel is available to it.
+    pub fn set_self_inbox(&mut self, inbox: InboxSender) {
+        if let WorkerState::Worker { self_inbox, .. } = self {
+            *self_inbox = Some(inbox);
+        }
+    }
+
+    /// Introduce a peer: remember `id`'s inbox so a later `send` can resolve
+    /// it. Replaces an existing entry for the same id — a respawned worker
+    /// reusing an id must not be reachable through its predecessor's link.
+    pub fn add_peer(&mut self, id: u32, inbox: InboxSender) {
+        if let WorkerState::Worker { peers, .. } = self {
+            if let Some(slot) = peers.iter_mut().find(|(pid, _)| *pid == id) {
+                slot.1 = inbox;
+            } else {
+                peers.push((id, inbox));
+            }
+        }
+    }
+
+    /// LEARN FROM AN ARRIVING ENVELOPE — the rule that makes peer links cost
+    /// no registry: whoever just spoke to us handed over the link to answer
+    /// them on, so remember it. A `None` reply_to teaches nothing, which is
+    /// every pre-peer-links message and is why this is safe to run on all of
+    /// them.
+    pub fn learn_peer_from(&mut self, env: &Envelope) {
+        if let Some(link) = env.reply_to.clone() {
+            self.add_peer(env.from, link);
         }
     }
 
@@ -509,6 +558,12 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
         }
     };
     let (tx, rx) = channel::<Envelope>();
+    // The worker's OWN inbox, cloned before the primary's link takes the
+    // sender: this is what the new VM offers as `reply_to` so a peer it
+    // messages can answer it directly (`docs/worker_peer_links.md`). Detached
+    // like the primary's link — a spawned worker parks in `rx.recv()`, so
+    // there is no run-loop to poke.
+    let self_inbox = InboxSender::detached(tx.clone());
     let boot = boot.clone();
     let to_primary = inbox_tx.clone();
     // The global-table row (one per SPAWN, not per id — reused ids get fresh
@@ -517,7 +572,18 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
     let alive = Arc::new(AtomicBool::new(true));
     worker_table_register(id, epoch, alive.clone());
     // Detached on purpose (S21: never join a VM worker thread).
-    std::thread::spawn(move || worker_main(id, epoch, alive, &boot, &rx, &to_primary, init.as_deref()));
+    std::thread::spawn(move || {
+        worker_main(
+            id,
+            epoch,
+            alive,
+            &boot,
+            &rx,
+            &to_primary,
+            self_inbox,
+            init.as_deref(),
+        )
+    });
     let link = WorkerLink {
         inbox: InboxSender::detached(tx),
         alive: true,
@@ -590,6 +656,7 @@ fn worker_main(
     boot: &WorkerBootFn,
     rx: &Receiver<Envelope>,
     to_primary: &InboxSender,
+    self_inbox: InboxSender,
     init: Option<&str>,
 ) {
     let Ok(mut handle) = boot() else {
@@ -598,6 +665,9 @@ fn worker_main(
         return;
     };
     handle.install_worker_role(id, to_primary.clone());
+    // Its own link, so anything it messages can answer it directly rather
+    // than through the primary (`docs/worker_peer_links.md`).
+    handle.set_self_inbox(self_inbox);
     // Monitor tab: this thread owns the handle, so it is the one place the
     // worker's metrics can be sampled — published at every quiescent point
     // (post-boot, post-dispatch). An idle worker's numbers are frozen, which
@@ -709,19 +779,44 @@ pub fn send(vm: &mut VmState, id: u32, corr: u64, bytes: Vec<u8>) -> bool {
         WorkerState::Worker {
             self_id,
             to_primary,
+            self_inbox,
+            peers,
             ..
         } => {
-            if id != 0 {
-                return false; // v1: workers talk only to the primary
+            // A WORKER MAY NOW REACH A PEER IT HOLDS A LINK TO. `id == 0` is
+            // still the parent, unchanged and always available; anything else
+            // must be a link this worker was introduced to or learned by
+            // being messaged (`docs/worker_peer_links.md`). There is
+            // deliberately no lookup by number: an id this worker holds no
+            // link for answers false, exactly as an unknown or dead worker
+            // always has.
+            let link = if id == 0 {
+                to_primary
+            } else {
+                match peers.iter().find(|(pid, _)| *pid == id) {
+                    Some((_, inbox)) => inbox,
+                    None => return false,
+                }
+            };
+            // Offer our own inbox so the far side can answer us directly
+            // rather than through the primary — the whole point of the field.
+            let env = Envelope {
+                from: *self_id,
+                corr,
+                bytes,
+                reply_to: self_inbox.clone(),
+            };
+            if link.send(env).is_err() {
+                // The peer's receiver is gone. Drop the link rather than keep
+                // a dead one: a reused id must never be reachable through its
+                // predecessor's channel. The parent's link is never dropped —
+                // a worker with no parent has nowhere to report anything.
+                if id != 0 {
+                    peers.retain(|(pid, _)| *pid != id);
+                }
+                return false;
             }
-            to_primary
-                .send(Envelope {
-                    from: *self_id,
-                    corr,
-                    bytes,
-                    reply_to: None,
-                })
-                .is_ok()
+            true
         }
     }
 }
@@ -801,5 +896,78 @@ pub fn self_inbox_sender(vm: &crate::runtime::vm_state::VmState) -> Option<Inbox
         Some(WorkerState::Primary { inbox_tx, .. }) => Some(inbox_tx.clone()),
         Some(WorkerState::Worker { to_primary, .. }) => Some(to_primary.clone()),
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod peer_link_tests {
+    //! `docs/worker_peer_links.md` §6 — the transport rules, at the level they
+    //! are written at. These need no VM: a `WorkerState` and a channel are the
+    //! whole mechanism, which is itself the argument that peer links are small.
+
+    use super::*;
+
+    /// A worker with a channel standing in for its parent, plus the receiving
+    /// end so a test can see what actually arrived.
+    fn worker(id: u32) -> (WorkerState, Receiver<Envelope>) {
+        let (tx, rx) = channel::<Envelope>();
+        let mut ws = WorkerState::new_worker(id, InboxSender::detached(tx));
+        let (self_tx, _self_rx) = channel::<Envelope>();
+        ws.set_self_inbox(InboxSender::detached(self_tx));
+        (ws, rx)
+    }
+
+    /// The rule that keeps peer links free of a registry: being messaged by
+    /// someone who offered a link teaches you how to answer them.
+    #[test]
+    fn an_arriving_envelope_that_offers_a_link_is_learned() {
+        let (mut ws, _parent) = worker(1);
+        let (peer_tx, peer_rx) = channel::<Envelope>();
+        let env = Envelope {
+            from: 7,
+            corr: 0,
+            bytes: vec![1, 2, 3],
+            reply_to: Some(InboxSender::detached(peer_tx)),
+        };
+        ws.learn_peer_from(&env);
+        let WorkerState::Worker { peers, .. } = &ws else {
+            panic!("worker role");
+        };
+        assert_eq!(peers.len(), 1, "the link was remembered");
+        assert_eq!(peers[0].0, 7);
+        // And it is a live link, not a note: sending down it arrives.
+        peers[0].1.send(Envelope::plain(1, 0, vec![9])).unwrap();
+        assert_eq!(peer_rx.recv().unwrap().bytes, vec![9]);
+    }
+
+    /// An envelope with nothing to offer teaches nothing — which is every
+    /// message that predates peer links, and why learning is safe to run on
+    /// all of them.
+    #[test]
+    fn an_envelope_without_a_link_teaches_nothing() {
+        let (mut ws, _parent) = worker(1);
+        ws.learn_peer_from(&Envelope::plain(7, 0, vec![1]));
+        let WorkerState::Worker { peers, .. } = &ws else {
+            panic!("worker role");
+        };
+        assert!(peers.is_empty());
+    }
+
+    /// A respawned worker reusing an id must not be reachable through its
+    /// predecessor's channel, so an introduction REPLACES rather than appends.
+    #[test]
+    fn introducing_the_same_id_twice_replaces_the_link() {
+        let (mut ws, _parent) = worker(1);
+        let (old_tx, old_rx) = channel::<Envelope>();
+        let (new_tx, new_rx) = channel::<Envelope>();
+        ws.add_peer(7, InboxSender::detached(old_tx));
+        ws.add_peer(7, InboxSender::detached(new_tx));
+        let WorkerState::Worker { peers, .. } = &ws else {
+            panic!("worker role");
+        };
+        assert_eq!(peers.len(), 1, "one entry, not two");
+        peers[0].1.send(Envelope::plain(1, 0, vec![9])).unwrap();
+        assert!(new_rx.try_recv().is_ok(), "the new link is the live one");
+        assert!(old_rx.try_recv().is_err(), "the old one is gone");
     }
 }
