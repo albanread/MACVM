@@ -83,3 +83,4 @@ tests/61_apptoolwin_tests.mst
 tests/62_windemotool_tests.mst
 tests/63_apppane_tests.mst
 tests/64_winditors_tests.mst
+tests/65_appvm_tests.mst

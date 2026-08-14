@@ -1,0 +1,286 @@
+"93_appvm.mst — AppSpec A5: an app in a VM of its own.
+
+ `docs/appspec.md` §3.2. The author's reason, verbatim: *I do like apps
+ running in their own VMs and it scales, at least the logic in the app runs in
+ its own thread; we have so many cores on systems now, even the toy Snapdragon
+ has eight of them.*
+
+ So an app's MODEL, its render block, its handler and its paint block all live
+ in a worker VM of their own, off the main thread, on their own core. The UI
+ worker keeps only what AppKit requires it to keep: the window, the controls,
+ and the reconcile that touches them. That makes the realizer a small shared
+ DISPLAY SERVER rather than the place applications live, and it is why two
+ open apps cannot block each other however much arithmetic either one does.
+
+ THE SEAM COST NOTHING TO INVENT, because `Worker pickle:` already carries
+ whole object graphs between VMs — measured before designing anything: a
+ normalized spec tree pickles to 689 bytes, unpickles as a real AppNode,
+ answers `sameNodeAs:` true, validates, and diffs against its original to zero
+ ops. So an app VM does not serialize its UI into some wire format and the
+ display side does not parse one; the spec IS the message. Blocks, contexts,
+ classes and aliens cannot cross, which is exactly why a spec was designed to
+ hold event NAMES rather than handlers — a decision made for the differ that
+ turns out to be what makes the tree shippable.
+
+ WHAT RUNS WHERE, precisely, because this is the part worth being able to
+ point at:
+
+     app VM        the model, the render block, the handler, the paint block
+     UI worker     normalize, validate, diff, and the realizer's native work
+
+ Diffing on the display side is a deliberate v1 choice, not an oversight. The
+ author's priority was that the app's LOGIC runs on its own thread, and it
+ does; moving the diff across as well is a change to WHAT this file ships (ops
+ instead of a spec) and nothing else, because both sides already have the
+ whole model. The comment at `specArrived:` says what that would take.
+
+ FAILURE IS A STATE, NOT AN ACCIDENT. An app VM can die — that is the point of
+ giving it one — so every crossing here is failure-soft: a send to a dead
+ worker is caught and reported, the window keeps its last frame, and
+ `isAlive` is what a supervisor asks. The window outlives the VM behind it.
+
+ THE ONE THING THIS FILE CANNOT DO YET, found by running it and stated here
+ rather than discovered again: **the UI worker cannot spawn.** The Cocoa host
+ registers the worker boot closure on the PRIMARY alone
+ (`cocoa_gui/src/boot.rs:275`, `primary.set_worker_boot(...)`), and a worker
+ inherits its spawner's — so `Worker spawn:` from the UI worker answers
+ `no boot registered` and `AppVm start:` reports it and gives up. That is a
+ host wiring fact, not a design fault: the primary is where app VMs must be
+ hosted, and the realizer is where they must be drawn.
+
+ SO THE ROUTE IS TWO HOPS, and A5's remaining work is exactly that plumbing:
+ the UI asks the primary to start an app (the primary can spawn), the app VM
+ answers its spawner (peer 0 = the primary), and the primary forwards the
+ frame to the UI worker, which is a registered peer it can already address.
+ Nothing above changes shape — `specArrived:` still receives a real AppNode,
+ because pickling is transitive and a second hop copies it again. The
+ alternative, and probably the better one, is to give the UI worker a boot
+ closure of its own in `boot.rs`, which would make this file work as written;
+ that is a Rust change to the host and wants its own decision.
+
+ What IS proven, and pinned by `world/tests/65_appvm_tests.mst`: the seam
+ itself. A spec tree pickles, arrives as a real AppNode, validates, and diffs
+ against its original to ZERO ops — so an app VM's frame costs no wire format
+ and arrives as nothing to do. Placements and patch ops cross intact too."
+
+Object subclass: AppVmClient [
+    <classVars: Tool>
+
+    "Installed INSIDE the app's own VM by the init source `AppVm` ships. From
+     here on this VM answers two questions and asks none: `what does your
+     window look like` and `here is an event, what does it look like now`."
+
+    AppVmClient class >> serve: aToolClassName <String> [
+        Tool := Worker classNamed: aToolClassName asSymbol.
+        Worker onMessage: [ :payload | AppVmClient handle: payload ].
+        ^self
+    ]
+
+    AppVmClient class >> tool ^ <Object> [ ^Tool ]
+
+    AppVmClient class >> handle: payload <Object> [
+        | verb |
+        (payload isKindOf: Array) ifFalse: [ ^self ].
+        verb := payload at: 1.
+        verb == #spec ifTrue: [ ^Worker reply: (Array with: #spec with: self currentSpec) ].
+        verb == #event ifTrue: [
+            "THE HANDLER RUNS HERE — in this VM, on this thread. Whatever it
+             costs, it costs the app rather than the display."
+            Tool isNil ifFalse: [
+                [ Tool handle: (payload at: 2) value: (payload at: 3) ]
+                    on: Error do: [ :e |
+                        ^Worker reply: (Array with: #failed with: e messageText) ] ].
+            ^Worker reply: (Array with: #spec with: self currentSpec) ].
+        ^self
+    ]
+
+    "Answers the tool's spec, or nil if it cannot build one — a tool that
+     raises in its render block must not take its own VM down."
+    AppVmClient class >> currentSpec ^ <Object> [
+        Tool isNil ifTrue: [ ^nil ].
+        ^[ Tool spec ] on: Error do: [ :e | nil ]
+    ]
+]
+
+Object subclass: AppVm [
+    <classVars: Apps>
+
+    "── the registry of running apps ────────────────────────────────────"
+
+    AppVm class >> apps ^ <Dictionary> [
+        Apps isNil ifTrue: [ Apps := Dictionary new ].
+        ^Apps
+    ]
+
+    AppVm class >> named: anId <Symbol> ^ <Object> [
+        ^self apps at: anId ifAbsent: [ nil ]
+    ]
+
+    AppVm class >> reset [ Apps := nil. ^self ]
+
+    "Every app VM still running — what a supervisor sweeps."
+    AppVm class >> liveCount ^ <Integer> [
+        | n |
+        n := 0.
+        self apps do: [ :a | a isAlive ifTrue: [ n := n + 1 ] ].
+        ^n
+    ]
+
+    "── starting one ────────────────────────────────────────────────────
+
+     `toolClass` is a class that answers `spec` and takes `handle:value:` —
+     the SAME two messages a tool already implements for the in-process path,
+     so a tool does not know or care which side of a VM boundary it is on."
+
+    AppVm class >> start: anId <Symbol> tool: aToolClassName <String>
+                   title: aTitle <String> width: w <Integer> height: h <Integer> ^ <Object> [
+        | app |
+        app := AppVm new setId: anId tool: aToolClassName title: aTitle width: w height: h.
+        app spawn isNil ifTrue: [ ^nil ].
+        self apps at: anId put: app.
+        app register.
+        ^app
+    ]
+
+    "── an app ──────────────────────────────────────────────────────────"
+
+    | id toolName title width height worker lastSpec failures |
+
+    setId: anId <Symbol> tool: aName <String> title: aTitle <String>
+    width: w <Integer> height: h <Integer> ^ <AppVm> [
+        id := anId.
+        toolName := aName.
+        title := aTitle.
+        width := w.
+        height := h.
+        failures := 0.
+        ^self
+    ]
+
+    id ^ <Symbol> [ ^id ]
+    title ^ <String> [ ^title ]
+    worker ^ <Object> [ ^worker ]
+    lastSpec ^ <Object> [ ^lastSpec ]
+    failures ^ <Integer> [ ^failures ]
+    isAlive ^ <Boolean> [ ^worker isNil not and: [ worker isAlive ] ]
+
+    "The init source runs ONCE in the fresh VM. It names the tool's class and
+     nothing else — the class itself is already there, because a worker boots
+     the same world this one did."
+    initSource ^ <String> [
+        ^'AppVmClient serve: ''' , toolName , '''.'
+    ]
+
+    spawn ^ <Object> [
+        worker := [ Worker spawn: self initSource ]
+            on: Error do: [ :e |
+                AppToolWindow report: 'app ' , id printString , ': ' , e messageText.
+                nil ].
+        ^worker
+    ]
+
+    "── the window this app drives ──────────────────────────────────────
+
+     ITS RENDER BLOCK ANSWERS A CACHE, and that is the whole trick. A render
+     block must answer NOW, and the app VM answers WHEN IT ANSWERS; so the
+     window renders whatever spec last arrived, and an arriving spec triggers
+     the rerender that shows it. That is what a display server is: it draws
+     the last frame it was given and never waits for the next one."
+    register [
+        AppToolWindow
+            register: id title: title width: width height: height
+            render: [ (AppVm named: id) lastSpec ]
+            handler: [ :event :value | (AppVm named: id) sendEvent: event value: value ]
+            paint: [ :tool :paneId :region |
+                "Painting stays with the app: it owns the pixels, and A3's
+                 surfaces are reachable from any VM by handle."
+                (AppVm named: id) paintPane: paneId damage: region in: tool ].
+        ^self
+    ]
+
+    "Ask the app VM for its first frame, then open. Opening BEFORE the spec
+     arrives would realize an empty window and immediately rebuild it."
+    open ^ <Boolean> [
+        self isAlive ifFalse: [ ^false ].
+        self requestSpec.
+        Worker runLoopWhile: [ lastSpec isNil and: [ self isAlive ] ].
+        lastSpec isNil ifTrue: [ ^false ].
+        ^(AppToolWindow named: id) open
+    ]
+
+    "── the two crossings ───────────────────────────────────────────────"
+
+    requestSpec [
+        ^self ask: (Array with: #spec)
+    ]
+
+    sendEvent: event <Symbol> value: aValue <Object> [
+        ^self ask: (Array with: #event with: event with: aValue)
+    ]
+
+    "One crossing, and every one of them can fail. A dead worker is REPORTED
+     and the window keeps its last frame — the alternative is a UI that dies
+     with the app it was showing, which is the whole thing an app VM is for."
+    ask: payload <Array> [
+        self isAlive ifFalse: [
+            failures := failures + 1.
+            AppToolWindow report: 'app ' , id printString , ' is not running'.
+            ^false ].
+        [ worker send: payload onReply: [ :reply | self replyArrived: reply ] ]
+            on: Error do: [ :e |
+                failures := failures + 1.
+                AppToolWindow report: 'app ' , id printString , ': ' , e messageText.
+                ^false ].
+        ^true
+    ]
+
+    replyArrived: reply <Object> [
+        ((reply isKindOf: Array) and: [ (reply at: 1) == #spec ])
+            ifTrue: [ ^self specArrived: (reply at: 2) ].
+        ((reply isKindOf: Array) and: [ (reply at: 1) == #failed ])
+            ifTrue: [
+                failures := failures + 1.
+                ^AppToolWindow report: 'app ' , id printString , ' handler: ' , (reply at: 2) ].
+        ^self
+    ]
+
+    "A FRAME ARRIVED. It is a real AppNode — pickled across, not parsed — so
+     everything downstream is the ordinary in-process path: normalize,
+     validate, diff against what is on screen, patch what changed.
+
+     TO MOVE THE DIFF INTO THE APP VM, which §3.2 wants eventually: have
+     AppVmClient keep its own `lastSpec`, send `AppSpec diff:against:` ops
+     instead of the tree, and call `apply:spec:` here instead of `rerender`.
+     Both sides already have the whole model, so nothing else changes — the
+     reason it is not done yet is that the ops path wants its own failure
+     story for `the display and the app disagree about what is on screen`."
+    specArrived: aSpec <Object> [
+        aSpec isNil ifTrue: [ ^self ].
+        lastSpec := aSpec.
+        (AppToolWindow named: id) isOpen ifTrue: [ (AppToolWindow named: id) rerender ].
+        ^self
+    ]
+
+    "── painting ────────────────────────────────────────────────────────
+
+     A pane's pixels are the app's, and `AppSurfaces` is reached by HANDLE, so
+     the app VM can be told which handle to draw into and do the drawing on its
+     own thread. v1 keeps the paint call here and asks the app to do the work
+     by RPC — the surface itself is shared, so nothing is copied."
+    paintPane: paneId <Object> damage: region <Object> in: tool <Object> [
+        self isAlive ifFalse: [ ^self ].
+        ^self ask: (Array with: #event with: #paint
+                          with: (Array with: paneId asString
+                                       with: (tool paneHandle: paneId)
+                                       with: region))
+    ]
+
+    "── the end of one ──────────────────────────────────────────────────"
+
+    stop [
+        (AppToolWindow named: id) isNil ifFalse: [ (AppToolWindow named: id) teardown ].
+        worker isNil ifFalse: [ worker terminate ].
+        worker := nil.
+        ^self
+    ]
+]

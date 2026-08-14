@@ -275,6 +275,12 @@
 # never edited, running here on the Cocoa realizer.
 91b_winspriteed.mst
 91c_winsoundtool.mst
+# AppVm (docs/appspec.md A5): an app's model, render block and handler in a
+# WORKER VM OF ITS OWN, off the main thread. Specs cross by Worker pickle —
+# a spec tree round-trips intact, so the tree IS the message and there is no
+# wire format. The UI worker keeps only what AppKit requires: window,
+# controls, reconcile. Loads after the tools it can host.
+93_appvm.mst
 # SUnit (docs/sunit_design.md): tests for the world, written in the world.
 # TestCase/TestFailure/TestResult/TestRunner. Loads last in the world list so
 # a test file in tests.list can subclass TestCase.

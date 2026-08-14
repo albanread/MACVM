@@ -1,0 +1,139 @@
+"65_appvm_tests.mst — gates the seam A5 rests on: a spec can cross a VM boundary.
+
+ `docs/appspec.md` §3.2 wants each app in a worker VM of its own. Everything
+ else in that design is plumbing; the one question that could have killed it
+ is whether a spec can GET to another VM without being flattened into a wire
+ format and parsed back — because a UI framework that has to serialize its own
+ tree twice per frame is a different, worse framework.
+
+ It can. `Worker pickle:` carries whole object graphs, and these tests measure
+ that against the actual model rather than trusting it: a normalized spec
+ pickles, unpickles as a real AppNode, answers `sameNodeAs:` its original,
+ passes the validator, and — the assertion that matters most — DIFFS AGAINST
+ ITS ORIGINAL TO ZERO OPS. That last one is the whole claim in one line: if a
+ round-tripped spec diffed to anything, an app VM's first frame would arrive
+ as a spurious patch of a window nobody had changed.
+
+ THE REASON IT WORKS IS A DECISION MADE FOR THE DIFFER. Blocks, contexts and
+ classes cannot pickle — and a spec holds event NAMES rather than handlers,
+ because the contract says handlers are never in the tree. A rule adopted so
+ the differ could compare nodes is what makes the tree shippable, which is the
+ kind of thing worth pinning before someone `simplifies` it by putting a block
+ in a prop.
+
+ These run anywhere, with no worker and no window: pickling is a VM service,
+ not a worker one."
+
+TestCase subclass: AppVmSeamTests [
+
+    sampleSpec [
+        ^AppSpec normalize: (AppSpec window: 'Sample' id: #w body: (AppSpec stack: {
+            AppSpec heading: 'A shippable tree' id: #head.
+            AppSpec text: 'count: 3' id: #count.
+            AppSpec divider: #rule.
+            AppSpec card: 'Verbs' children: {
+                AppSpec row: {
+                    AppSpec button: 'Go' event: #go id: #go.
+                    AppSpec button: 'Stop' event: #stop id: #stop } id: #verbs.
+                AppSpec input: 'Note' value: 'hello' event: #note id: #note.
+                AppSpec checkbox: 'Loud' checked: true event: #loud id: #loud.
+                AppSpec select: 'Colour' value: 2
+                        options: (Array with: (Association key: 1 value: 'One')
+                                        with: (Association key: 2 value: 'Two'))
+                        event: #colour id: #colour.
+                AppSpec rgbaPane: #grid width: 64 height: 64 } id: #card
+        } id: #root))
+    ]
+
+    "── the claim ───────────────────────────────────────────────────────"
+
+    testASpecTreeSurvivesAVmCrossingIntact [
+        | spec back |
+        spec := self sampleSpec.
+        back := Worker unpickle: (Worker pickle: spec).
+        self assert: (back isKindOf: AppNode) description: 'it comes back a real node'.
+        self assert: back type equals: #window.
+        self assert: (back sameNodeAs: spec) description: 'every node, prop and child'.
+    ]
+
+    "The one that matters: a frame arriving from another VM must not look like
+     a change. If this fails, every app's first frame is a spurious patch."
+    testARoundTrippedSpecDiffsToNothing [
+        | spec back ops |
+        spec := self sampleSpec.
+        back := Worker unpickle: (Worker pickle: spec).
+        ops := AppSpec diff: spec against: back.
+        self assert: ops isNil not description: 'the differ can express it at all'.
+        self assert: ops isEmpty description: 'and there is nothing to say'.
+    ]
+
+    testTheCrossedSpecStillValidates [
+        | back |
+        back := Worker unpickle: (Worker pickle: self sampleSpec).
+        self assert: (AppSpec validate: back) isNil.
+    ]
+
+    "Props keep their kinds across, which the realizer depends on — an option's
+     Association, a checkbox's Boolean, a pane's Integers."
+    testPropKindsSurviveTheCrossing [
+        | back card colour |
+        back := Worker unpickle: (Worker pickle: self sampleSpec).
+        card := back body children at: 4.
+        colour := card children at: 4.
+        self assert: colour type equals: #select.
+        self assert: ((colour at: #options) at: 1) key equals: 1.
+        self assert: ((colour at: #options) at: 2) value equals: 'Two'.
+        self assert: ((card children at: 3) at: #checked) equals: true.
+        self assert: ((card children at: 5) at: #width) equals: 64.
+    ]
+
+    "PLACEMENTS CROSS TOO, which is what would let the app VM do its own
+     layout: they are Arrays of node, numbers and a kind Symbol."
+    testPlacementsSurviveTheCrossing [
+        | places back |
+        places := AppSpecLayout layout: self sampleSpec width: 400
+                       metrics: (AppSpecLayout metricsCharWidth: 8 lineHeight: 16).
+        back := Worker unpickle: (Worker pickle: places).
+        self assert: back size equals: places size.
+        self assert: (((back at: 1) at: 1) isKindOf: AppNode).
+        self assert: ((back at: 1) at: 6) == ((places at: 1) at: 6).
+    ]
+
+    "AND SO DO PATCH OPS, which is what the design's next step ships instead
+     of a whole tree — pinned now so that step is a change of mind rather than
+     a discovery."
+    testPatchOpsSurviveTheCrossing [
+        | a b ops back |
+        a := self sampleSpec.
+        b := AppSpec normalize: (AppSpec window: 'Sample' id: #w body: (AppSpec stack: {
+            AppSpec heading: 'A shippable tree' id: #head.
+            AppSpec text: 'count: 4' id: #count.
+            AppSpec divider: #rule.
+            AppSpec card: 'Verbs' children: {
+                AppSpec row: {
+                    AppSpec button: 'Go' event: #go id: #go.
+                    AppSpec button: 'Stop' event: #stop id: #stop } id: #verbs.
+                AppSpec input: 'Note' value: 'hello' event: #note id: #note.
+                AppSpec checkbox: 'Loud' checked: true event: #loud id: #loud.
+                AppSpec select: 'Colour' value: 2
+                        options: (Array with: (Association key: 1 value: 'One')
+                                        with: (Association key: 2 value: 'Two'))
+                        event: #colour id: #colour.
+                AppSpec rgbaPane: #grid width: 64 height: 64 } id: #card
+        } id: #root)).
+        ops := AppSpec diff: a against: b.
+        self assert: ops size equals: 1 description: 'one caption changed'.
+        back := Worker unpickle: (Worker pickle: ops).
+        self assert: back size equals: 1.
+        self assert: ((back at: 1) at: 1) == #setNodeProps.
+        self assert: ((back at: 1) at: 2) equals: 'count'.
+        self assert: (((back at: 1) at: 3) at: 1) value equals: 'count: 4'.
+    ]
+
+    "A BLOCK CANNOT CROSS, and the tests say so out loud because it is the
+     constraint the whole contract was already shaped for: handlers live in
+     the registry, never in the tree."
+    testABlockRefusesToPickleWhichIsWhySpecsHoldEventNames [
+        self should: [ Worker pickle: [ :x | x ] ] raise: Error.
+    ]
+]
