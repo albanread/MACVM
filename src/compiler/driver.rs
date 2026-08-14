@@ -1420,6 +1420,25 @@ fn compile_method_full(
             .chain(crate::compiler::ir::const_pool_vregs(&ir_method).keys())
             .copied()
             .collect();
+    // The whole-method claim (see `build_for_position`'s own comment): every
+    // nil-filled oop slot, in every map — minus any slot belonging to an
+    // F3-elided vreg, whose store never runs (its slot would scan the
+    // prologue nil forever: harmless, but the F3 contract says unscanned).
+    let f3_slots: std::collections::HashSet<u16> = regalloc_result
+        .intervals
+        .iter()
+        .filter(|iv| f3_skip.contains(&iv.vreg.0))
+        .filter_map(|iv| match iv.assignment {
+            Some(crate::compiler::regalloc::Assignment::Spill(s)) => Some(s.0),
+            _ => None,
+        })
+        .collect();
+    let always_slots: Vec<crate::compiler::regalloc::SpillSlot> = regalloc_result
+        .deopt_nil_init_slots
+        .iter()
+        .copied()
+        .filter(|s| !f3_slots.contains(&s.0))
+        .collect();
     for sp in &safepoint_pcs {
         let map = oopmap::build_for_position(
             &regalloc_result.intervals,
@@ -1427,6 +1446,7 @@ fn compile_method_full(
             sp.position,
             &regalloc_result.extra_oop_live,
             &f3_skip,
+            &always_slots,
         );
         let idx = oopmap::intern(&mut oopmaps, map);
         safepoint_pcdescs.push(PcDesc {

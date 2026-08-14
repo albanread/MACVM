@@ -630,6 +630,10 @@ fn install_loop_nmethod(
             sp.position,
             &ra.extra_oop_live,
             &Default::default(),
+            // The whole-method claim, exactly as the driver passes it — this
+            // test hand-builds "the same construction driver::compile_method
+            // performs", so it makes the same claim.
+            &ra.deopt_nil_init_slots,
         );
         let idx = oopmap::intern(&mut oopmaps, map);
         pcdescs.push(PcDesc {

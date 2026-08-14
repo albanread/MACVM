@@ -57,8 +57,28 @@ pub fn build_for_position(
     // F3: const-uniform smi vregs — their slots are NEVER written (deopt
     // rematerializes via ValueLoc::ConstSmi), so the GC must not scan them.
     skip_vregs: &std::collections::HashSet<u32>,
+    // EVERY nil-filled oop slot, claimed at EVERY safepoint — the whole-method
+    // rule, stated once (2026-08-14, the canvas-benchmark abort). This family
+    // has now produced four path-shaped staleness bugs (BUG D, task #94's
+    // sibling arms, the head-2 loop-carried facts, and today's: an
+    // inlined-scope slot claimed at inner-loop safepoints, gone stale during
+    // an OUTER-loop tail scavenge, rescanned via a guard-bypass path that
+    // never redefined it) — each patched by widening one mechanism's claims a
+    // little further along one more kind of path. The sound invariant is not
+    // path-shaped at all: a slot the prologue nil-fills is nil-or-current on
+    // EVERY path — nil can never go stale, and every def writes through — so
+    // claiming it EVERYWHERE makes every scavenge keep it current and closes
+    // the whole class, cyclic paths included. The cost is the GC's alone (a
+    // few more slot updates per scavenge; dead values float until the frame
+    // pops); the mutator and the emitted bytes are untouched, and `intern`'s
+    // dedup collapses the now-more-similar maps.
+    always_slots: &[crate::compiler::regalloc::SpillSlot],
 ) -> OopMap {
     let mut map = OopMap::empty();
+    for s in always_slots {
+        debug_assert!(s.0 < frame_slots);
+        map.set(s.0);
+    }
     // One pass over the facts per POSITION (not per interval × position):
     // the head-2 fix legitimately multiplied the fact count (loop-carried
     // slots get one fact per in-loop safepoint), and deltablue's steady
@@ -210,7 +230,7 @@ mod tests {
             spilled(0, 0, true, 0, 5),  // ends at 5, safepoint is at 10: dead
             spilled(1, 1, true, 0, 20), // spans 10: live
         ];
-        let map = build_for_position(&intervals, 2, 10, &[], &Default::default());
+        let map = build_for_position(&intervals, 2, 10, &[], &Default::default(), &[]);
         assert!(
             !map.is_oop(0),
             "interval ending before the safepoint must be excluded"
@@ -233,16 +253,16 @@ mod tests {
         let intervals = vec![spilled(0, 0, true, 0, 5)];
         let extra = [(VReg(0), 80)];
         assert!(
-            !build_for_position(&intervals, 1, 68, &extra, &Default::default()).is_oop(0),
+            !build_for_position(&intervals, 1, 68, &extra, &Default::default(), &[]).is_oop(0),
             "an unrelated safepoint numerically between the organic end and \
              the forced trap position must NOT see the vreg as live"
         );
         assert!(
-            build_for_position(&intervals, 1, 80, &extra, &Default::default()).is_oop(0),
+            build_for_position(&intervals, 1, 80, &extra, &Default::default(), &[]).is_oop(0),
             "the EXACT forced position must see the vreg as live"
         );
         assert!(
-            !build_for_position(&intervals, 1, 81, &extra, &Default::default()).is_oop(0),
+            !build_for_position(&intervals, 1, 81, &extra, &Default::default(), &[]).is_oop(0),
             "one past the forced position must not — this is a point fact, \
              not a range"
         );
@@ -254,7 +274,7 @@ mod tests {
     #[test]
     fn oopmap_excludes_interval_ending_at_position() {
         let intervals = vec![spilled(0, 0, true, 0, 10)];
-        let map = build_for_position(&intervals, 1, 10, &[], &Default::default());
+        let map = build_for_position(&intervals, 1, 10, &[], &Default::default(), &[]);
         assert!(!map.is_oop(0));
     }
 
@@ -271,14 +291,14 @@ mod tests {
     #[test]
     fn oopmap_excludes_interval_starting_at_position() {
         let intervals = vec![spilled(0, 0, true, 10, 20)];
-        let map = build_for_position(&intervals, 1, 10, &[], &Default::default());
+        let map = build_for_position(&intervals, 1, 10, &[], &Default::default(), &[]);
         assert!(
             !map.is_oop(0),
             "a call's own dst (def AT the safepoint) must not be traced during the call"
         );
         // ...and the very next safepoint, once the value genuinely exists,
         // covers it normally.
-        let map_later = build_for_position(&intervals, 1, 15, &[], &Default::default());
+        let map_later = build_for_position(&intervals, 1, 15, &[], &Default::default(), &[]);
         assert!(map_later.is_oop(0));
     }
 
@@ -288,7 +308,7 @@ mod tests {
     #[test]
     fn oopmap_excludes_non_oop_interval() {
         let intervals = vec![spilled(0, 0, false, 0, 20)];
-        let map = build_for_position(&intervals, 1, 10, &[], &Default::default());
+        let map = build_for_position(&intervals, 1, 10, &[], &Default::default(), &[]);
         assert!(!map.is_oop(0));
     }
 
