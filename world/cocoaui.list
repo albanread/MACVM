@@ -62,3 +62,9 @@
 # by name with the SF-Symbol magnifying glass.
 86_coctests.mst
 85_cocoamonitor.mst
+# CocoaRealize (docs/appspec.md A2): the AppSpec framework's platform half —
+# the only file in it that knows AppKit exists. Implements the realizer
+# protocol from 89_apptoolwin.mst and installs itself as the realizer class,
+# which is what makes declarative tools draw here. Loaded only by the UI
+# worker, so headless images keep the null realizer.
+92_cocoarealize.mst

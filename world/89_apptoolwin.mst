@@ -195,8 +195,23 @@ Object subclass: AppToolWindow [
      before A2's Cocoa realizer exists, and it is also what a worker VM with no
      display should do rather than fail."
 
+    "IT RESOLVES ITSELF, and that is not cleverness — it is the only thing that
+     works in both boot paths. Loading `world/*.mst` runs a file's trailing
+     doits, but the GUI boots its VMs FROM THE IMAGE, and image boot replays
+     only a two-entry `WORLD_DOITS` list (cocoa_gui/src/boot.rs): a
+     `realizerClass: CocoaRealize.` line at the foot of the Cocoa file would
+     simply never run there, which is exactly how it failed the first time.
+     So instead of being told, this ASKS — late-bound by name, the same
+     discipline CocoaUI uses to reach views that load after it
+     (`(Worker classNamed: #CocoaMonitor) ifNotNil: [ :mc | mc register ]`).
+     A VM that loaded the Cocoa layer finds CocoaRealize and draws; every
+     other VM finds nothing and keeps the null realizer, which is the right
+     answer for a headless image rather than a fallback from a broken one.
+     Resolved once and cached, so the reflection sweep costs nothing after."
     AppToolWindow class >> realizerClass ^ <Object> [
-        RealizerClass isNil ifTrue: [ RealizerClass := AppNullRealizer ].
+        RealizerClass isNil ifTrue: [
+            RealizerClass := (Worker classNamed: #CocoaRealize)
+                ifNil: [ AppNullRealizer ] ].
         ^RealizerClass
     ]
 

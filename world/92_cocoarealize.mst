@@ -1,0 +1,422 @@
+"92_cocoarealize.mst — AppSpec A2: the Cocoa realizer.
+
+ `docs/appspec.md` §5.4. This is the platform half, and it is the ONLY file in
+ the framework that knows AppKit exists. It implements the realizer protocol
+ declared in `world/89_apptoolwin.mst`'s header — eleven messages — and nothing
+ above it may name an NSView.
+
+ IT IS DELIBERATELY DULL, and that is the measure of whether the split worked.
+ The spec model decided what exists, the layout decided where it goes, and the
+ differ decided what changed; all that is left here is `create a control per
+ rect, set a property per patch`. When this file starts wanting to know what a
+ tool MEANS, the seam has been broken.
+
+ THE Y-FLIP LIVES HERE, in `rectFor:` and nowhere else. Layout answers
+ top-left rects because that is what the shared contract says; an unflipped
+ NSView is bottom-left, so every placement is converted once on its way to a
+ frame: `y_cocoa = clientHeight - y_top - h`. The bridge cannot mint a flipped
+ view — `MacvmDelegate`'s roles are a fixed family and none of them is one —
+ and flipping here is what the rest of this codebase already does
+ (`cocoa_gui/src/canvas.rs`, `76_spriteed.mst`'s sprite row). The vendored
+ layout needs no Mac edit, which is the property that matters.
+
+ THE REALIZER OWNS EVERY NATIVE OBJECT, which is the promise `docs/appspec.md`
+ makes on the framework's behalf: the window, the view tree, and — the part
+ that actually bites — the ACTION DELEGATES. A `MacvmDelegate` is kept alive by
+ the world-side ticket registry, but the holder blocks and the delegate handles
+ are ours to drop at teardown, exactly as `70_cocoacanvas.mst` keeps its
+ `ActionDelegates`. A tool author holds none of this and therefore cannot leak
+ it.
+
+ A2's CONTROL SET is the MVP the record names — text, heading, button, input,
+ checkbox, divider — plus `select`, because a demo without a choice control
+ proves less than it should. `slider`, `listBox` and the three pane types are
+ A3's, and until then they realize as a VISIBLE placeholder rather than as
+ nothing: a spec that grew a node this file has not met yet should be obviously
+ wrong on screen, never invisibly absent."
+
+Object subclass: CocoaRealize [
+    | toolWindow nsWin content controls delegates winDelegate |
+
+    CocoaRealize class >> newFor: aWindow <Object> ^ <CocoaRealize> [
+        ^self new setToolWindow: aWindow
+    ]
+
+    setToolWindow: aWindow <Object> ^ <CocoaRealize> [
+        toolWindow := aWindow.
+        controls := OrderedCollection new.
+        delegates := OrderedCollection new.
+        nsWin := nil.
+        ^self
+    ]
+
+    "── metrics ─────────────────────────────────────────────────────────
+
+     APPROXIMATE, AND SAID SO. The layout wants {charWidth. lineHeight} for a
+     proportional font, which has no single character width; measuring one
+     through the bridge would cost a main-thread crossing per string and buy
+     very little, because the layout uses the number only to decide how wide a
+     label wants to be. These are the numbers for the 12pt system font, and the
+     one place to change if text starts clipping.
+
+     8, NOT 7, AND THE FIRST SCREENSHOT IS WHY. At 7 the demo's heading came
+     out `A window made of` with `data` cut off: the layout multiplies ONE
+     charWidth by a string's length for every text node, so the widest glyphs
+     in the file set the number, and bold text is wider than the average
+     character it was averaged from. Erring high is free — there is no
+     stretch-to-fill, so an over-wide box is invisible, while an under-wide one
+     eats the end of a sentence."
+
+    fontSize ^ <Number> [ ^12.0 ]
+    metrics ^ <Array> [ ^AppSpecLayout metricsCharWidth: 8 lineHeight: 16 ]
+
+    clientWidth ^ <Integer> [ ^toolWindow width ]
+    clientHeight ^ <Integer> [ ^toolWindow height ]
+
+    "── the window ──────────────────────────────────────────────────────"
+
+    open ^ <Boolean> [
+        nsWin isNil ifTrue: [ self buildWindow ].
+        nsWin isNil ifTrue: [ ^false ].
+        nsWin onMain makeKeyAndOrderFront: nil.
+        ^true
+    ]
+
+    hide [
+        nsWin isNil ifFalse: [ nsWin onMain orderOut: nil ].
+        ^self
+    ]
+
+    isOpen ^ <Boolean> [
+        nsWin isNil ifTrue: [ ^false ].
+        ^nsWin onMain isVisible
+    ]
+
+    teardown [
+        self destroyControls.
+        nsWin isNil ifFalse: [
+            nsWin onMain orderOut: nil.
+            nsWin onMain setDelegate: nil ].
+        winDelegate := nil.
+        nsWin := nil.
+        content := nil.
+        ^self
+    ]
+
+    buildWindow [
+        | winClass |
+        winClass := Cocoa classNamed: 'NSWindow'.
+        "styleMask 7 = titled|closable|miniaturizable. No resizable bit: the
+         layout is computed for one width, and A3 is where a resize would
+         re-run it."
+        nsWin := ((winClass onMain alloc) onMain
+            initWithContentRect: (Array with: 340.0 with: 180.0
+                                        with: self clientWidth asFloat
+                                        with: self clientHeight asFloat)
+            styleMask: 7 backing: 2 defer: false).
+        nsWin onMain setReleasedWhenClosed: false.
+        nsWin onMain setTitle: toolWindow title.
+        "CLOSE IS HIDE, and the framework binds it so no tool can forget —
+         `windowShouldClose:` below answers false and hides instead."
+        winDelegate := MacvmDelegate windowDelegateOn: self.
+        nsWin onMain setDelegate: winDelegate.
+        content := nsWin onMain contentView.
+        content onMain setAutoresizesSubviews: true.
+        ^self
+    ]
+
+    "The C6 window-delegate callback. Answering false is what keeps the tool's
+     state alive across a close, which is the Mac's own choice and the
+     contract's `#closeRequested` default."
+    windowShouldClose: sender [
+        toolWindow closeRequested.
+        ^false
+    ]
+
+    "── placements -> frames ────────────────────────────────────────────"
+
+    "THE ONE PLACE THE COORDINATE SYSTEMS MEET."
+    rectFor: p <Array> ^ <Array> [
+        ^Array
+            with: (p at: 2) asFloat
+            with: (self clientHeight - (p at: 3) - (p at: 5)) asFloat
+            with: ((p at: 4) max: 1) asFloat
+            with: ((p at: 5) max: 1) asFloat
+    ]
+
+    "── build ───────────────────────────────────────────────────────────"
+
+    destroyControls [
+        controls do: [ :each | (each at: 1) onMain removeFromSuperview ].
+        controls := OrderedCollection new.
+        delegates := OrderedCollection new.
+        ^self
+    ]
+
+    "A placement is {node. x. y. w. h. kind}. The KIND says which of a node's
+     controls this is — its label, a card's title, or the control itself — and
+     keeping them apart here is what lets `applyNodeProps:` route a patch to
+     the right one later."
+    createFor: p <Array> [
+        | node kind view |
+        content isNil ifTrue: [ ^self ].
+        node := p at: 1.
+        kind := p at: 6.
+        kind == #label ifTrue: [
+            view := self makeLabel: ((node at: #label) ifNil: [ '' ]) rect: (self rectFor: p) ].
+        kind == #cardTitle ifTrue: [
+            view := self makeHeading: ((node at: #title) ifNil: [ '' ]) rect: (self rectFor: p) ].
+        kind == #control ifTrue: [
+            view := self makeControlFor: node rect: (self rectFor: p) ].
+        view isNil ifFalse: [
+            controls add: (Array with: view with: node with: kind) ].
+        ^self
+    ]
+
+    makeControlFor: node <AppNode> rect: rect <Array> ^ <Object> [
+        | t |
+        t := node type.
+        t == #text ifTrue: [ ^self makeLabel: ((node at: #text) ifNil: [ '' ]) rect: rect ].
+        t == #heading ifTrue: [ ^self makeHeading: ((node at: #text) ifNil: [ '' ]) rect: rect ].
+        t == #button ifTrue: [ ^self makeButton: node rect: rect ].
+        t == #input ifTrue: [ ^self makeInput: node rect: rect ].
+        t == #checkbox ifTrue: [ ^self makeCheckbox: node rect: rect ].
+        t == #divider ifTrue: [ ^self makeDivider: rect ].
+        t == #select ifTrue: [ ^self makeSelect: node rect: rect ].
+        "NOT YET REALIZED (A3): say so on screen. An unimplemented node that
+         drew nothing would look like a layout bug rather than a missing
+         feature, and the difference matters when someone else reads it."
+        ^self makeLabel: '[' , t printString , ' — A3]' rect: rect
+    ]
+
+    makeLabel: aString <String> rect: rect <Array> ^ <Object> [
+        | l |
+        l := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain initWithFrame: rect.
+        l onMain setEditable: false.
+        l onMain setBordered: false.
+        l onMain setDrawsBackground: false.
+        l onMain setSelectable: false.
+        l onMain setFont: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: self fontSize).
+        l onMain setStringValue: aString asString.
+        content onMain addSubview: l.
+        ^l
+    ]
+
+    "BOLD AT THE SAME SIZE, not larger. The layout measures every text node
+     with one charWidth, so a heading rendered a point bigger is a heading the
+     layout under-measured — weight alone reads as a heading and costs no extra
+     width the arithmetic does not know about."
+    makeHeading: aString <String> rect: rect <Array> ^ <Object> [
+        | l |
+        l := self makeLabel: aString rect: rect.
+        l onMain setFont:
+            ((Cocoa classNamed: 'NSFont') onMain boldSystemFontOfSize: self fontSize).
+        ^l
+    ]
+
+    "THE FRAME IS SET AFTER THE BOX TYPE, and the first screenshot is why: an
+     NSBox configured after construction re-derives its geometry from its
+     title and border, so a separator built at its final frame came out a dot
+     in the corner instead of a rule across the card. Type first, then frame."
+    makeDivider: rect <Array> ^ <Object> [
+        | box |
+        box := ((Cocoa classNamed: 'NSBox') onMain alloc) onMain initWithFrame: rect.
+        "NSBoxSeparator = 2."
+        box onMain setBoxType: 2.
+        box onMain setTitlePosition: 0.   "NSNoTitle"
+        box onMain setFrame:
+            (Array with: (rect at: 1) with: (rect at: 2) + ((rect at: 4) / 2.0)
+                   with: (rect at: 3) with: 1.0).
+        content onMain addSubview: box.
+        ^box
+    ]
+
+    makeButton: node <AppNode> rect: rect <Array> ^ <Object> [
+        | btn |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: ((node at: #text) ifNil: [ '' ]) asString.
+        btn onMain setBezelStyle: 1.
+        btn onMain setFont: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: self fontSize).
+        self wire: btn to: [ toolWindow dispatch: (node at: #event) value: nil ].
+        content onMain addSubview: btn.
+        ^btn
+    ]
+
+    makeInput: node <AppNode> rect: rect <Array> ^ <Object> [
+        | f |
+        f := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain initWithFrame: rect.
+        f onMain setFont: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: self fontSize).
+        f onMain setStringValue: ((node at: #value) ifNil: [ '' ]) asString.
+        "An NSTextField's action fires on Enter and on focus loss, which is the
+         Mac's own idiom; the contract's `every keystroke` is Win32's EN_CHANGE
+         and is not worth a text delegate per field here."
+        self wire: f to: [ toolWindow dispatch: (node at: #event) value: (f onMain stringValue) ].
+        content onMain addSubview: f.
+        ^f
+    ]
+
+    makeCheckbox: node <AppNode> rect: rect <Array> ^ <Object> [
+        | b |
+        b := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        "NSButtonTypeSwitch = 3. A checkbox draws its OWN title beside the box,
+         which is why the layout exempts it from the label rule — a STATIC
+         above it would render the word twice."
+        b onMain setButtonType: 3.
+        b onMain setTitle: ((node at: #label) ifNil: [ '' ]) asString.
+        b onMain setFont: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: self fontSize).
+        b onMain setState: ((node at: #checked) == true ifTrue: [ 1 ] ifFalse: [ 0 ]).
+        self wire: b to: [
+            toolWindow dispatch: (node at: #event)
+                       value: ((b onMain state) = 1) ].
+        content onMain addSubview: b.
+        ^b
+    ]
+
+    makeSelect: node <AppNode> rect: rect <Array> ^ <Object> [
+        | popup |
+        popup := ((Cocoa classNamed: 'NSPopUpButton') onMain alloc) onMain
+            initWithFrame: rect pullsDown: false.
+        popup onMain setFont: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: self fontSize).
+        self fill: popup from: node.
+        "A SELECTION CROSSES AS THE OPTION'S VALUE, never its text and never its
+         index — the value is what the spec said and what the handler will
+         compare against. `AppSpec optionValue:` is the one place that knows."
+        self wire: popup to: [
+            toolWindow dispatch: (node at: #event)
+                       value: (self valueChosenIn: popup from: node) ].
+        content onMain addSubview: popup.
+        ^popup
+    ]
+
+    fill: popup <Object> from: node <AppNode> [
+        | opts idx |
+        popup onMain removeAllItems.
+        opts := (node at: #options) ifNil: [ #() ].
+        opts do: [ :opt | popup onMain addItemWithTitle: (AppSpec optionText: opt) asString ].
+        idx := AppSpec indexOfValue: (node at: #value) in: opts.
+        idx < 0 ifTrue: [ ^self ].
+        popup onMain selectItemAtIndex: idx.
+        ^self
+    ]
+
+    valueChosenIn: popup <Object> from: node <AppNode> ^ <Object> [
+        | opts idx |
+        opts := (node at: #options) ifNil: [ #() ].
+        idx := popup onMain indexOfSelectedItem.
+        (idx < 0 or: [ idx >= opts size ]) ifTrue: [ ^nil ].
+        ^AppSpec optionValue: (opts at: idx + 1)
+    ]
+
+    "Every control gets its own zero-argument holder block, which is the
+     bridge's shape (`CocoaToolbarAction>>macvmAction:` answers `Block value`)
+     and is exactly what a realizer wants: the block closes over the node, so
+     there is no tag to look up and no table to keep in step."
+    wire: aControl <Object> to: aBlock <Object> [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        delegates add: delegate.
+        ^self
+    ]
+
+    "── patch ───────────────────────────────────────────────────────────"
+
+    applyWindowProps: changed <OrderedCollection> [
+        nsWin isNil ifTrue: [ ^self ].
+        changed do: [ :a |
+            a key == #title ifTrue: [ nsWin onMain setTitle: a value asString ] ].
+        ^self
+    ]
+
+    "EACH PROP GOES TO ITS OWN CONTROL. WINARMVM's realizer picked ONE control
+     for a patch's whole changed-list, and the bug that produced is worth
+     carrying the warning for: a slider's patch changes both its label and its
+     value, the label control won, the value went to a STATIC as a harmless
+     no-op, and the thumb stayed put — after which the poll read the stale
+     thumb and pushed the OLD value back into the document. The screen quietly
+     reverting the model, with nothing raising anywhere."
+    applyNodeProps: changed <OrderedCollection> to: nodeId <String> [
+        changed do: [ :a | self applyProp: a to: nodeId ].
+        ^self
+    ]
+
+    applyProp: a <Object> to: nodeId <String> [
+        | kind pair |
+        kind := a key == #title
+            ifTrue: [ #cardTitle ]
+            ifFalse: [ a key == #label ifTrue: [ #label ] ifFalse: [ #control ] ].
+        pair := self controlFor: nodeId kind: kind.
+        "A label that a node does not actually have (a checkbox's, which the
+         layout deliberately never places) simply has nowhere to go."
+        pair isNil ifTrue: [ ^self ].
+        self set: a on: (pair at: 1) node: (pair at: 2) kind: kind.
+        ^self
+    ]
+
+    set: a <Object> on: view <Object> node: node <AppNode> kind: aKind <Symbol> [
+        | t |
+        "A label and a card title are STATICs whatever their node is."
+        aKind == #control ifFalse: [ ^view onMain setStringValue: a value asString ].
+        t := node type.
+        a key == #text ifTrue: [
+            t == #button
+                ifTrue: [ ^view onMain setTitle: a value asString ]
+                ifFalse: [ ^view onMain setStringValue: a value asString ] ].
+        a key == #value ifTrue: [
+            t == #input ifTrue: [ ^view onMain setStringValue: a value asString ].
+            t == #select ifTrue: [ ^self fill: view from: node ].
+            ^self ].
+        a key == #checked ifTrue: [
+            ^view onMain setState: (a value == true ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+        a key == #options ifTrue: [
+            t == #select ifTrue: [ ^self fill: view from: node ].
+            ^self ].
+        ^self
+    ]
+
+    controlFor: nodeId <String> kind: aKind <Symbol> ^ <Object> [
+        controls do: [ :each |
+            (((each at: 2) idOrEmpty = nodeId) and: [ (each at: 3) == aKind ])
+                ifTrue: [ ^each ] ].
+        ^nil
+    ]
+
+    "Nothing to poll: a Cocoa control pushes its action when it changes, where
+     a Win32 trackbar has to be read on a heartbeat. A3's panes may want this."
+    tick [ ^self ]
+
+    "── for tests and for driving it ────────────────────────────────────"
+
+    controls ^ <OrderedCollection> [ ^controls ]
+    nsWindow ^ <Object> [ ^nsWin ]
+
+    placedIds ^ <OrderedCollection> [
+        | out |
+        out := OrderedCollection new.
+        controls do: [ :each |
+            ((each at: 3) == #control) ifTrue: [ out add: (each at: 2) idOrEmpty ] ].
+        ^out
+    ]
+
+    "What a control actually SHOWS, read back from AppKit — the only honest way
+     to assert that a patch reached the screen rather than merely the model."
+    shownTextFor: nodeId <String> ^ <Object> [
+        | pair view |
+        pair := self controlFor: nodeId kind: #control.
+        pair isNil ifTrue: [ ^nil ].
+        view := pair at: 1.
+        ((pair at: 2) type == #button)
+            ifTrue: [ ^view onMain title ]
+            ifFalse: [ ^view onMain stringValue ]
+    ]
+]
+
+"NO TRAILING DOIT INSTALLS THIS, deliberately. `AppToolWindow class >>
+ realizerClass` resolves this class BY NAME the first time a window needs it,
+ because the GUI boots its VMs from the image and image boot replays only a
+ two-entry WORLD_DOITS list — a `realizerClass: CocoaRealize.` line here would
+ load, look right, and never run. Merely being in cocoaui.list is therefore
+ the whole installation: this file exists in the UI worker's world, so the UI
+ worker draws, and every VM without it keeps the null realizer."

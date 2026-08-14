@@ -274,4 +274,24 @@ TestCase subclass: AppSpecLayoutTests [
         self assert: (self wOf: a) equals: 48 description: 'natural width'.
         self assert: (self xOf: b) equals: 76 description: 'the same 76 as before'.
     ]
+
+    "A DIVIDER IS PLACED AT ITS FULL WIDTH, which the vendored source got
+     wrong and only a realizer could show. `measure:` answers a divider's full
+     width and returns before `measureControl:`, but `place:` records the rect
+     that measureControl: answers — and with no divider case there it fell
+     through to `the width of my #text prop`, which a divider has none of. So
+     every divider was placed ONE PIXEL WIDE: invisible on Win32, and a dot in
+     the corner the moment Cocoa drew it (frame read back as {16, 776, 1, 1}).
+     Pinned at the WIDTH, because that is the number that was wrong."
+    testADividerIsPlacedAcrossTheFullWidth [
+        | places d |
+        places := self place: (AppSpec stack: {
+            AppSpec text: 'above' id: #a.
+            AppSpec divider: #rule.
+            AppSpec text: 'below' id: #b } id: #root).
+        d := self in: places find: 'rule' kind: #control.
+        self assert: d isNil not description: 'the divider was placed at all'.
+        self assert: (self wOf: d) > 100
+             description: 'a divider spans its container, not one pixel'.
+    ]
 ]

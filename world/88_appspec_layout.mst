@@ -100,6 +100,18 @@ Object subclass: AppSpecLayout [
         t := aNode type.
         lh := self lineHeightIn: m.
         tw := self textWidth: (aNode at: #text) in: m.
+        "A DIVIDER, WHICH THE VENDORED SOURCE MISSES — the second divergence,
+         and a genuine bug rather than a port artifact. `measure:` answers a
+         divider's full width above and returns before reaching here, but
+         `place:` asks measureControl: for the RECT it records, and with no
+         case here a divider fell through to the default `textWidth of #text`
+         — which a divider does not have. So every divider was placed ONE
+         PIXEL WIDE. It is invisible on Win32 for the same reason it was
+         invisible in review (a 1px separator against a 1px separator), and it
+         showed here the moment a realizer drew it: a dot in the corner
+         instead of a rule across the card. Measured, not guessed — the frame
+         read back as {16, 776, 1, 1}. Carry back to WINARMVM."
+        t == #divider ifTrue: [ ^Array with: maxW with: self dividerHeight ].
         t == #text ifTrue: [ ^Array with: (tw min: maxW) with: lh ].
         t == #heading ifTrue: [ ^Array with: (tw min: maxW) with: lh + 4 ].
         t == #button ifTrue: [ ^Array with: ((tw + 28) min: maxW) with: lh + 16 ].

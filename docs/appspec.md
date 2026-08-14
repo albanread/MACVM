@@ -208,11 +208,23 @@ Spec → live AppKit tree. Builds on what already exists:
 | event transport | the C4/C6 bridge callbacks, main-thread drain |
 | theme / font / DPI | the shell's own, already broadcast |
 
-**The Y-flip is solved once, in the host view.** Layout answers top-left rects;
-an unflipped `NSView` is bottom-left. Rather than flipping arithmetic at every call
-site (and diverging from the vendored pure file), the realizer hosts every window's
-content in a **flipped container view** (`isFlipped` → true), so layout rects apply
-1:1. This is why the vendored layout needs no Mac-specific edit.
+**The Y-flip is solved once, in `createFor:`.** Layout answers top-left rects; an
+unflipped `NSView` is bottom-left.
+
+*Corrected after surveying the bridge, and recorded rather than quietly changed.*
+This section first specified a **flipped container view** (`isFlipped` → true). The
+bridge cannot mint one: `MacvmDelegate` registers a fixed family of per-role ObjC
+classes (`#window`, `#text`, `#table`, `#outline`, `#mouseview`, `#action`,
+`#toolbar` — `world/65_cocoadelegate.mst`), and none of them is a flipped view, nor
+can the world define an ObjC subclass overriding `isFlipped`. So the realizer flips
+in the one place that converts a placement into a rect:
+`y_cocoa = clientHeight - y_top - h`.
+
+This is what the codebase already does everywhere else (`cocoa_gui/src/canvas.rs:324`
+flips every y for the same reason; `76_spriteed.mst:179` flips its sprite row), so it
+is house practice rather than a workaround. What matters for portability is unchanged:
+the flip is confined to the realizer, and **the vendored layout still needs no
+Mac-specific edit.**
 
 ### 5.5 Naming, and the compatibility shims
 
@@ -267,6 +279,20 @@ abandoning the framework.
    caller stores the result as a pixel count and none does Integer-only arithmetic
    on it. Worth carrying back to WINARMVM, whose own suite never ran this check on
    its winui files — they were platform-gated to `#windows`.
+
+   **A second divergence, found by A2 and also a real bug.** `measureControl:` had
+   no `#divider` case. `measure:` answers a divider's full width and returns before
+   reaching it, but `place:` records the rect that `measureControl:` answers — so a
+   divider fell through to "the width of my `#text` prop", which a divider does not
+   have, and **every divider was placed one pixel wide**. Invisible on Win32 (a 1px
+   separator against a 1px separator) and invisible in review; it showed the instant
+   a realizer drew it, as a dot in the corner instead of a rule across the card, with
+   the frame reading back `{16, 776, 1, 1}`. Fixed in the layout and pinned by
+   `testADividerIsPlacedAcrossTheFullWidth`, which was verified to fail without the
+   fix. Carry back to WINARMVM.
+
+   Both divergences are the same shape and worth stating as a lesson: **the value of
+   a second realizer is that it re-asks every question the first one answered.**
 6. **Blast vs patch, scoped rather than repealed.** The house law is
    "VM-owned GUI views send WHOLE state each change, never incremental deltas". That
    stands for VM-owned pixel and state views — GamePane, Canvas, the metrics beat.
