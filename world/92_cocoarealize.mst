@@ -36,7 +36,7 @@
  wrong on screen, never invisibly absent."
 
 Object subclass: CocoaRealize [
-    | toolWindow nsWin content controls delegates winDelegate |
+    | toolWindow nsWin content controls delegates winDelegate panes |
 
     CocoaRealize class >> newFor: aWindow <Object> ^ <CocoaRealize> [
         ^self new setToolWindow: aWindow
@@ -46,6 +46,7 @@ Object subclass: CocoaRealize [
         toolWindow := aWindow.
         controls := OrderedCollection new.
         delegates := OrderedCollection new.
+        panes := Dictionary new.
         nsWin := nil.
         ^self
     ]
@@ -146,11 +147,24 @@ Object subclass: CocoaRealize [
 
     "── build ───────────────────────────────────────────────────────────"
 
+    "THE SURFACES GO WITH THE VIEWS. A rebuild replaces the pane views, so a
+     plane still registered against a dead one is a leak the tool cannot see
+     and cannot free — this is the realizer keeping its promise to own every
+     native lifetime."
     destroyControls [
         controls do: [ :each | (each at: 1) onMain removeFromSuperview ].
+        panes do: [ :h | AppSurfaces remove: h ].
+        panes := Dictionary new.
         controls := OrderedCollection new.
         delegates := OrderedCollection new.
         ^self
+    ]
+
+    "The surface handle a pane node was realized into — what a tool passes to
+     AppPixels/AppRender. 0 when there is no such pane, which the pixel verbs
+     treat as `nothing to draw on` rather than as an error."
+    paneHandleFor: nodeId <Object> ^ <Integer> [
+        ^panes at: nodeId asString ifAbsent: [ 0 ]
     ]
 
     "A placement is {node. x. y. w. h. kind}. The KIND says which of a node's
@@ -183,10 +197,106 @@ Object subclass: CocoaRealize [
         t == #checkbox ifTrue: [ ^self makeCheckbox: node rect: rect ].
         t == #divider ifTrue: [ ^self makeDivider: rect ].
         t == #select ifTrue: [ ^self makeSelect: node rect: rect ].
-        "NOT YET REALIZED (A3): say so on screen. An unimplemented node that
-         drew nothing would look like a layout bug rather than a missing
-         feature, and the difference matters when someone else reads it."
-        ^self makeLabel: '[' , t printString , ' — A3]' rect: rect
+        t == #slider ifTrue: [ ^self makeSlider: node rect: rect ].
+        t == #rgbaPane ifTrue: [ ^self makePane: node rect: rect ].
+        "NOT YET REALIZED: say so on screen. An unimplemented node that drew
+         nothing would look like a layout bug rather than a missing feature,
+         and the difference matters when someone else reads it. `listBox`
+         wants a real NSTableView in a scroll view; `indexedPane` and
+         `textGrid` want the palette and cell-grid semantics their Windows
+         shaders have. None of the three blocks A4 — the sprite editor's two
+         surfaces are BOTH rgbaPane, and the sound editor's controls are
+         sliders."
+        ^self makeLabel: '[' , t printString , ' — not yet]' rect: rect
+    ]
+
+    "A CONTINUOUS SLIDER, which is the Mac's own idiom and simpler than the
+     contract's. Win32 has to POLL a trackbar on a heartbeat because WM_HSCROLL
+     is not on its door's allowlist; an NSSlider pushes its action as it moves,
+     so `tick` stays empty and a drag relabels live."
+    makeSlider: node <AppNode> rect: rect <Array> ^ <Object> [
+        | s |
+        s := ((Cocoa classNamed: 'NSSlider') onMain alloc) onMain initWithFrame: rect.
+        s onMain setMinValue: ((node at: #min) ifNil: [ 0 ]) asFloat.
+        s onMain setMaxValue: ((node at: #max) ifNil: [ 100 ]) asFloat.
+        s onMain setDoubleValue: ((node at: #value) ifNil: [ 0 ]) asFloat.
+        s onMain setContinuous: true.
+        "THE VALUE CROSSES AS AN INTEGER. The contract's sliders carry integer
+         positions (a Win32 trackbar cannot carry anything else), and every
+         tool written against it converts with its own pure position<->value
+         pair — handing over a Float here would land in that arithmetic and
+         come back as a value the document never offered."
+        self wire: s to: [
+            toolWindow dispatch: (node at: #event)
+                       value: (s onMain doubleValue) rounded ].
+        content onMain addSubview: s.
+        ^s
+    ]
+
+    "── panes ───────────────────────────────────────────────────────────
+
+     A pane is a MacvmMouseView (an NSImageView subclass whose mouse overrides
+     dispatch into the world — the role the sprite editor already uses, chosen
+     because world-minted gesture recognizers never fire) plus a retained RGBA
+     plane in `AppSurfaces`. The tool writes pixels through AppPixels and says
+     `AppRender present:`; nothing in the tool names a view."
+    makePane: node <AppNode> rect: rect <Array> ^ <Object> [
+        | view w h handle |
+        w := ((node at: #width) ifNil: [ 320 ]) rounded max: 1.
+        h := ((node at: #height) ifNil: [ 180 ]) rounded max: 1.
+        view := MacvmDelegate mouseViewOn:
+            (CocoaMouseHandler on: [ :ev | self paneMouse: ev node: node view: view height: h ]).
+        view onMain setFrame: rect.
+        "NSImageScaleNone: the blast is already at view size, pixel for pixel."
+        view onMain setImageScaling: 2.
+        content onMain addSubview: view.
+        handle := AppSurfaces register: w height: h present: [ :surface |
+            self blast: surface to: view ].
+        panes at: node idOrEmpty put: handle.
+        ^view
+    ]
+
+    "BGRA IN THE PLANE, RGBA ON THE WIRE. The plane's byte order is Windows'
+     so that a tool's `bgraR:g:b:` arithmetic is identical on both platforms
+     (see world/93_apppixels.mst); the canvas host verb wants RGBA, so the
+     shuffle happens HERE, once per present, in the one place that is allowed
+     to know about either."
+    blast: surface <Object> to: view <Object> [
+        | plane out n |
+        plane := surface plane.
+        plane isNil ifTrue: [ ^self ].
+        n := plane size.
+        out := ByteArray new: n.
+        0 to: n - 4 by: 4 do: [ :i |
+            out at: i + 1 put: (plane at: i + 3).   "R <- byte 3"
+            out at: i + 2 put: (plane at: i + 2).   "G"
+            out at: i + 3 put: (plane at: i + 1).   "B <- byte 1"
+            out at: i + 4 put: (plane at: i + 4) ].
+        CocoaBrowser hostService onMain
+            showCanvasPixelsOn: view base64: (Base64 encode: out)
+            width: surface width printString
+            height: surface height printString.
+        ^self
+    ]
+
+    "A PANE'S POINT ARRIVES IN THE PANE'S OWN PIXELS, TOP-LEFT — the same
+     space `invalidatePane:rect:` speaks, which is what lets a handler say
+     `I touched this cell` in the coordinates it was just handed. AppKit
+     gives it bottom-left, so the flip happens here."
+    paneMouse: ev <Object> node: node <AppNode> view: aView height: h <Integer> [
+        | pt x y |
+        pt := self viewPoint: ev in: aView.
+        x := (pt at: 1) asInteger.
+        y := h - 1 - (pt at: 2) asInteger.
+        ^toolWindow dispatch: (node at: #event) value: (Array with: x with: y)
+    ]
+
+    viewPoint: ev <Object> in: aView <Object> ^ <Array> [
+        | wp |
+        wp := ev send: 'locationInWindow' args: (Array new: 0) ret: #point.
+        ^aView send: 'convertPoint:fromView:'
+               args: (Array with: (wp at: 1) with: (wp at: 2) with: nil)
+               ret: #point
     ]
 
     makeLabel: aString <String> rect: rect <Array> ^ <Object> [
@@ -351,6 +461,16 @@ Object subclass: CocoaRealize [
         "A label that a node does not actually have (a checkbox's, which the
          layout deliberately never places) simply has nowhere to go."
         pair isNil ifTrue: [ ^self ].
+        "THE STORED NODE IS BROUGHT UP TO DATE FIRST, and a screenshot is why.
+         `controls` holds the node as it was when the control was CREATED, and
+         most props are applied straight from the patch — but a choice control
+         is refilled FROM ITS NODE, because a selection is an index into that
+         node's options. Reading the stale node meant the demo's colour popup
+         still said `Red` after the model had moved to Blue: the patch arrived,
+         the control was refilled, and it was refilled with yesterday's answer.
+         Keeping the stored node in step is the realizer's half of the host-echo
+         rule — what it holds must match what is on screen."
+        (pair at: 2) at: a key put: a value.
         self set: a on: (pair at: 1) node: (pair at: 2) kind: kind.
         ^self
     ]

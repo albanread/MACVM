@@ -1,0 +1,178 @@
+"91a_appdemopane.mst — AppSpec A3's proof: a pane, its clicks, and its damage.
+
+ `docs/appspec.md`. The demo tool of A2 proved the CONTROL half of the loop —
+ a click patches one caption in place. This proves the other half, which is
+ the one every real tool needs: a surface the tool draws into, clicks that
+ arrive in the surface's own pixels, and a repaint that touches only what
+ changed.
+
+ IT IS THE SPRITE EDITOR IN MINIATURE, deliberately. Cells outside, pixels
+ inside; a click paints ONE cell and invalidates ONE cell; Clear invalidates
+ the whole pane because its reach is total. That is the shape A4's editors
+ already have, so if this works they should, and if it does not, this is a
+ forty-line file to debug instead of a seven-hundred-line one.
+
+ THE DRAWING IS PORTABLE. `AppPixels planeFor:…`, `AppPixels bgraR:g:b:`,
+ `AppPixels at:x:y:stride:put:`, `AppRender present:` — the same four
+ sentences WINARMVM's sprite editor writes, which is the whole reason they are
+ spelled that way. Nothing here names AppKit, Win32, an NSView or an hwnd."
+
+Object subclass: AppDemoPane [
+    <classVars: Cells Colour Painted>
+
+    AppDemoPane class >> gridN ^ <Integer> [ ^16 ]
+    AppDemoPane class >> cellSize ^ <Integer> [ ^18 ]
+    AppDemoPane class >> paneSize ^ <Integer> [ ^self gridN * self cellSize ]
+
+    "The model: a flat array of palette indices, 0 = empty."
+    AppDemoPane class >> cells ^ <Array> [
+        Cells isNil ifTrue: [ self clearCells ].
+        ^Cells
+    ]
+
+    AppDemoPane class >> clearCells [
+        Cells := Array new: self gridN * self gridN.
+        1 to: Cells size do: [ :i | Cells at: i put: 0 ].
+        ^self
+    ]
+
+    AppDemoPane class >> painted ^ <Integer> [ ^Painted isNil ifTrue: [ 0 ] ifFalse: [ Painted ] ]
+    AppDemoPane class >> colour ^ <Integer> [ ^Colour isNil ifTrue: [ 1 ] ifFalse: [ Colour ] ]
+
+    AppDemoPane class >> colourOptions ^ <Array> [
+        ^Array
+            with: (Association key: 1 value: 'Red')
+            with: (Association key: 2 value: 'Green')
+            with: (Association key: 3 value: 'Blue')
+    ]
+
+    "Palette entry as {r. g. b}."
+    AppDemoPane class >> rgbFor: i <Integer> ^ <Array> [
+        i = 1 ifTrue: [ ^Array with: 220 with: 60 with: 60 ].
+        i = 2 ifTrue: [ ^Array with: 60 with: 200 with: 90 ].
+        i = 3 ifTrue: [ ^Array with: 70 with: 130 with: 230 ].
+        ^Array with: 58 with: 58 with: 64
+    ]
+
+    "A palette index as the packed word the plane holds — one place, so a test
+     can say what it expects to SEE without repeating the packing."
+    AppDemoPane class >> bgraOf: i <Integer> ^ <Integer> [
+        | rgb |
+        rgb := self rgbFor: i.
+        ^AppPixels bgraR: (rgb at: 1) g: (rgb at: 2) b: (rgb at: 3)
+    ]
+
+    AppDemoPane class >> atX: x <Integer> y: y <Integer> ^ <Integer> [
+        (x < 0 or: [ y < 0 or: [ x >= self gridN or: [ y >= self gridN ] ] ])
+            ifTrue: [ ^0 ].
+        ^self cells at: (y * self gridN) + x + 1
+    ]
+
+    AppDemoPane class >> atX: x <Integer> y: y <Integer> put: v <Integer> [
+        (x < 0 or: [ y < 0 or: [ x >= self gridN or: [ y >= self gridN ] ] ])
+            ifTrue: [ ^self ].
+        self cells at: (y * self gridN) + x + 1 put: v.
+        ^self
+    ]
+
+    "── the spec ────────────────────────────────────────────────────────"
+
+    AppDemoPane class >> spec ^ <AppNode> [
+        ^AppSpec window: 'Pane Demo' id: #paneWin body: (AppSpec stack: {
+            AppSpec heading: 'A pane, drawn by the tool' id: #head.
+            AppSpec rgbaPane: #grid width: self paneSize height: self paneSize.
+            AppSpec row: {
+                AppSpec button: 'Clear' event: #clear id: #clearBtn } id: #verbs.
+            AppSpec select: 'Colour' value: self colour
+                    options: self colourOptions event: #colour id: #colourPick.
+            AppSpec text: 'cells painted: ' , self painted printString id: #paintedText.
+            AppSpec text: 'patches: ' , AppToolWindow patchCount printString
+                    , '   rebuilds: ' , AppToolWindow rebuildCount printString
+                    id: #counts
+        } id: #root)
+    ]
+
+    "── the handler ─────────────────────────────────────────────────────
+
+     A CLICK INVALIDATES ONE CELL. The point arrives in the pane's own pixels,
+     which is the same space the damage rect is written in — so `the cell I
+     touched` is one division away, and the repaint that follows costs one
+     cell rather than the whole grid."
+    AppDemoPane class >> handle: event <Symbol> value: value <Object> in: tool <Object> [
+        | cx cy |
+        event == #clear ifTrue: [
+            self clearCells.
+            Painted := 0.
+            "Total reach, so the whole pane — this is the case damage exists
+             to distinguish, not the one it optimises."
+            tool invalidatePane: #grid.
+            ^self ].
+        event == #colour ifTrue: [ Colour := value. ^self ].
+        event == #grid ifTrue: [
+            cx := (value at: 1) // self cellSize.
+            cy := (value at: 2) // self cellSize.
+            (self atX: cx y: cy) = self colour ifTrue: [
+                "Nothing changed, so nothing is invalidated and nothing paints."
+                ^self ].
+            self atX: cx y: cy put: self colour.
+            Painted := self painted + 1.
+            tool invalidatePane: #grid
+                 rect: (Array with: cx * self cellSize with: cy * self cellSize
+                              with: self cellSize with: self cellSize) ].
+        ^self
+    ]
+
+    "── the paint block ─────────────────────────────────────────────────
+
+     CELLS OUTSIDE, PIXELS INSIDE — the sprite editor's own lesson, which it
+     learned by asking its document once per DEVICE PIXEL and watching the
+     door decline clicks while the VM was busy. Only the damaged cells are
+     touched at all."
+    AppDemoPane class >> paint: paneId <Object> damage: region <Object> in: tool <Object> [
+        | handle plane stride n cell x0 y0 x1 y1 rgb word |
+        paneId asString = 'grid' ifFalse: [ ^self ].
+        handle := tool paneHandle: #grid.
+        handle = 0 ifTrue: [ ^self ].
+        n := self gridN.
+        cell := self cellSize.
+        plane := AppPixels planeFor: handle width: self paneSize height: self paneSize.
+        stride := AppPixels strideFor: handle.
+        x0 := 0. y0 := 0. x1 := n - 1. y1 := n - 1.
+        region isNil ifFalse: [
+            x0 := ((region at: 1) // cell) max: 0.
+            y0 := ((region at: 2) // cell) max: 0.
+            x1 := (((region at: 1) + (region at: 3) - 1) // cell) min: n - 1.
+            y1 := (((region at: 2) + (region at: 4) - 1) // cell) min: n - 1 ].
+        y0 to: y1 do: [ :cy |
+            x0 to: x1 do: [ :cx |
+                rgb := self rgbFor: (self atX: cx y: cy).
+                word := AppPixels bgraR: (rgb at: 1) g: (rgb at: 2) b: (rgb at: 3).
+                0 to: cell - 1 do: [ :py |
+                    0 to: cell - 1 do: [ :px |
+                        "A one-pixel lattice on each cell's left and top edge,
+                         so the grid reads as cells rather than as a blur."
+                        AppPixels at: plane
+                                  x: (cx * cell) + px y: (cy * cell) + py
+                                  stride: stride
+                                  put: ((px = 0 or: [ py = 0 ])
+                                        ifTrue: [ AppPixels bgraR: 40 g: 40 b: 44 ]
+                                        ifFalse: [ word ]) ] ] ] ].
+        AppRender present: handle.
+        ^self
+    ]
+
+    "── registration ────────────────────────────────────────────────────"
+
+    AppDemoPane class >> install [
+        AppToolWindow
+            register: #panedemo title: 'Pane Demo' width: 360 height: 520
+            render: [ AppDemoPane spec ]
+            handler: [ :event :value |
+                AppDemoPane handle: event value: value
+                            in: (AppToolWindow named: #panedemo).
+                (AppToolWindow named: #panedemo) rerender ]
+            paint: [ :tool :paneId :region |
+                AppDemoPane paint: paneId damage: region in: tool ].
+        ^self
+    ]
+]

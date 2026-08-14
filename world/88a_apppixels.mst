@@ -1,0 +1,195 @@
+"93_apppixels.mst — AppSpec A3: a pane's pixels, portably.
+
+ `docs/appspec.md`. A pane is the one node whose contents no diff can carry:
+ its props say where it is and how big, and everything INSIDE it is pixels the
+ tool computes. So the tool needs a way to write them, and that way has to be
+ the same sentence on both platforms or the portability claim stops at the
+ first tool that draws — which is every interesting one.
+
+ THE SHAPE IS WINARMVM'S, because a shape already in use by a working tool
+ beats a nicer one invented here. Its sprite editor says:
+
+     base := WinPixels planeFor: hwnd width: gw height: gh.
+     stride := WinPixels strideFor: hwnd.
+     WinPixels at: base x: px y: py stride: stride put:
+         (WinPixels bgraR: r g: g b: b).
+     WinRender present: hwnd.
+
+ so `AppPixels` and `AppRender` answer exactly those, and
+ `world/90_appspec_compat.mst` aliases the Win names onto them. A tool written
+ against either name draws on both platforms.
+
+ WHAT IS PORTABLE AND WHAT IS NOT. The PLANE is portable: a ByteArray of
+ 32-bit pixels the tool pokes, retained between paints so a partial repaint is
+ sound rather than merely fast. PRESENTING it is not, so a realizer hands this
+ registry a block that knows how to get bytes onto its own screen — a base64
+ blast through the canvas host verb here, a D3D11 present there. Nothing in
+ this file mentions either.
+
+ BGRA, NOT RGBA, and it is worth being explicit because the name of the
+ selector is the only warning: `bgraR:g:b:` packs a word in the order Windows'
+ own plane wants. The Mac's presenter unpacks it back to RGBA on its way out,
+ which costs one shuffle per pixel in the blast and keeps every TOOL's
+ arithmetic identical across the family. The alternative — two spellings of
+ `bgraR:g:b:` — would put a per-platform branch inside every tool that draws,
+ which is exactly what this framework exists to remove."
+
+Object subclass: AppSurface [
+    | handle width height plane presenter |
+
+    AppSurface class >> handle: h <Integer> width: w <Integer> height: hh <Integer>
+                        present: aBlock <Object> ^ <AppSurface> [
+        ^self new setHandle: h width: w height: hh present: aBlock
+    ]
+
+    setHandle: h <Integer> width: w <Integer> height: hh <Integer>
+    present: aBlock <Object> ^ <AppSurface> [
+        handle := h.
+        presenter := aBlock.
+        ^self resizeTo: w height: hh
+    ]
+
+    "THE PLANE IS RETAINED between paints — that is the fact that makes a
+     damage rect sound. Reallocated only when the size actually changes,
+     because a fresh buffer would silently discard everything outside the
+     damaged region and turn a partial repaint into a mostly-blank one."
+    resizeTo: w <Integer> height: hh <Integer> ^ <AppSurface> [
+        (plane isNil or: [ width ~= w or: [ height ~= hh ] ]) ifTrue: [
+            width := w max: 1.
+            height := hh max: 1.
+            plane := ByteArray new: width * height * 4 ].
+        ^self
+    ]
+
+    handle ^ <Integer> [ ^handle ]
+    width ^ <Integer> [ ^width ]
+    height ^ <Integer> [ ^height ]
+    plane ^ <ByteArray> [ ^plane ]
+    present [ presenter isNil ifFalse: [ presenter value: self ]. ^self ]
+]
+
+"The handle -> surface map. A realizer fills it in as it creates panes; a tool
+ reaches it only through AppPixels/AppRender, and by handle, so nothing above
+ this line has to know which realizer made the pane."
+Object subclass: AppSurfaces [
+    <classVars: Surfaces NextHandle>
+
+    AppSurfaces class >> all ^ <Dictionary> [
+        Surfaces isNil ifTrue: [ Surfaces := Dictionary new ].
+        ^Surfaces
+    ]
+
+    AppSurfaces class >> nextHandle ^ <Integer> [
+        NextHandle isNil ifTrue: [ NextHandle := 0 ].
+        NextHandle := NextHandle + 1.
+        ^NextHandle
+    ]
+
+    AppSurfaces class >> register: w <Integer> height: h <Integer> present: aBlock <Object> ^ <Integer> [
+        | handle |
+        handle := self nextHandle.
+        self all at: handle put:
+            (AppSurface handle: handle width: w height: h present: aBlock).
+        ^handle
+    ]
+
+    AppSurfaces class >> at: handle <Integer> ^ <Object> [
+        ^self all at: handle ifAbsent: [ nil ]
+    ]
+
+    AppSurfaces class >> remove: handle <Integer> [
+        self all removeKey: handle ifAbsent: [ nil ].
+        ^self
+    ]
+
+    AppSurfaces class >> reset [ Surfaces := nil. NextHandle := nil. ^self ]
+]
+
+"The tool-facing pixel verbs. Class-side and handle-keyed, exactly as
+ WINARMVM's are, so a tool's drawing loop is the same text on both platforms."
+Object subclass: AppPixels [
+
+    "Answer the plane to poke, sized to what the caller expects. A pane whose
+     node changed size gets a new buffer here rather than at creation, which
+     is how a tool that recomputes its own geometry stays correct."
+    AppPixels class >> planeFor: handle <Integer> width: w <Integer> height: h <Integer> ^ <Object> [
+        | s |
+        s := AppSurfaces at: handle.
+        s isNil ifTrue: [ ^nil ].
+        s resizeTo: w height: h.
+        ^s plane
+    ]
+
+    AppPixels class >> strideFor: handle <Integer> ^ <Integer> [
+        | s |
+        s := AppSurfaces at: handle.
+        s isNil ifTrue: [ ^0 ].
+        ^s width * 4
+    ]
+
+    "A pixel as one 32-bit word, B G R A in ascending byte order — Windows'
+     own plane order, kept so a tool's constants never need translating."
+    AppPixels class >> bgraR: r <Integer> g: g <Integer> b: b <Integer> ^ <Integer> [
+        ^(b bitAnd: 255)
+            + ((g bitAnd: 255) bitShift: 8)
+            + ((r bitAnd: 255) bitShift: 16)
+            + (255 bitShift: 24)
+    ]
+
+    "Write one word. Out-of-bounds is IGNORED rather than raised: a paint
+     block runs inside an event, and a tool that miscomputes one edge pixel
+     should draw the other 65,535 rather than take the window down."
+    AppPixels class >> at: plane <Object> x: x <Integer> y: y <Integer>
+                       stride: stride <Integer> put: word <Integer> [
+        | i |
+        plane isNil ifTrue: [ ^self ].
+        (x < 0 or: [ y < 0 ]) ifTrue: [ ^self ].
+        i := (y * stride) + (x * 4).
+        (i < 0 or: [ i + 4 > plane size ]) ifTrue: [ ^self ].
+        plane at: i + 1 put: (word bitAnd: 255).
+        plane at: i + 2 put: ((word bitShift: -8) bitAnd: 255).
+        plane at: i + 3 put: ((word bitShift: -16) bitAnd: 255).
+        plane at: i + 4 put: ((word bitShift: -24) bitAnd: 255).
+        ^self
+    ]
+
+    "Read one back — for tests, which is the only honest way to assert that a
+     paint block wrote what it meant to without looking at a screenshot."
+    AppPixels class >> at: plane <Object> x: x <Integer> y: y <Integer>
+                       stride: stride <Integer> ^ <Integer> [
+        | i |
+        plane isNil ifTrue: [ ^0 ].
+        i := (y * stride) + (x * 4).
+        (i < 0 or: [ i + 4 > plane size ]) ifTrue: [ ^0 ].
+        ^(plane at: i + 1)
+            + ((plane at: i + 2) bitShift: 8)
+            + ((plane at: i + 3) bitShift: 16)
+            + ((plane at: i + 4) bitShift: 24)
+    ]
+]
+
+"Getting a plane onto the screen. One verb that matters, and the realizer
+ supplied the block that performs it."
+Object subclass: AppRender [
+
+    AppRender class >> present: handle <Integer> [
+        | s |
+        s := AppSurfaces at: handle.
+        s isNil ifTrue: [ ^self ].
+        s present.
+        ^self
+    ]
+
+    "A pane's size, for a tool that wants to fit its drawing to it."
+    AppRender class >> widthFor: handle <Integer> ^ <Integer> [
+        | s |
+        s := AppSurfaces at: handle.
+        ^s isNil ifTrue: [ 0 ] ifFalse: [ s width ]
+    ]
+
+    AppRender class >> heightFor: handle <Integer> ^ <Integer> [
+        | s |
+        s := AppSurfaces at: handle.
+        ^s isNil ifTrue: [ 0 ] ifFalse: [ s height ]
+    ]
+]

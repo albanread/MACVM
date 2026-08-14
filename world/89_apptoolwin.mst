@@ -23,6 +23,18 @@
      createFor: aPlacement    {node. x. y. w. h. kind} -> one native control
      applyNodeProps: c to: id patch one node's changed props in place
      applyWindowProps: c      patch the window's own props (title, so far)
+     paneHandleFor: id        the surface handle a pane node was realized into
+
+ ONE OBLIGATION THAT IS EASY TO MISS, written here because it cost a bug in
+ the first realizer and will cost one in the next: whatever a realizer holds
+ to represent a node must be BROUGHT UP TO DATE as it applies a patch. Most
+ props are set straight from the patch and it does not matter, but a choice
+ control is refilled from its NODE (a selection is an index into that node's
+ options), so a realizer that kept the node it was handed at creation time
+ refills with yesterday's answer — the demo's colour popup still reading `Red`
+ after the model had moved to Blue, with the patch correct and the screen
+ wrong. It is the realizer's half of the host-echo rule: what it holds must
+ match what is on screen.
 
  THE AUTHOR OF A TOOL SEES NONE OF THAT. A tool is a title, a block that
  answers a spec and a block that handles an event — no window code, no control
@@ -52,7 +64,7 @@
  a test about a differ wants: `one click produced one setNodeProps naming
  clicks` is a statement about the ops, and needs no window to be true."
 Object subclass: AppNullRealizer [
-    | window open placements patches windowPatches |
+    | window open placements patches windowPatches panes |
 
     AppNullRealizer class >> newFor: aWindow <Object> ^ <AppNullRealizer> [
         ^self new setWindow: aWindow
@@ -64,6 +76,7 @@ Object subclass: AppNullRealizer [
         placements := OrderedCollection new.
         patches := OrderedCollection new.
         windowPatches := OrderedCollection new.
+        panes := Dictionary new.
         ^self
     ]
 
@@ -80,9 +93,33 @@ Object subclass: AppNullRealizer [
     metrics ^ <Array> [ ^AppSpecLayout metricsCharWidth: 8 lineHeight: 16 ]
     clientWidth ^ <Integer> [ ^window width ]
 
-    destroyControls [ placements := OrderedCollection new. ^self ]
+    destroyControls [
+        panes do: [ :h | AppSurfaces remove: h ].
+        panes := Dictionary new.
+        placements := OrderedCollection new.
+        ^self
+    ]
 
-    createFor: aPlacement <Array> [ placements add: aPlacement. ^self ]
+    createFor: aPlacement <Array> [
+        | node w h |
+        placements add: aPlacement.
+        "A PANE GETS A REAL SURFACE EVEN HEADLESS, with a present that does
+         nothing. That is what lets a paint block — the part of a tool most
+         likely to be wrong — be driven and its pixels READ BACK in a test,
+         with no window anywhere."
+        node := aPlacement at: 1.
+        ((aPlacement at: 6) == #control
+            and: [ AppSpec paneTypes includes: node type ]) ifTrue: [
+                w := ((node at: #width) ifNil: [ 320 ]) rounded.
+                h := ((node at: #height) ifNil: [ 180 ]) rounded.
+                panes at: node idOrEmpty put:
+                    (AppSurfaces register: w height: h present: [ :s | nil ]) ].
+        ^self
+    ]
+
+    paneHandleFor: anId <Object> ^ <Integer> [
+        ^panes at: anId asString ifAbsent: [ 0 ]
+    ]
 
     applyNodeProps: changed <OrderedCollection> to: nodeId <String> [
         patches add: (Array with: nodeId with: changed).
@@ -385,6 +422,17 @@ Object subclass: AppToolWindow [
             ifFalse: [ damage at: k put: r ].
         ^self
     ]
+
+    "THE HANDLE A PAINT BLOCK DRAWS THROUGH — `AppPixels planeFor: (tool
+     paneHandle: #grid) …`. Named `paneHwnd:` as well, below, because that is
+     what WINARMVM's tools already say and this is the one place the two
+     vocabularies have to meet; the number means `which surface`, not `which
+     window`, on either platform."
+    paneHandle: anId <Object> ^ <Integer> [
+        ^self realizer paneHandleFor: anId
+    ]
+
+    paneHwnd: anId <Object> ^ <Integer> [ ^self paneHandle: anId ]
 
     damageFor: anId <Object> ^ <Object> [
         "#clean when nothing is pending, nil for the whole pane, a rect for a

@@ -240,6 +240,12 @@
 # AppSpecLayout: measure-then-place, metrics passed in, top-left rects. Pure,
 # so the geometry is checkable to the pixel with no window.
 88_appspec_layout.mst
+# AppPixels/AppRender (docs/appspec.md A3): a pane's pixels, portably — the
+# retained BGRA plane a tool pokes and the present that puts it on screen.
+# Shape taken from WINARMVM's WinPixels/WinRender so a drawing loop is the
+# same text on both platforms; the realizer supplies the present block.
+# Loads BEFORE 89: the tool window's own null realizer registers surfaces.
+88a_apppixels.mst
 # AppToolWindow (docs/appspec.md A1): the lifecycle and the reconcile loop,
 # PORTABLE — registry, dispatch discipline, counters, damage, and the
 # republish -> validate -> diff -> ops pipeline. Everything platform-shaped is
@@ -254,6 +260,10 @@
 # patches in place here through the compat aliases, which is only possible
 # because a tool contains no platform. Costs one registry entry until opened.
 91_windemotool.mst
+# AppDemoPane (docs/appspec.md A3): the pane proof and the template — a
+# surface the tool draws with AppPixels, clicks in the pane's own pixels, and
+# one-cell damage. The sprite editor in miniature.
+91a_appdemopane.mst
 # SUnit (docs/sunit_design.md): tests for the world, written in the world.
 # TestCase/TestFailure/TestResult/TestRunner. Loads last in the world list so
 # a test file in tests.list can subclass TestCase.

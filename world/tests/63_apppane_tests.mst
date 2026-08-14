@@ -1,0 +1,202 @@
+"63_apppane_tests.mst — gates world/88a_apppixels.mst and world/91a_appdemopane.mst.
+
+ A pane's pixels are the part of a declarative UI that no diff can check, so
+ they are exactly the part worth asserting on. The null realizer registers a
+ REAL surface — a retained plane with a present that does nothing — which is
+ what lets a paint block be driven and its pixels read straight back, with no
+ window anywhere.
+
+ THE CENTRAL TEST IS `testOnlyTheDamagedCellIsRepainted`, and it proves the
+ claim by exploiting staleness rather than by counting calls: paint the whole
+ pane, change the model behind the framework's back, then invalidate ONE cell
+ and paint. If the repaint were total, every cell would show the new colour;
+ because it is damage-driven, exactly one does and the rest are still showing
+ what they showed before. A call counter could be satisfied by a paint block
+ that ignored its damage argument; this cannot."
+
+TestCase subclass: AppPaneTests [
+
+    ensureTool [
+        (AppToolWindow named: #panedemo) isNil ifTrue: [ AppDemoPane install ].
+        ^AppToolWindow named: #panedemo
+    ]
+
+    freshTool [
+        | w |
+        w := self ensureTool.
+        w teardown.
+        AppDemoPane clearCells.
+        AppDemoPane handle: #clear value: nil in: w.
+        AppToolWindow resetCounts.
+        w open.
+        ^w
+    ]
+
+    "The colour word a cell shows, read back off the retained plane."
+    wordAt: cx y: cy in: w [
+        | handle stride |
+        handle := w paneHandle: #grid.
+        stride := AppPixels strideFor: handle.
+        "The cell's INTERIOR — (0,0) of a cell is lattice, not colour."
+        ^AppPixels
+            at: (AppPixels planeFor: handle
+                           width: AppDemoPane paneSize height: AppDemoPane paneSize)
+            x: (cx * AppDemoPane cellSize) + 4
+            y: (cy * AppDemoPane cellSize) + 4
+            stride: stride
+    ]
+
+    "── the pixel verbs themselves ──────────────────────────────────────"
+
+    testAWordRoundTripsThroughThePlane [
+        | h plane stride word |
+        h := AppSurfaces register: 8 height: 8 present: [ :s | nil ].
+        plane := AppPixels planeFor: h width: 8 height: 8.
+        stride := AppPixels strideFor: h.
+        self assert: stride equals: 32.
+        word := AppPixels bgraR: 220 g: 60 b: 30.
+        AppPixels at: plane x: 3 y: 2 stride: stride put: word.
+        self assert: (AppPixels at: plane x: 3 y: 2 stride: stride) equals: word.
+        "Its neighbour is untouched — the write is one pixel, not a row."
+        self assert: (AppPixels at: plane x: 4 y: 2 stride: stride) equals: 0.
+        AppSurfaces remove: h.
+    ]
+
+    "Out of bounds is IGNORED, not raised: a paint block runs inside an event,
+     and a tool that miscomputes one edge pixel should draw the other 65,535."
+    testAnOutOfBoundsWriteIsIgnoredRatherThanRaised [
+        | h plane stride |
+        h := AppSurfaces register: 4 height: 4 present: [ :s | nil ].
+        plane := AppPixels planeFor: h width: 4 height: 4.
+        stride := AppPixels strideFor: h.
+        AppPixels at: plane x: 99 y: 0 stride: stride put: 16rFFFFFFFF.
+        AppPixels at: plane x: 0 y: 99 stride: stride put: 16rFFFFFFFF.
+        AppPixels at: plane x: -1 y: 0 stride: stride put: 16rFFFFFFFF.
+        self assert: (AppPixels at: plane x: 0 y: 0 stride: stride) equals: 0.
+        AppSurfaces remove: h.
+    ]
+
+    "THE PLANE IS RETAINED ACROSS A RESIZE TO THE SAME SIZE, which is the fact
+     that makes partial repaint sound — a fresh buffer every paint would
+     silently blank everything outside the damage."
+    testThePlaneSurvivesASameSizeResize [
+        | h plane stride |
+        h := AppSurfaces register: 8 height: 8 present: [ :s | nil ].
+        plane := AppPixels planeFor: h width: 8 height: 8.
+        stride := AppPixels strideFor: h.
+        AppPixels at: plane x: 1 y: 1 stride: stride put: (AppPixels bgraR: 1 g: 2 b: 3).
+        plane := AppPixels planeFor: h width: 8 height: 8.
+        self assert: (AppPixels at: plane x: 1 y: 1 stride: stride)
+             equals: (AppPixels bgraR: 1 g: 2 b: 3).
+        AppSurfaces remove: h.
+    ]
+
+    "── the pane, end to end ────────────────────────────────────────────"
+
+    testOpeningTheToolGivesItsPaneASurface [
+        | w |
+        w := self freshTool.
+        self assert: (w realizer placedIds includes: 'grid').
+        self assert: (w paneHandle: #grid) > 0.
+        self assert: (AppRender widthFor: (w paneHandle: #grid))
+             equals: AppDemoPane paneSize.
+    ]
+
+    "A CLICK ARRIVES IN THE PANE'S OWN PIXELS and lands on the cell it points
+     at — the conversion the realizer performs, asserted from the model side."
+    testAClickPaintsTheCellItLandsOn [
+        | w |
+        w := self freshTool.
+        w dispatch: #grid value: (Array with: (3 * AppDemoPane cellSize) + 5
+                                        with: (2 * AppDemoPane cellSize) + 5).
+        self assert: (AppDemoPane atX: 3 y: 2) equals: AppDemoPane colour.
+        self assert: (AppDemoPane atX: 2 y: 2) equals: 0.
+        self assert: AppDemoPane painted equals: 1.
+    ]
+
+    "And the pixels followed the model."
+    testThePaintedCellShowsItsColourOnThePlane [
+        | w expected |
+        w := self freshTool.
+        w dispatch: #grid value: (Array with: (3 * AppDemoPane cellSize) + 5
+                                        with: (2 * AppDemoPane cellSize) + 5).
+        expected := AppPixels
+            bgraR: ((AppDemoPane rgbFor: AppDemoPane colour) at: 1)
+            g: ((AppDemoPane rgbFor: AppDemoPane colour) at: 2)
+            b: ((AppDemoPane rgbFor: AppDemoPane colour) at: 3).
+        self assert: (self wordAt: 3 y: 2 in: w) equals: expected.
+    ]
+
+    "A stroke the model reports as changing nothing invalidates nothing — the
+     third state, and the one a naive `always repaint` would lose."
+    testARepeatedClickInvalidatesNothing [
+        | w |
+        w := self freshTool.
+        w dispatch: #grid value: (Array with: 5 with: 5).
+        self assert: (w damageFor: #grid) equals: #clean description: 'painted then consumed'.
+        w dispatch: #grid value: (Array with: 5 with: 5).
+        self assert: (w damageFor: #grid) equals: #clean.
+        self assert: AppDemoPane painted equals: 1 description: 'the second click changed nothing'.
+    ]
+
+    "THE CENTRAL CLAIM. Paint everything, move the model behind the
+     framework's back, then invalidate ONE cell and paint: exactly that cell
+     changes on the plane and every other still shows the old colour. A paint
+     block that ignored its damage argument would fail this; a call counter
+     would not have noticed."
+    testOnlyTheDamagedCellIsRepainted [
+        | w red blue |
+        w := self freshTool.
+        red := AppDemoPane bgraOf: 1.
+        blue := AppDemoPane bgraOf: 3.
+        "Fill the whole grid with colour 1 and paint it all."
+        0 to: AppDemoPane gridN - 1 do: [ :cy |
+            0 to: AppDemoPane gridN - 1 do: [ :cx |
+                AppDemoPane atX: cx y: cy put: 1 ] ].
+        w invalidatePane: #grid.
+        w paintDirty.
+        self assert: (self wordAt: 0 y: 0 in: w) equals: red.
+        self assert: (self wordAt: 7 y: 7 in: w) equals: red.
+        "Now change EVERY cell to colour 3, but invalidate only one."
+        0 to: AppDemoPane gridN - 1 do: [ :cy |
+            0 to: AppDemoPane gridN - 1 do: [ :cx |
+                AppDemoPane atX: cx y: cy put: 3 ] ].
+        w invalidatePane: #grid
+             rect: (Array with: 7 * AppDemoPane cellSize with: 7 * AppDemoPane cellSize
+                          with: AppDemoPane cellSize with: AppDemoPane cellSize).
+        w paintDirty.
+        self assert: (self wordAt: 7 y: 7 in: w) equals: blue
+             description: 'the damaged cell was repainted'.
+        self assert: (self wordAt: 0 y: 0 in: w) equals: red
+             description: 'an undamaged cell was NOT repainted — it is stale, and that is the point'.
+    ]
+
+    "Clear reaches everything, because its reach is total — the case damage
+     exists to DISTINGUISH, not the one it optimises."
+    testClearInvalidatesTheWholePane [
+        | w empty |
+        w := self freshTool.
+        empty := AppDemoPane bgraOf: 0.
+        0 to: AppDemoPane gridN - 1 do: [ :cy |
+            0 to: AppDemoPane gridN - 1 do: [ :cx |
+                AppDemoPane atX: cx y: cy put: 2 ] ].
+        w invalidatePane: #grid.
+        w paintDirty.
+        AppDemoPane handle: #clear value: nil in: w.
+        w paintDirty.
+        self assert: (self wordAt: 0 y: 0 in: w) equals: empty.
+        self assert: (self wordAt: 9 y: 4 in: w) equals: empty.
+    ]
+
+    "A pane's contents change without its SPEC changing, so a republish after
+     a stroke diffs to no ops — and must still paint. This is the case that
+     produced `a perfect grid that never updated` upstream."
+    testAStrokePaintsEvenThoughNoPropChanged [
+        | w before |
+        w := self freshTool.
+        w dispatch: #grid value: (Array with: 5 with: 5).
+        before := self wordAt: 0 y: 0 in: w.
+        self assert: before equals: (AppDemoPane bgraOf: AppDemoPane colour)
+             description: 'the stroke reached the plane through a no-op diff'.
+    ]
+]
