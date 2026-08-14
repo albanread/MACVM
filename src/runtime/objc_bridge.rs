@@ -1478,6 +1478,7 @@ extern "C" fn macvm_action_fire(this: *mut c_void, _cmd: *mut c_void, _sender: *
                     from: COCOA_PEER_ID,
                     corr: 0,
                     bytes: e.bytes.clone(),
+                    reply_to: None,
                 });
             }
         }

@@ -7107,18 +7107,10 @@ mod tests {
         let inbox = crate::runtime::workers::primary_inbox_sender(&primary.vm)
             .expect("the primary's inbox sender");
         inbox
-            .send(crate::runtime::workers::Envelope {
-                from: 1,
-                corr: 1,
-                bytes: bytes_a,
-            })
+            .send(crate::runtime::workers::Envelope::plain(1, 1, bytes_a))
             .expect("land peer-1 reply");
         inbox
-            .send(crate::runtime::workers::Envelope {
-                from: 2,
-                corr: 1,
-                bytes: bytes_b,
-            })
+            .send(crate::runtime::workers::Envelope::plain(2, 1, bytes_b))
             .expect("land peer-2 reply");
 
         primary

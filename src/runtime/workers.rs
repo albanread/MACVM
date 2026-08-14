@@ -150,6 +150,30 @@ pub struct Envelope {
     pub from: u32,
     pub corr: u64,
     pub bytes: Vec<u8>,
+    /// The SENDER'S OWN INBOX, when it has one to offer — the whole of
+    /// `docs/worker_peer_links.md` in one field. Envelopes cross between VMs
+    /// as Rust structs down a channel, never as serialized bytes, so an
+    /// envelope can carry a live link; a receiver that has been messaged
+    /// therefore already knows how to answer, and a peer link is LEARNED
+    /// rather than registered. That removes the registry, the name service
+    /// and the round trip a general peer-addressing scheme would need.
+    ///
+    /// `None` is the ordinary case and means exactly what it did before this
+    /// field existed: nothing to learn, reply through the parent.
+    pub reply_to: Option<InboxSender>,
+}
+
+impl Envelope {
+    /// The plain envelope — no link offered. Every pre-peer-links call site
+    /// means this, so it is spelled once rather than nine times.
+    pub fn plain(from: u32, corr: u64, bytes: Vec<u8>) -> Envelope {
+        Envelope {
+            from,
+            corr,
+            bytes,
+            reply_to: None,
+        }
+    }
 }
 
 /// How the embedder boots a worker's world — registered on the PRIMARY via
@@ -374,6 +398,7 @@ fn died_envelope(id: u32) -> Envelope {
         from: id,
         corr: 0,
         bytes: crate::runtime::mop::encode_worker_died(i64::from(id)),
+        reply_to: None,
     }
 }
 
@@ -441,6 +466,7 @@ impl crate::embed::TranscriptSink for ForwardTranscript {
             from: self.id,
             corr: 0,
             bytes: crate::runtime::mop::encode_worker_transcript(i64::from(self.id), &out),
+            reply_to: None,
         });
     }
 }
@@ -665,6 +691,7 @@ pub fn send(vm: &mut VmState, id: u32, corr: u64, bytes: Vec<u8>) -> bool {
                 from: 0,
                 corr,
                 bytes,
+                reply_to: None,
             };
             // `InboxSender::send` enqueues then fires the (coalesced) wake —
             // a no-op for a spawned worker (detached hook), a run-loop poke
@@ -692,6 +719,7 @@ pub fn send(vm: &mut VmState, id: u32, corr: u64, bytes: Vec<u8>) -> bool {
                     from: *self_id,
                     corr,
                     bytes,
+                    reply_to: None,
                 })
                 .is_ok()
         }
