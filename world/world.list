@@ -254,6 +254,12 @@
 # The names WINARMVM's tools were written against, so they load here unchanged.
 # Transitional — deleted when the sister repo adopts the AppSpec names.
 90_appspec_compat.mst
+# AppHost/AppShell (docs/appspec.md A4): the six host services a real tool
+# needs beyond drawing — persist a class, read a method's source, find
+# implementors, the clipboard, launch a demo, editor DPI. Late-bound to a
+# backend by name, so a headless image loads the editors and only these calls
+# go quiet. Carries the WinHost/WinShell aliases the vendored tools use.
+90a_apphost.mst
 # WINARMVM's world/125_winui_demotool.mst, VENDORED BYTE FOR BYTE (sha1
 # fc737b37...) — a tool written for Win32 and never edited for this platform.
 # It is the arc's acceptance test in miniature: it registers, opens, and
@@ -264,6 +270,11 @@
 # surface the tool draws with AppPixels, clicks in the pane's own pixels, and
 # one-cell damage. The sprite editor in miniature.
 91a_appdemopane.mst
+# WINARMVM's world/126 and 127 — the sprite and sound editors, VENDORED BYTE
+# FOR BYTE. The acceptance test of docs/appspec.md: tools written for Win32,
+# never edited, running here on the Cocoa realizer.
+91b_winspriteed.mst
+91c_winsoundtool.mst
 # SUnit (docs/sunit_design.md): tests for the world, written in the world.
 # TestCase/TestFailure/TestResult/TestRunner. Loads last in the world list so
 # a test file in tests.list can subclass TestCase.

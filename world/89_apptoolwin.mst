@@ -24,6 +24,7 @@
      applyNodeProps: c to: id patch one node's changed props in place
      applyWindowProps: c      patch the window's own props (title, so far)
      paneHandleFor: id        the surface handle a pane node was realized into
+     layoutFinished: places   every control is placed; fit to them if you can
 
  ONE OBLIGATION THAT IS EASY TO MISS, written here because it cost a bug in
  the first realizer and will cost one in the next: whatever a realizer holds
@@ -130,6 +131,8 @@ Object subclass: AppNullRealizer [
         windowPatches add: changed.
         ^self
     ]
+
+    layoutFinished: places <Object> [ ^self ]
 
     tick [ ^self ]
 
@@ -560,6 +563,13 @@ Object subclass: AppToolWindow [
         places := AppSpecLayout
             layout: spec width: self realizer clientWidth metrics: self realizer metrics.
         places do: [ :p | self realizer createFor: p ].
+        "EVERY CONTROL IS PLACED; NOW THE PLATFORM MAY FIT ITSELF TO THEM. A
+         tool declares its window size against the metrics of the platform it
+         was written on, so a tool ported from the other one is always a little
+         wrong here — too tall, or clipped at the right edge. The realizer has
+         just seen the real extent, so it is the thing that can say so; a
+         realizer with nothing to adjust ignores this."
+        self realizer layoutFinished: places.
         AppToolWindow suppress: false.
         lastSpec := spec.
         self invalidateAllPanes.

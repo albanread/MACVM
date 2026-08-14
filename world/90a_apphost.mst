@@ -1,0 +1,147 @@
+"90a_apphost.mst — AppSpec A4: the services a real tool needs beyond drawing.
+
+ `docs/appspec.md`. A3 finished the drawing surface, and the two editors A4
+ ports still would not load, because a tool that only draws is not a tool. The
+ sprite editor saves a sheet into the image, reads a method's source back,
+ and asks who implements `isSpriteSheet`; both editors put a snippet on the
+ clipboard; the sprite editor launches its preview as a demo. On Windows those
+ are `WinHost` and `WinShell`. This file is what they mean HERE.
+
+ THE SURFACE IS TINY AND IT IS THE TOOLS' OWN. Nothing was invented: every
+ selector below exists because `world/91b_winspriteed.mst` or
+ `world/91c_winsoundtool.mst` sends it, and no others were added on
+ speculation. Six verbs total, which is a fair measure of how little of a tool
+ is actually platform.
+
+ LATE-BOUND, LIKE THE REALIZER. These classes hold no Cocoa; they ask for a
+ backend BY NAME (`CocoaAppServices`, in cocoaui.list) the first time they are
+ used, and answer nil when there is none. So a headless image loads both
+ editors, builds their specs, paints their panes and runs their tests, and
+ only the half-dozen calls that genuinely need a host go quiet. That is the
+ same bargain the null realizer makes, for the same reason: absent is a
+ correct state, not a broken one.
+
+ EVERY CALL SITE IN BOTH TOOLS IS ALREADY FAILURE-SOFT — each one is written
+ `[ WinHost … ] on: Error do: [ … ]`, because the Windows versions cross a
+ worker boundary that can fail. That is what makes answering nil safe here
+ rather than merely convenient."
+
+Object subclass: AppHost [
+    <classVars: Backend Resolved>
+
+    "Resolved once, by name, and remembered even when the answer is nil —
+     otherwise every call re-runs the reflection sweep in an image that will
+     never have one."
+    AppHost class >> backend ^ <Object> [
+        Resolved == true ifFalse: [
+            Backend := Worker classNamed: #CocoaAppServices.
+            Resolved := true ].
+        ^Backend
+    ]
+
+    AppHost class >> backend: aClass <Object> [ Backend := aClass. Resolved := true. ^self ]
+    AppHost class >> resetBackend [ Backend := nil. Resolved := nil. ^self ]
+    AppHost class >> hasBackend ^ <Boolean> [ ^self backend isNil not ]
+
+    "── the image services ──────────────────────────────────────────────"
+
+    "Compile and store a class from its source. Answers whatever the host says
+     — the tools only ever show it in a status line."
+    AppHost class >> persistClass: source <String> ^ <Object> [
+        self backend isNil ifTrue: [ ^nil ].
+        ^self backend persistClass: source
+    ]
+
+    "One method's source. `side` is #class or #instance, exactly as the Mac's
+     own host verb already spells it."
+    AppHost class >> methodSourceFor: aClassName <String> side: aSide <Symbol>
+                     selector: aSelector <String> ^ <Object> [
+        self backend isNil ifTrue: [ ^nil ].
+        ^self backend methodSourceFor: aClassName side: aSide selector: aSelector
+    ]
+
+    AppHost class >> implementorsOf: aSelector <String> ^ <Object> [
+        self backend isNil ifTrue: [ ^nil ].
+        ^self backend implementorsOf: aSelector
+    ]
+]
+
+Object subclass: AppShell [
+    <classVars: Dpi>
+
+    AppShell class >> backend ^ <Object> [ ^AppHost backend ]
+
+    "── the shell services ──────────────────────────────────────────────"
+
+    AppShell class >> clipboardText: aString <String> ^ <Object> [
+        self backend isNil ifTrue: [ ^nil ].
+        ^self backend clipboardText: aString
+    ]
+
+    "Run a composed top-level doit as a demo — the sprite editor's Preview,
+     which wants its sprite ANIMATING in a real game pane rather than redrawn
+     into its own."
+    AppShell class >> launchDemo: aDoit <String> named: aName <String> ^ <Object> [
+        self backend isNil ifTrue: [ ^nil ].
+        ^self backend launchDemo: aDoit named: aName
+    ]
+
+    "Only ever an argument to `AppRender attach:points:dpi:`, which on this
+     platform never needs to run — a pane here has its surface from birth. 96
+     is the neutral answer, and it is a number rather than nil so a tool that
+     does arithmetic on it still works."
+    AppShell class >> editorMetricsDpi ^ <Integer> [
+        ^Dpi isNil ifTrue: [ 96 ] ifFalse: [ Dpi ]
+    ]
+
+    AppShell class >> editorMetricsDpi: n <Integer> [ Dpi := n. ^self ]
+
+    "── the find reply ──────────────────────────────────────────────────
+
+     A find reply is one record per LINE, fields separated by the ASCII unit
+     separator. Answers a collection of field-arrays, and a line with no
+     separator is a single field — which is what makes this work against both
+     hosts' replies without either having to change."
+    AppShell class >> splitFindReply: aReply <Object> ^ <OrderedCollection> [
+        | out |
+        out := OrderedCollection new.
+        aReply isNil ifTrue: [ ^out ].
+        (self linesOf: aReply asString) do: [ :line |
+            line isEmpty ifFalse: [ out add: (self fieldsOf: line) ] ].
+        ^out
+    ]
+
+    AppShell class >> linesOf: aString <String> ^ <OrderedCollection> [
+        | out line lf ch |
+        out := OrderedCollection new.
+        line := ''.
+        lf := Character value: 10.
+        1 to: aString size do: [ :i |
+            ch := aString at: i.
+            ch = lf
+                ifTrue: [ line isEmpty ifFalse: [ out add: line ]. line := '' ]
+                ifFalse: [ line := line , (String with: ch) ] ].
+        line isEmpty ifFalse: [ out add: line ].
+        ^out
+    ]
+
+    AppShell class >> fieldsOf: aLine <String> ^ <Array> [
+        | out field us ch |
+        out := OrderedCollection new.
+        field := ''.
+        us := Character value: 31.
+        1 to: aLine size do: [ :i |
+            ch := aLine at: i.
+            ch = us
+                ifTrue: [ out add: field. field := '' ]
+                ifFalse: [ field := field , (String with: ch) ] ].
+        out add: field.
+        ^out asArray
+    ]
+]
+
+"The names the vendored tools were written against — the same subclass-alias
+ discipline as world/90_appspec_compat.mst, and transitional for the same
+ reason."
+AppHost subclass: WinHost [ ]
+AppShell subclass: WinShell [ ]

@@ -36,7 +36,7 @@
  wrong on screen, never invisibly absent."
 
 Object subclass: CocoaRealize [
-    | toolWindow nsWin content controls delegates winDelegate panes |
+    | toolWindow nsWin content controls delegates winDelegate panes fittedHeight |
 
     CocoaRealize class >> newFor: aWindow <Object> ^ <CocoaRealize> [
         ^self new setToolWindow: aWindow
@@ -48,6 +48,7 @@ Object subclass: CocoaRealize [
         delegates := OrderedCollection new.
         panes := Dictionary new.
         nsWin := nil.
+        fittedHeight := nil.
         ^self
     ]
 
@@ -57,22 +58,40 @@ Object subclass: CocoaRealize [
      proportional font, which has no single character width; measuring one
      through the bridge would cost a main-thread crossing per string and buy
      very little, because the layout uses the number only to decide how wide a
-     label wants to be. These are the numbers for the 12pt system font, and the
-     one place to change if text starts clipping.
+     label wants to be. They are the one place to change if text starts
+     clipping, or if a window comes out the wrong size — because they decide
+     both.
 
-     8, NOT 7, AND THE FIRST SCREENSHOT IS WHY. At 7 the demo's heading came
-     out `A window made of` with `data` cut off: the layout multiplies ONE
-     charWidth by a string's length for every text node, so the widest glyphs
-     in the file set the number, and bold text is wider than the average
-     character it was averaged from. Erring high is free — there is no
-     stretch-to-fill, so an over-wide box is invisible, while an under-wide one
-     eats the end of a sentence."
+     THEY SET THE WINDOW'S SIZE, which is the part that is easy to miss. The
+     layout derives every control's HEIGHT from lineHeight — a button is
+     lineHeight + 16, an input + 10, a checkbox and a select + 12 — so a
+     generous lineHeight does not merely space text out, it inflates the whole
+     window. At 12pt/16 the two vendored editors came out visibly too tall.
+     11pt on a 13px line is the Mac's own compact-control convention, and the
+     size `76_spriteed.mst` already uses for its own labels; it brings a button
+     to 29 points and a field to 23, which is what an AppKit window is supposed
+     to look like.
 
-    fontSize ^ <Number> [ ^12.0 ]
-    metrics ^ <Array> [ ^AppSpecLayout metricsCharWidth: 8 lineHeight: 16 ]
+     WIDTH ERRS HIGH, AND A SCREENSHOT SETTLED THE NUMBER. The layout
+     multiplies ONE charWidth by a string's length for every text node, so the
+     widest glyphs in the file set it; at 12pt a charWidth of 7 cut `data` off
+     the demo's heading. Erring high is free — there is no stretch-to-fill, so
+     an over-wide box is invisible while an under-wide one eats the end of a
+     sentence — and 7 is generous at 11pt where it was mean at 12. The heading
+     is bold at the SAME size for the same reason: the layout must never be
+     asked to measure something larger than it thinks."
+
+    fontSize ^ <Number> [ ^11.0 ]
+    metrics ^ <Array> [ ^AppSpecLayout metricsCharWidth: 7 lineHeight: 13 ]
 
     clientWidth ^ <Integer> [ ^toolWindow width ]
-    clientHeight ^ <Integer> [ ^toolWindow height ]
+    "THE HEIGHT EVERY FLIP IS TAKEN AGAINST. Before the window has been
+     fitted this is what the tool asked for; afterwards it is what the content
+     actually needed, so a patch that re-derives a rect lands where the
+     control already is instead of jumping."
+    clientHeight ^ <Integer> [
+        ^fittedHeight isNil ifTrue: [ toolWindow height ] ifFalse: [ fittedHeight ]
+    ]
 
     "── the window ──────────────────────────────────────────────────────"
 
@@ -501,6 +520,71 @@ Object subclass: CocoaRealize [
             (((each at: 2) idOrEmpty = nodeId) and: [ (each at: 3) == aKind ])
                 ifTrue: [ ^each ] ].
         ^nil
+    ]
+
+    "── fit the window to what was actually laid out ────────────────────
+
+     A TOOL'S DECLARED SIZE IS A GUESS MADE ON ANOTHER PLATFORM. Both vendored
+     editors ask for 720 points tall, computed against Win32's font; ours is
+     taller per line, so the same spec needs more room and the windows came out
+     cramped — the sprite editor's rightmost button clipped off the edge, both
+     of them taller than their content wanted to be. Nothing about that is the
+     tools' fault and nothing about it can be fixed in a spec, because the spec
+     does not know the font.
+
+     So the realizer measures. Layout has just answered every rect, so the
+     content's true extent is known exactly: take the furthest edge, add the
+     root padding back, and size the window to THAT. A tool that declared too
+     much shrinks, one that declared too little grows, and neither has to know
+     which platform it is on. The declared width still drives LAYOUT — it is
+     what the columns were composed against — so only the window follows.
+
+     Clamped to something a screen can hold, because a tool is free to declare
+     a spec taller than the display and a window that cannot be reached is
+     worse than one that scrolls off."
+    layoutFinished: places <Object> [
+        | maxX maxY w h |
+        (nsWin isNil or: [ places isNil ]) ifTrue: [ ^self ].
+        maxX := 0.
+        maxY := 0.
+        places do: [ :p |
+            maxX := maxX max: (p at: 2) + (p at: 4).
+            maxY := maxY max: (p at: 3) + (p at: 5) ].
+        maxX = 0 ifTrue: [ ^self ].
+        w := (maxX + AppSpecLayout rootPadding) min: 1600.
+        h := (maxY + AppSpecLayout rootPadding) min: 1000.
+        w := w max: 200.
+        h := h max: 120.
+        "THE HEIGHT MUST BE SET BEFORE THE CONTROLS ARE PLACED, and they
+         already are — so the frames move with it. `rectFor:` flipped every y
+         against the OLD client height, so changing it now would put every
+         control at the wrong height unless they are re-derived. Re-place them
+         against the new height rather than laying out again: same rects, one
+         subtraction different."
+        self resizeContentTo: w height: h places: places.
+        ^self
+    ]
+
+    resizeContentTo: w <Integer> height: h <Integer> places: places <Object> [
+        | frame |
+        frame := nsWin onMain frame.
+        "setContentSize: keeps the top-left where it is on screen, which is
+         what a user expects of a window that fits itself."
+        nsWin onMain setContentSize: (Array with: w asFloat with: h asFloat).
+        nsWin onMain setFrameTopLeftPoint:
+            (Array with: (frame at: 1) with: (frame at: 2) + (frame at: 4)).
+        fittedHeight := h.
+        places do: [ :p | self repositionFor: p ].
+        ^self
+    ]
+
+    "One control, moved to where it belongs under the window's real height."
+    repositionFor: p <Array> [
+        | pair |
+        pair := self controlFor: (p at: 1) idOrEmpty kind: (p at: 6).
+        pair isNil ifTrue: [ ^self ].
+        (pair at: 1) onMain setFrame: (self rectFor: p).
+        ^self
     ]
 
     "Nothing to poll: a Cocoa control pushes its action when it changes, where

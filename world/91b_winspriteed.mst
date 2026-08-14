@@ -1,0 +1,699 @@
+"126_winui_spriteed.mst — the Sprite Editor, WG14c, and the first REAL tool
+ written in the declarative UI.
+
+ The Mac's is `world/76_spriteed.mst`: 900 lines of which most is NSWindow,
+ NSImageView, absolute frame rects and control retention. THE DOCUMENT IS NOT
+ PORTED, because `SpriteDoc` (`world/44a_spritedoc.mst`) is in `world.list` on
+ every platform and holds every rule — the pixels, the frames, the palette,
+ the hex rows, the sheet source. This file is a face, and it is about a fifth
+ the size of the one it replaces, because `WinToolWindow` owns the window and
+ `WinSpec`/`WinSpecLayout` own the arrangement.
+
+ TWO SURFACES, BOTH PANES. The grid and the swatch strip are `rgbaPane`
+ nodes: the spec PLACES them and the paint block FILLS them, which is the
+ division the pane type exists for — a control's contents are props and the
+ differ carries those, a pane's contents are pixels no diff could express.
+
+ THE DRAWING IS THE MAC'S, rule for rule, so the two editors look like the
+ same program: a 432-pixel box divided by the LARGER dimension so cells stay
+ square; a one-pixel lattice at (40,40,44) on each cell's left and top edge;
+ transparent pixels over an 8-pixel checker computed in WHOLE-SURFACE
+ coordinates, so it deliberately does not line up with the cells; and in the
+ swatches, entry 0 shown as a checker with its real colour in a centre patch,
+ the selected entry ringed 3 pixels white.
+
+ ONE THING IS DELIBERATELY NOT COPIED: the y-flip. The Mac's hit test reads
+ `Doc height - 1 - (py // cell)` because an unflipped NSView has a bottom-left
+ origin while the buffer it draws has row 0 on top. A Win32 client area is
+ top-left already, so the flip would be a bug rather than a fix."
+
+Object subclass: WinSpriteEd [
+    <classVars: Doc CurFrame SelColor Tool Status WantW WantH>
+
+    "── state the FACE owns; SpriteDoc holds none of it ─────────────────"
+
+    WinSpriteEd class >> doc ^ <Object> [
+        Doc isNil ifTrue: [ Doc := SpriteDoc new ].
+        ^Doc
+    ]
+    WinSpriteEd class >> curFrame ^ <Integer> [ ^CurFrame isNil ifTrue: [ 0 ] ifFalse: [ CurFrame ] ]
+    WinSpriteEd class >> selColor ^ <Integer> [ ^SelColor isNil ifTrue: [ 15 ] ifFalse: [ SelColor ] ]
+    WinSpriteEd class >> tool ^ <Symbol> [ ^Tool isNil ifTrue: [ #pencil ] ifFalse: [ Tool ] ]
+    WinSpriteEd class >> status ^ <String> [
+        ^Status isNil
+            ifTrue: [ 'pencil paints colour 15; index 0 is transparent' ]
+            ifFalse: [ Status ]
+    ]
+    WinSpriteEd class >> status: aString <String> [ Status := aString. ^self ]
+
+    "── geometry, the Mac's own ─────────────────────────────────────────"
+
+    WinSpriteEd class >> gridBox ^ <Integer> [ ^432 ]
+    WinSpriteEd class >> cellSize ^ <Integer> [
+        ^(self gridBox // ((self doc width max: self doc height) max: 1)) max: 1
+    ]
+    WinSpriteEd class >> gridWidth ^ <Integer> [ ^self cellSize * self doc width ]
+    WinSpriteEd class >> gridHeight ^ <Integer> [ ^self cellSize * self doc height ]
+    WinSpriteEd class >> swatchCell ^ <Integer> [ ^48 ]
+    WinSpriteEd class >> swatchWidth ^ <Integer> [ ^self swatchCell * 8 ]
+    WinSpriteEd class >> swatchHeight ^ <Integer> [ ^self swatchCell * 2 ]
+
+    "── the spec ────────────────────────────────────────────────────────
+
+     Every node named, because that is what makes an edit cost one caption
+     instead of one window."
+
+    WinSpriteEd class >> spec ^ <WinNode> [
+        "LANDSCAPE, since WG14d made columns sayable: the canvas and its tools
+         on the left, everything you SET on the right. The grid is 432 wide
+         and the panel wants about the same, so the weights are even."
+        ^WinSpec window: 'Sprite Editor' id: #spriteWin body: (WinSpec stack: {
+            WinSpec text: self status id: #status.
+            WinSpec row: {
+                WinSpec stack: {
+                    WinSpec rgbaPane: #grid width: self gridWidth height: self gridHeight.
+                    WinSpec row: {
+                        WinSpec button: (self toolLabel: #pencil) event: #toolPencil id: #tPencil.
+                        WinSpec button: (self toolLabel: #fill) event: #toolFill id: #tFill.
+                        WinSpec button: (self toolLabel: #pick) event: #toolPick id: #tPick.
+                        WinSpec button: 'Clear' event: #clear id: #tClear
+                    } id: #tools.
+                    WinSpec row: {
+                        WinSpec button: 'Left' event: #nudgeLeft id: #nLeft.
+                        WinSpec button: 'Right' event: #nudgeRight id: #nRight.
+                        WinSpec button: 'Up' event: #nudgeUp id: #nUp.
+                        WinSpec button: 'Down' event: #nudgeDown id: #nDown
+                    } id: #nudges.
+                    WinSpec rgbaPane: #swatches width: self swatchWidth height: self swatchHeight
+                } id: #leftCol.
+                WinSpec stack: {
+                    self colourCard.
+                    self frameCard.
+                    self sizeCard.
+                    self sheetCard
+                } id: #rightCol
+            } weights: #(1 1) id: #main
+        } id: #root)
+    ]
+
+    WinSpriteEd class >> colourCard ^ <WinNode> [
+        ^WinSpec card: 'Colour ' , self selColor printString children: {
+            WinSpec slider: 'R' value: (self channel: 1) min: 0 max: 255
+                    event: #red id: #sliderR.
+            WinSpec slider: 'G' value: (self channel: 2) min: 0 max: 255
+                    event: #green id: #sliderG.
+            WinSpec slider: 'B' value: (self channel: 3) min: 0 max: 255
+                    event: #blue id: #sliderB
+        } id: #colourCard
+    ]
+
+    WinSpriteEd class >> frameCard ^ <WinNode> [
+        ^WinSpec card: 'Frame ' , (self curFrame + 1) printString , '/'
+                    , self doc frameCount printString
+            children: {
+                WinSpec row: {
+                    WinSpec button: 'First' event: #frameFirst id: #fFirst.
+                    WinSpec button: 'Prev' event: #framePrev id: #fPrev.
+                    WinSpec button: 'Next' event: #frameNext id: #fNext
+                } id: #frameNav.
+                WinSpec row: {
+                    WinSpec button: 'Add' event: #frameAdd id: #fAdd.
+                    WinSpec button: 'Dup' event: #frameDup id: #fDup.
+                    WinSpec button: 'Del' event: #frameDel id: #fDel
+                } id: #frameEdit.
+                WinSpec button: 'Preview' event: #preview id: #bPreview
+            } id: #frameCard
+    ]
+
+    WinSpriteEd class >> sizeCard ^ <WinNode> [
+        ^WinSpec card: 'Size ' , self doc width printString , 'x'
+                    , self doc height printString
+            children: {
+                WinSpec row: {
+                    WinSpec input: 'W' value: self wantW event: #wantW id: #wField.
+                    WinSpec input: 'H' value: self wantH event: #wantH id: #hField.
+                    WinSpec button: 'Resize' event: #resize id: #bResize
+                } id: #sizeRow
+            } id: #sizeCard
+    ]
+
+    WinSpriteEd class >> sheetCard ^ <WinNode> [
+        ^WinSpec card: 'Sheet' children: {
+            WinSpec input: 'Name' value: self doc name event: #name id: #nameField.
+            WinSpec row: {
+                WinSpec button: 'Save' event: #save id: #bSave.
+                WinSpec button: 'Load' event: #load id: #bLoad.
+                WinSpec button: 'Sheets' event: #sheets id: #bSheets.
+                WinSpec button: 'Copy Code' event: #copy id: #bCopy
+            } id: #sheetButtons
+        } id: #sheetCard
+    ]
+
+    WinSpriteEd class >> toolLabel: aSymbol <Symbol> ^ <String> [
+        "The active tool wears a marker, the Mac's own idiom — ASCII here,
+         because a guest String is UTF-8 bytes and a bullet would arrive as
+         three cells of rubbish."
+        ^(self tool == aSymbol ifTrue: [ '* ' ] ifFalse: [ '' ])
+            , aSymbol asString
+    ]
+
+    WinSpriteEd class >> channel: i <Integer> ^ <Integer> [
+        ^(self doc paletteAt: self selColor) at: i
+    ]
+
+    "── events ──────────────────────────────────────────────────────────"
+
+    WinSpriteEd class >> handle: event <Symbol> value: value <Object> [
+        | d |
+        d := self doc.
+        event == #grid ifTrue: [ ^self paintAt: value ].
+        event == #swatches ifTrue: [ ^self swatchAt: value ].
+
+        event == #toolPencil ifTrue: [ ^self selectTool: #pencil ].
+        event == #toolFill ifTrue: [ ^self selectTool: #fill ].
+        event == #toolPick ifTrue: [ ^self selectTool: #pick ].
+        event == #clear ifTrue: [
+            d clearFrame: self curFrame.
+            self invalidateGrid.
+            ^self status: 'frame cleared' ].
+
+        event == #red ifTrue: [ ^self setChannel: 1 to: value ].
+        event == #green ifTrue: [ ^self setChannel: 2 to: value ].
+        event == #blue ifTrue: [ ^self setChannel: 3 to: value ].
+
+        event == #frameFirst ifTrue: [ ^self gotoFrame: 0 ].
+        event == #framePrev ifTrue: [ ^self gotoFrame: self curFrame - 1 ].
+        event == #frameNext ifTrue: [ ^self gotoFrame: self curFrame + 1 ].
+        event == #frameAdd ifTrue: [ ^self gotoFrame: d addFrame ].
+        event == #frameDup ifTrue: [ ^self gotoFrame: (d dupFrame: self curFrame) ].
+        event == #frameDel ifTrue: [
+            (d delFrame: self curFrame)
+                ifTrue: [
+                    CurFrame := self curFrame min: d frameCount - 1.
+                    self invalidateGrid.
+                    ^self status: 'frame deleted' ]
+                ifFalse: [ ^self status: 'the last frame stays' ] ].
+
+        event == #name ifTrue: [ d name: value. ^self ].
+        event == #wantW ifTrue: [ WantW := value. ^self ].
+        event == #wantH ifTrue: [ WantH := value. ^self ].
+        event == #resize ifTrue: [ ^self resize ].
+        event == #nudgeLeft ifTrue: [ ^self nudge: -1 dy: 0 ].
+        event == #nudgeRight ifTrue: [ ^self nudge: 1 dy: 0 ].
+        event == #nudgeUp ifTrue: [ ^self nudge: 0 dy: -1 ].
+        event == #nudgeDown ifTrue: [ ^self nudge: 0 dy: 1 ].
+        event == #save ifTrue: [ ^self save ].
+        event == #load ifTrue: [ ^self load ].
+        event == #sheets ifTrue: [ ^self sheets ].
+        event == #copy ifTrue: [ ^self copyCode ].
+        event == #preview ifTrue: [ ^self preview ].
+        ^self
+    ]
+
+    "── the pixel verbs the Mac has and this did not ────────────────────"
+
+    WinSpriteEd class >> nudge: dx <Integer> dy: dy <Integer> [
+        "A WRAPPING shift, the document's own — which is why nudging a sprite
+         all the way round brings it back rather than eating it."
+        self doc shift: self curFrame dx: dx dy: dy.
+        self invalidateGrid.
+        ^self status: 'nudged'
+    ]
+
+    WinSpriteEd class >> wantW ^ <String> [
+        ^WantW isNil ifTrue: [ self doc width printString ] ifFalse: [ WantW ]
+    ]
+    WinSpriteEd class >> wantH ^ <String> [
+        ^WantH isNil ifTrue: [ self doc height printString ] ifFalse: [ WantH ]
+    ]
+
+    WinSpriteEd class >> resize [
+        "The document decides, and it declines a same-size request as well as
+         an out-of-range one — so the message names both possibilities rather
+         than claiming a bound was broken."
+        | nw nh |
+        nw := self wantW asInteger.
+        nh := self wantH asInteger.
+        (nw isNil or: [ nh isNil ]) ifTrue: [ ^self status: 'resize: not a number' ].
+        (self doc resizeTo: nw by: nh) ifFalse: [
+            ^self status: 'resize declined (1..64, and different from now)' ].
+        WantW := nil.
+        WantH := nil.
+        self invalidateGrid.
+        ^self status: 'resized to ' , self doc width printString , 'x'
+                    , self doc height printString
+    ]
+
+    "── damage: the handler says WHAT it dirtied ────────────────────────
+     The differ carries the controls; these carry the pixels. A pencil stroke
+     invalidates ONE CELL's rect; a flood fill, a frame change or a palette
+     edit invalidates the whole pane, because their reach is unknowable or
+     total. The paint block is then called only for what is named here."
+
+    WinSpriteEd class >> invalidateGrid [
+        (WinToolWindow named: #spriteEd) ifNotNil: [ :t | t invalidatePane: #grid ].
+        ^self
+    ]
+
+    WinSpriteEd class >> invalidateSwatches [
+        (WinToolWindow named: #spriteEd) ifNotNil: [ :t | t invalidatePane: #swatches ].
+        ^self
+    ]
+
+    WinSpriteEd class >> invalidateCellX: x <Integer> y: y <Integer> [
+        | cell |
+        cell := self cellSize.
+        (WinToolWindow named: #spriteEd) ifNotNil: [ :t |
+            t invalidatePane: #grid
+              rect: (Array with: x * cell with: y * cell with: cell with: cell) ].
+        ^self
+    ]
+
+    "THE SINGLE FUNNEL, as on the Mac: every gesture and every script arrives
+     here, and the tool decides. The document's `did anything change` answers
+     are what stop a drag inside one cell from repainting on every message —
+     a stroke that changed nothing invalidates nothing and paints nothing."
+    WinSpriteEd class >> paintAt: point <Array> [
+        | x y d |
+        d := self doc.
+        x := (point at: 1) // self cellSize.
+        y := (point at: 2) // self cellSize.
+        (x < 0 or: [ x >= d width or: [ y < 0 or: [ y >= d height ] ] ])
+            ifTrue: [ ^self ].
+        self tool == #pick ifTrue: [
+            ^self selectColour: (d getPx: self curFrame x: x y: y) ].
+        self tool == #fill
+            ifTrue: [
+                (d floodFill: self curFrame x: x y: y color: self selColor)
+                    ifTrue: [ self invalidateGrid ] ]
+            ifFalse: [
+                (d setPx: self curFrame x: x y: y color: self selColor)
+                    ifTrue: [ self invalidateCellX: x y: y ] ].
+        ^self
+    ]
+
+    WinSpriteEd class >> swatchAt: point <Array> [
+        | col row |
+        col := (point at: 1) // self swatchCell.
+        row := (point at: 2) // self swatchCell.
+        (col between: 0 and: 7) ifFalse: [ ^self ].
+        (row between: 0 and: 1) ifFalse: [ ^self ].
+        ^self selectColour: (row * 8) + col
+    ]
+
+    WinSpriteEd class >> selectColour: i <Integer> [
+        SelColor := (i max: 0) min: 15.
+        "The RING moved, and only the swatches show it."
+        self invalidateSwatches.
+        ^self status: 'colour ' , SelColor printString
+            , (SelColor = 0 ifTrue: [ ' (transparent)' ] ifFalse: [ '' ])
+    ]
+
+    WinSpriteEd class >> selectTool: aSymbol <Symbol> [
+        Tool := aSymbol.
+        ^self status: 'tool: ' , aSymbol asString
+    ]
+
+    WinSpriteEd class >> setChannel: i <Integer> to: v <Object> [
+        "A palette edit reaches every pixel of that colour, on BOTH surfaces."
+        | c |
+        c := self doc paletteAt: self selColor.
+        self doc
+            setPal: self selColor
+            r: (i = 1 ifTrue: [ v ] ifFalse: [ c at: 1 ])
+            g: (i = 2 ifTrue: [ v ] ifFalse: [ c at: 2 ])
+            b: (i = 3 ifTrue: [ v ] ifFalse: [ c at: 3 ]).
+        self invalidateGrid.
+        self invalidateSwatches.
+        ^self
+    ]
+
+    WinSpriteEd class >> gotoFrame: f <Integer> [
+        "Out of range is a SILENT no-op, which is how `Prev` at the first frame
+         and `dupFrame:`'s -1 are both absorbed without a special case."
+        (f < 0 or: [ f >= self doc frameCount ]) ifTrue: [ ^self ].
+        CurFrame := f.
+        "A different frame is a different picture, all of it."
+        ^self invalidateGrid
+    ]
+
+    "── the sheet ───────────────────────────────────────────────────────"
+
+    WinSpriteEd class >> save [
+        | d reply |
+        d := self doc.
+        (SpriteDoc validName: d name) ifFalse: [
+            ^self status: 'save: name must be a capitalised identifier' ].
+        reply := [ WinHost persistClass: d sheetSource ]
+            on: Error do: [ :e | Array with: false with: e messageText ].
+        ^self status: ((reply at: 1)
+            ifTrue: [ 'saved ' , d name ]
+            ifFalse: [ 'save FAILED: ' , (reply at: 2) printString ])
+    ]
+
+    "── load: the round trip that makes Save mean anything ──────────────
+
+     A sheet is SOURCE IN THE IMAGE, so loading reads it back from the image
+     rather than from any live pane — which is why a sheet saved a moment ago
+     loads immediately, and why a sheet edited by hand in the Browser loads
+     exactly as edited. The two scrapers are honest parsers because this
+     editor wrote the text they read."
+
+    WinSpriteEd class >> load [
+        | d nm rows pal frames triples |
+        d := self doc.
+        nm := d name.
+        (SpriteDoc validName: nm) ifFalse: [
+            ^self status: 'load: type the sheet class name in Name first' ].
+        rows := [ WinHost methodSourceFor: nm side: #class selector: 'frames' ]
+            on: Error do: [ :e | Array with: false with: e messageText ].
+        pal := [ WinHost methodSourceFor: nm side: #class selector: 'palette' ]
+            on: Error do: [ :e | Array with: false with: e messageText ].
+        ((rows at: 1) and: [ pal at: 1 ]) ifFalse: [
+            ^self status: 'load: ' , nm , ' has no frames/palette (not a sheet?)' ].
+        frames := self quotedStringsIn: (rows at: 2).
+        triples := self integerTriplesIn: (pal at: 2).
+        (frames isEmpty or: [ triples isNil ]) ifTrue: [
+            ^self status: 'load: ' , nm , ' did not parse as a sheet' ].
+        (d loadFrames: frames palette: triples) ifFalse: [
+            ^self status: 'load: ' , nm , ' did not load' ].
+        d name: nm.
+        CurFrame := 0.
+        WantW := nil.
+        WantH := nil.
+        self invalidateGrid.
+        self invalidateSwatches.
+        ^self status: 'loaded ' , nm , ' (' , d frameCount printString , ' frames)'
+    ]
+
+    WinSpriteEd class >> sheets [
+        | reply names |
+        reply := [ WinHost implementorsOf: 'isSpriteSheet' ]
+            on: Error do: [ :e | Array with: false with: e messageText ].
+        (reply at: 1) ifFalse: [ ^self status: 'sheets: ' , (reply at: 2) printString ].
+        names := OrderedCollection new.
+        (WinShell splitFindReply: (reply at: 2)) do: [ :fields |
+            fields isEmpty ifFalse: [ names add: (fields at: 1) ] ].
+        names isEmpty ifTrue: [ ^self status: 'no sprite sheets in the image yet' ].
+        ^self status: 'sheets: ' , (self joined: names)
+    ]
+
+    WinSpriteEd class >> joined: names <OrderedCollection> ^ <String> [
+        | out first |
+        out := ''.
+        first := true.
+        names do: [ :n |
+            first ifFalse: [ out := out , ' ' ].
+            first := false.
+            out := out , n ].
+        ^out
+    ]
+
+    "Every single-quoted run's contents, in order. PURE."
+    WinSpriteEd class >> quotedStringsIn: src <String> ^ <OrderedCollection> [
+        | out run inside |
+        out := OrderedCollection new.
+        run := ''.
+        inside := false.
+        src do: [ :ch |
+            ch = $'
+                ifTrue: [
+                    inside ifTrue: [ out add: run. run := '' ].
+                    inside := inside not ]
+                ifFalse: [ inside ifTrue: [ run := run , (String with: ch) ] ] ].
+        ^out
+    ]
+
+    "Every digit run, grouped in threes — and nil unless there are EXACTLY
+     forty-eight of them, because sixteen colours is what a sheet has and a
+     short read would silently recolour the sprite."
+    WinSpriteEd class >> integerTriplesIn: src <String> ^ <Object> [
+        | nums run out i |
+        nums := OrderedCollection new.
+        run := ''.
+        src do: [ :ch |
+            ch isDigit
+                ifTrue: [ run := run , (String with: ch) ]
+                ifFalse: [
+                    run isEmpty ifFalse: [ nums add: run asInteger. run := '' ] ] ].
+        run isEmpty ifFalse: [ nums add: run asInteger ].
+        nums size = 48 ifFalse: [ ^nil ].
+        out := OrderedCollection new.
+        i := 1.
+        [ i <= 48 ] whileTrue: [
+            out add: (Array with: (nums at: i) with: (nums at: i + 1)
+                            with: (nums at: i + 2)).
+            i := i + 3 ].
+        ^out
+    ]
+
+    "── preview: the sprite ANIMATING, in the real game pane ────────────"
+
+    WinSpriteEd class >> preview [
+        "Composed from the model every time, so it cannot drift from what is
+         on the canvas, and launched down the same road as any demo."
+        WinShell launchDemo: self previewDoit named: 'Sprite preview'.
+        ^self status: 'preview launched (' , self doc frameCount printString , ' frames)'
+    ]
+
+    WinSpriteEd class >> previewDoit ^ <String> [
+        "NOTE THE DOUBLE BACKSLASH. The Mac's own preview emits `\` here
+         (76_spriteed.mst:784) and there is no such selector — modulo is `\\`
+         — so its animated branch is a doesNotUnderstand at step time. Written
+         correctly here, and said out loud so the next reader does not
+         `correct` it back."
+        | d nl out i c |
+        d := self doc.
+        nl := String with: (Character value: 10).
+        "WRAPPED IN A BLOCK, and that is not style. A doit crossing the worker
+         seam is compiled as a top-level chunk, and this world's parser
+         refuses temporaries there — the whole preview raised, replied, and
+         the reply block cheerfully said `up`, so the only symptom was a black
+         pane. A BLOCK may declare temps anywhere, so the body goes inside one
+         and the doit becomes a single expression."
+        out := 'GamePane reset. ' , nl.
+        out := out , '[ | p s fr tick last | ' , nl.
+        out := out , 'p := GamePane new. p resizeTo: 320 by: 180. p frameRate: 12. ' , nl.
+        out := out , 'fr := OrderedCollection new. ' , nl.
+        0 to: d frameCount - 1 do: [ :f |
+            out := out , 'fr add: ''' , (d rowsOf: f) , '''. ' , nl ].
+        out := out , 'fr := fr asArray. ' , nl.
+        out := out , 's := p defineSprite: (fr at: 1). ' , nl.
+        out := out , '2 to: fr size do: [ :k | s addFrame: (fr at: k) ]. ' , nl.
+        i := 1.
+        [ i <= 15 ] whileTrue: [
+            c := d paletteAt: i.
+            out := out , 's colorAt: ' , i printString ,
+                ' r: ' , (c at: 1) printString ,
+                ' g: ' , (c at: 2) printString ,
+                ' b: ' , (c at: 3) printString , '. ' , nl.
+            i := i + 1 ].
+        "The pane's OWN palette mirrors the sprite's into 17..31, so the big
+         rendition can be drawn with `fill:` rects in the same colours the
+         hardware sprite uses — the Mac's own trick, and the reason a preview
+         can show one sprite twice at two sizes."
+        i := 1.
+        [ i <= 15 ] whileTrue: [
+            c := d paletteAt: i.
+            out := out , 'p paletteAt: ' , (16 + i) printString ,
+                ' r: ' , (c at: 1) printString ,
+                ' g: ' , (c at: 2) printString ,
+                ' b: ' , (c at: 3) printString , '. ' , nl.
+            i := i + 1 ].
+        out := out , 'p paletteAt: 16 r: 68 g: 70 b: 84. ' , nl.
+        out := out , 'tick := 0. last := -1. ' , nl.
+        out := out , 'p onStep: [ :frame | | f rows scale ox oy | ' , nl.
+        out := out , '  tick := tick + 1. ' , nl.
+        out := out , '  f := tick // 6 \\ fr size. ' , nl.
+        out := out , '  f = last ifFalse: [ ' , nl.
+        out := out , '    last := f. ' , nl.
+        out := out , '    p cls: 16. ' , nl.
+        "The big one, cell by cell — index 0 is skipped, so the background
+         shows through exactly where the sprite is transparent."
+        out := out , '    rows := (fr at: f + 1) subStrings: ''/''. ' , nl.
+        out := out , '    scale := 128 // (rows size max: 1). ' , nl.
+        out := out , '    scale < 1 ifTrue: [ scale := 1 ]. ' , nl.
+        out := out , '    ox := 160. oy := 90 - (rows size * scale // 2). ' , nl.
+        out := out , '    1 to: rows size do: [ :ry | ' , nl.
+        out := out , '      1 to: (rows at: ry) size do: [ :rx | | ci | ' , nl.
+        out := out , '        ci := ((rows at: ry) at: rx) digitValue. ' , nl.
+        out := out , '        ci > 0 ifTrue: [ ' , nl.
+        out := out , '          p fill: ox + (rx - 1 * scale) y: oy + (ry - 1 * scale) ' , nl.
+        out := out , '            width: scale height: scale color: 16 + ci ] ] ]. ' , nl.
+        out := out , '    s moveTo: 80 y: 82 frame: f ]. ' , nl.
+        out := out , '  p present ]. ' , nl.
+        out := out , 'p run ] value. 1'.
+        ^out
+    ]
+
+    WinSpriteEd class >> copyCode [
+        [ WinShell clipboardText: self doc codeSnippet ]
+            on: Error do: [ :e | ^self status: 'copy FAILED: ' , e messageText ].
+        ^self status: 'code copied to the clipboard'
+    ]
+
+    "── the two surfaces ────────────────────────────────────────────────
+
+     Painted from the model every time, whole — `blast, don't patch`, which is
+     the Mac's own note and is right for the same reason there: a partial
+     repaint is a second description of the picture, and two descriptions
+     disagree."
+
+    "Called once per DIRTY pane, with the damage the handler recorded — nil
+     for all of it, a {x. y. w. h} rect in pane pixels for a region. A pane
+     nobody invalidated is never painted at all."
+    WinSpriteEd class >> paintPane: paneId <Object> damage: region <Object> in: tool <Object> [
+        paneId = 'grid' ifTrue: [
+            ^self paintGridOn: (tool paneHwnd: #grid) damage: region ].
+        paneId = 'swatches' ifTrue: [
+            ^self paintSwatchesOn: (tool paneHwnd: #swatches) ].
+        ^self
+    ]
+
+    "The inclusive cell bounds {x0. y0. x1. y1} a pane-pixel rect touches —
+     the whole sprite when the damage is nil. PURE, and tested: this is the
+     arithmetic that turns `one stroke` into `one cell repainted`."
+    WinSpriteEd class >> cellRangeFor: region <Object> ^ <Array> [
+        | cell d |
+        d := self doc.
+        region isNil ifTrue: [
+            ^Array with: 0 with: 0 with: d width - 1 with: d height - 1 ].
+        cell := self cellSize.
+        ^Array
+            with: (((region at: 1) // cell) max: 0)
+            with: (((region at: 2) // cell) max: 0)
+            with: ((((region at: 1) + (region at: 3) - 1) // cell) min: d width - 1)
+            with: ((((region at: 2) + (region at: 4) - 1) // cell) min: d height - 1)
+    ]
+
+    "A pane has no plane until a renderer is attached to it, exactly as the
+     Canvas view attaches before it draws. Idempotent: a pane that already has
+     one answers its cell width and is left alone."
+    WinSpriteEd class >> attach: hwnd <Integer> ^ <Boolean> [
+        (WinRender cellWidthFor: hwnd) = 0 ifFalse: [ ^true ].
+        ^[ WinRender attach: hwnd points: 9 dpi: WinShell editorMetricsDpi ]
+            on: Error do: [ :e | false ]
+    ]
+
+    WinSpriteEd class >> paintGridOn: hwnd <Integer> damage: region <Object> [
+        "CELLS OUTSIDE, PIXELS INSIDE, and only the DAMAGED cells at all —
+         which is the whole performance story told twice. The first cut asked
+         the document per device pixel: 186,624 sends for a 16x16 sprite,
+         slow enough that the door declined the next click while the VM was
+         busy and two thirds of a stroke went missing. Per cell brought that
+         to 256. The damage brings a pencil stroke to ONE — the handler knew
+         which cell it touched all along, and the pane's plane is retained, so
+         everything outside the region is simply still there."
+        | d cell gw gh base stride idx c word x0 y0 px py range |
+        hwnd = 0 ifTrue: [ ^self ].
+        (self attach: hwnd) ifFalse: [ ^self ].
+        d := self doc.
+        cell := self cellSize.
+        gw := self gridWidth.
+        gh := self gridHeight.
+        base := WinPixels planeFor: hwnd width: gw height: gh.
+        base = 0 ifTrue: [ ^self ].
+        stride := WinPixels strideFor: hwnd.
+        range := self cellRangeFor: region.
+        (range at: 2) to: (range at: 4) do: [ :cy |
+            (range at: 1) to: (range at: 3) do: [ :cx |
+                idx := d getPx: self curFrame x: cx y: cy.
+                c := idx = 0 ifTrue: [ nil ] ifFalse: [ d paletteAt: idx ].
+                word := c isNil
+                    ifTrue: [ 0 ]
+                    ifFalse: [ WinPixels bgraR: (c at: 1) g: (c at: 2) b: (c at: 3) ].
+                x0 := cx * cell.
+                y0 := cy * cell.
+                0 to: cell - 1 do: [ :dy |
+                    py := y0 + dy.
+                    0 to: cell - 1 do: [ :dx |
+                        px := x0 + dx.
+                        WinPixels at: base x: px y: py stride: stride put:
+                            ((dx = 0 or: [ dy = 0 ])
+                                "A one-pixel lattice on each cell's left and top
+                                 edge - so there is no outer right or bottom
+                                 border, which is the Mac's look exactly."
+                                ifTrue: [ WinPixels bgraR: 40 g: 40 b: 44 ]
+                                ifFalse: [
+                                    c isNil
+                                        ifTrue: [
+                                            "The checker is in WHOLE-SURFACE
+                                             coordinates, so with a cell of 27
+                                             it deliberately does not line up."
+                                            ((px // 8) + (py // 8)) \\ 2 = 0
+                                                ifTrue: [ WinPixels bgraR: 58 g: 58 b: 64 ]
+                                                ifFalse: [ WinPixels bgraR: 74 g: 74 b: 82 ] ]
+                                        ifFalse: [ word ] ]) ] ] ] ].
+        WinRender present: hwnd.
+        ^self
+    ]
+
+    WinSpriteEd class >> paintSwatchesOn: hwnd <Integer> [
+        | d cellPx w h base stride px py col row i c word inCentre border |
+        hwnd = 0 ifTrue: [ ^self ].
+        (self attach: hwnd) ifFalse: [ ^self ].
+        d := self doc.
+        cellPx := self swatchCell.
+        w := self swatchWidth.
+        h := self swatchHeight.
+        base := WinPixels planeFor: hwnd width: w height: h.
+        base = 0 ifTrue: [ ^self ].
+        stride := WinPixels strideFor: hwnd.
+        py := 0.
+        [ py < h ] whileTrue: [
+            px := 0.
+            [ px < w ] whileTrue: [
+                col := px // cellPx.
+                row := py // cellPx.
+                i := (row * 8) + col.
+                c := d paletteAt: i.
+                word := WinPixels bgraR: (c at: 1) g: (c at: 2) b: (c at: 3).
+                i = 0 ifTrue: [
+                    "Entry 0 is KEPT but transparent, so it is drawn as a
+                     checker with its real colour in a centre patch — the
+                     colour is real and the meaning is `none`."
+                    inCentre := ((px \\ cellPx) between: 14 and: 33)
+                        and: [ (py \\ cellPx) between: 14 and: 33 ].
+                    inCentre ifFalse: [
+                        word := (((px \\ cellPx) // 8) + ((py \\ cellPx) // 8)) \\ 2 = 0
+                            ifTrue: [ WinPixels bgraR: 58 g: 58 b: 64 ]
+                            ifFalse: [ WinPixels bgraR: 74 g: 74 b: 82 ] ] ].
+                border := (px \\ cellPx) < 3
+                    or: [ (px \\ cellPx) >= (cellPx - 3)
+                    or: [ (py \\ cellPx) < 3
+                    or: [ (py \\ cellPx) >= (cellPx - 3) ] ] ].
+                (border and: [ i = self selColor ])
+                    ifTrue: [ word := WinPixels bgraR: 255 g: 255 b: 255 ].
+                WinPixels at: base x: px y: py stride: stride put: word.
+                px := px + 1 ].
+            py := py + 1 ].
+        WinRender present: hwnd.
+        ^self
+    ]
+
+    "── registration ────────────────────────────────────────────────────"
+
+    WinSpriteEd class >> install [
+        WinToolWindow
+            register: #spriteEd title: 'Sprite Editor' width: 1020 height: 720
+            render: [ WinSpriteEd spec ]
+            handler: [ :event :value |
+                WinSpriteEd handle: event value: value.
+                (WinToolWindow named: #spriteEd) rerender ]
+            paint: [ :tool :paneId :region |
+                WinSpriteEd paintPane: paneId damage: region in: tool ].
+        ^self
+    ]
+
+    "── the scripted surface, the Mac's own probes ──────────────────────"
+
+    WinSpriteEd class >> spedRows ^ <String> [ ^self doc rowsOf: self curFrame ]
+    WinSpriteEd class >> spedStatus ^ <String> [ ^self status ]
+    WinSpriteEd class >> spedColor: i <Integer> [ ^self selectColour: i ]
+    WinSpriteEd class >> spedTool: aSymbol <Symbol> [ ^self selectTool: aSymbol ]
+    WinSpriteEd class >> spedPaintX: x <Integer> y: y <Integer> [
+        ^self paintAt: (Array with: x * self cellSize with: y * self cellSize)
+    ]
+]
+
+WinSpriteEd install.

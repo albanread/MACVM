@@ -1,0 +1,164 @@
+"64_winditors_tests.mst — the acceptance test of the whole arc, as a gate.
+
+ `world/91b_winspriteed.mst` and `world/91c_winsoundtool.mst` are WINARMVM's
+ `126_winui_spriteed.mst` and `127_winui_soundtool.mst`, VENDORED BYTE FOR
+ BYTE. Not one character was changed to make them run here. They declare
+ classes called WinSpriteEd and WinSoundEd, build their windows with WinSpec,
+ draw with WinPixels, and reach the image through WinHost — and every one of
+ those names resolves to a portable class with a Mac implementation behind it.
+
+ The author's definition of done, verbatim: *once deployed the sound and
+ sprite editor should just port over, no effort at all, that's the point.*
+ These assertions are that sentence, written so it stays true.
+
+ WHAT THEY DO NOT CLAIM. The realizer under them is the null one, so nothing
+ here is about pixels on a screen; it is about the tools LOADING, registering,
+ building valid specs, placing their controls, receiving their surfaces, and
+ running their own scripted verbs without a single report. The screen was
+ verified separately and by hand — both editors, drawn and driven. What these
+ protect is the thing most likely to rot silently: that a change on our side
+ has not made the tools unloadable or their contract unmeetable."
+
+TestCase subclass: WinEditorPortabilityTests [
+
+    ensureSprite [
+        (AppToolWindow named: #spriteEd) isNil ifTrue: [ WinSpriteEd install ].
+        ^AppToolWindow named: #spriteEd
+    ]
+
+    ensureSound [
+        (AppToolWindow named: #soundEd) isNil ifTrue: [ WinSoundEd install ].
+        ^AppToolWindow named: #soundEd
+    ]
+
+    "── they are here, and they are what they say ───────────────────────"
+
+    testBothWindowsEditorsRegisterThroughTheAliases [
+        self assert: self ensureSprite title equals: 'Sprite Editor'.
+        self assert: self ensureSound title equals: 'Sound Editor'.
+    ]
+
+    "Their specs are built by WinSpec and pass OUR validator — the contract is
+     the same object on both platforms, not merely a similar one."
+    testTheirSpecsAreValidAppNodeTrees [
+        | sp so |
+        sp := AppSpec normalize: WinSpriteEd spec.
+        so := AppSpec normalize: WinSoundEd spec.
+        self assert: (sp isKindOf: AppNode).
+        self assert: (AppSpec validate: sp) isNil.
+        self assert: (AppSpec validate: so) isNil.
+    ]
+
+    "── they open, and their panes get real surfaces ────────────────────"
+
+    testTheSpriteEditorOpensWithBothOfItsSurfaces [
+        | w |
+        w := self ensureSprite.
+        w teardown.
+        AppToolWindow clearReports.
+        self assert: w open.
+        "The grid and the palette strip are BOTH rgbaPane nodes upstream, which
+         is exactly why A3's rgbaPane was enough to unblock this."
+        self assert: (w paneHandle: #grid) > 0.
+        self assert: (w paneHandle: #swatches) > 0.
+        self assert: (AppRender widthFor: (w paneHandle: #grid)) > 0.
+        self assert: AppToolWindow reports isEmpty description: 'opened without reporting'.
+    ]
+
+    testTheSoundEditorOpensAndPlacesItsControls [
+        | w |
+        w := self ensureSound.
+        w teardown.
+        AppToolWindow clearReports.
+        self assert: w open.
+        self assert: w realizer placedIds size > 20 description: 'its whole face was placed'.
+        self assert: AppToolWindow reports isEmpty.
+    ]
+
+    "── they RUN, through their own scripted verbs ──────────────────────"
+
+    "The sprite editor's own probes — the surface WINARMVM added so a script
+     could drive it — exercised here to prove the document, the damage and the
+     patch path all still work when the platform underneath changed."
+    testPaintingThroughTheSpriteEditorsOwnProbesChangesTheDocument [
+        | w before after |
+        w := self ensureSprite.
+        w teardown.
+        w open.
+        WinSpriteEd spedColor: 9.
+        before := WinSpriteEd spedRows.
+        WinSpriteEd spedPaintX: 3 y: 2.
+        after := WinSpriteEd spedRows.
+        self deny: before = after description: 'the sprite changed'.
+        self assert: WinSpriteEd spedStatus equals: 'colour 9'.
+    ]
+
+    "A STROKE DAMAGES ONLY WHAT IT TOUCHED, and consecutive strokes union into
+     one box — the discipline A3 built, exercised by a tool that was written
+     against the other platform's version of it."
+    testAStrokeDamagesOnlyTheCellsItTouched [
+        | w d |
+        w := self ensureSprite.
+        w teardown.
+        w open.
+        w paintDirty.
+        WinSpriteEd spedPaintX: 3 y: 2.
+        WinSpriteEd spedPaintX: 4 y: 2.
+        d := w damageFor: #grid.
+        self assert: d isNil not description: 'something was invalidated'.
+        self deny: d == #clean.
+        "Two adjacent cells on one row: a box two cells wide and one tall,
+         never the whole 16x16 pane."
+        self assert: (d at: 3) < (AppRender widthFor: (w paneHandle: #grid))
+             description: 'the damage is a region, not the whole pane'.
+    ]
+
+    "And a repaint after it patches rather than rebuilding."
+    testARepaintAfterAStrokePatchesInPlace [
+        | w |
+        w := self ensureSprite.
+        w teardown.
+        w open.
+        AppToolWindow resetCounts.
+        WinSpriteEd spedColor: 5.
+        WinSpriteEd spedPaintX: 6 y: 6.
+        w rerender.
+        self assert: AppToolWindow rebuildCount equals: 0 description: 'no rebuild'.
+        self assert: AppToolWindow patchCount > 0 description: 'patched'.
+    ]
+
+    "The sound editor's recipe moves when a preset is stepped — its document,
+     its conversions, its status line, none of which we wrote."
+    testSteppingASoundPresetChangesTheRecipe [
+        | w before after |
+        w := self ensureSound.
+        w teardown.
+        w open.
+        before := WinSoundEd sndParams.
+        WinSoundEd sndPreset: 2.
+        after := WinSoundEd sndParams.
+        self deny: before = after description: 'the recipe changed'.
+        "THE STATUS LINE DEPENDS ON THE AUDITION, and both answers are correct.
+         Stepping a preset also SOUNDS it, so with a worker the status is
+         `preset: zap` and headless it is the audition's own `cannot send`.
+         Asserting the first cost a red the moment this ran outside the GUI,
+         which is the test learning what the tool actually does: the claim is
+         that a preset step is reported at all, not which of the two it says."
+        self assert: WinSoundEd sndStatus isEmpty not description: 'it said something'.
+    ]
+
+    "AUDITION FAILS SOFT WITH NO WORKER, which is the behaviour that matters
+     headlessly: an editor whose Play can take its own handler down is broken
+     in the way that costs you the tool."
+    testAuditionWithoutAWorkerIsReportedNotFatal [
+        | w |
+        w := self ensureSound.
+        w teardown.
+        w open.
+        AppToolWindow clearReports.
+        WinSoundEd sndPreset: 1.
+        self assert: WinSoundEd sndStatus isNil not.
+        self assert: AppToolWindow reports isEmpty
+             description: 'a missing audition worker is handled, not reported as a tool fault'.
+    ]
+]

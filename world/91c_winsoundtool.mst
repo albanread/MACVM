@@ -1,0 +1,442 @@
+"127_winui_soundtool.mst — the Sound Editor as a declarative tool (WG14c),
+ the migration SPRINTS promised: `Sound Editor first`.
+
+ THREE FACES OF ONE DOCUMENT have now existed, and the lineage is the point.
+ The Mac's (`world/77_sounded.mst`) is NSSliders over absolute rects; WG13's
+ (`world/121_winui_sounded.mst`) is a cell grid driven by the keyboard,
+ because a trackbar carries an integer and twelve hand-written fixed-point
+ mappings were twelve chances to round a recipe. This one gets the sliders
+ back WITHOUT the twelve mappings: the fields are a TABLE — event, label,
+ range, setter — and one pair of pure conversions (`posFor:`/`valueFor:`)
+ serves every slider, because the spec builder and the handler read the same
+ row. `SoundDoc` (`world/44b_sounddoc.mst`) still owns every clamp; a slider
+ is a way of ASKING for a value, and the document remains the one that says.
+
+ THE ENVELOPE IS A PANE, and the damage rule from the sprite editor applies
+ unchanged: only the fields that change the CURVE invalidate it — the ADSR
+ five and the two sweeps. Noise, distortion and the echo trio are audible,
+ not visible, and dragging them repaints nothing.
+
+ AUDITION IS THE MAC'S, behaviour for behaviour: Play, a preset step, Random,
+ Mutate and a wave click all sound the recipe through primitive 263 in the
+ PRIMARY (only the primary holds a game sink); a slider drag does NOT — it
+ relabels and redraws, and you press Play when you want to hear it.
+
+ THE OSCILLATOR ROWS ARE THE DIFFER'S SHOWCASE. `Osc +` adds four named
+ nodes to a named list, so the reconciler APPENDS them; `Osc -` removes them;
+ nothing else in the window is touched either way."
+
+Object subclass: WinSoundEd [
+    <classVars: Doc PresetIx Rng Status>
+
+    "── state ───────────────────────────────────────────────────────────"
+
+    WinSoundEd class >> doc ^ <Object> [
+        Doc isNil ifTrue: [ Doc := SoundDoc new ].
+        ^Doc
+    ]
+
+    WinSoundEd class >> rng ^ <Object> [
+        "THE SAME SEED THE MAC USES (77_sounded.mst): the world's Random is an
+         exact-integer LCG with a pinned test vector, so Random and Mutate
+         produce the identical sequence on both platforms."
+        Rng isNil ifTrue: [ Rng := Random newWithSeed: 20260807 ].
+        ^Rng
+    ]
+
+    WinSoundEd class >> presetIx ^ <Integer> [
+        ^PresetIx isNil ifTrue: [ -1 ] ifFalse: [ PresetIx ]
+    ]
+
+    WinSoundEd class >> status ^ <String> [
+        ^Status isNil
+            ifTrue: [ 'a fresh 440Hz sine - Play auditions, Preset cycles the twelve' ]
+            ifFalse: [ Status ]
+    ]
+    WinSoundEd class >> status: aString <String> [ Status := aString. ^self ]
+
+    "── the field table: every slider is one row here ───────────────────
+     {event. label. lo. hi. kind} — kind #scaled maps through 0..1000, kind
+     #direct is the trackbar's own integers (echoes: nine detents, exact).
+     The GETTER is the event symbol; the setter is it plus a colon."
+
+    WinSoundEd class >> recipeFields ^ <OrderedCollection> [
+        | out |
+        out := OrderedCollection new.
+        out add: { #duration.   'duration'.   0.05. 4.0.    #scaled }.
+        out add: { #attack.     'attack'.     0.0.  2.0.    #scaled }.
+        out add: { #decay.      'decay'.      0.0.  2.0.    #scaled }.
+        out add: { #sustain.    'sustain'.    0.0.  1.0.    #scaled }.
+        out add: { #release.    'release'.    0.0.  2.0.    #scaled }.
+        out add: { #sweepStart. 'sweep from'. 0.0.  4000.0. #scaled }.
+        out add: { #sweepEnd.   'sweep to'.   0.0.  4000.0. #scaled }.
+        out add: { #noiseMix.   'noise'.      0.0.  1.0.    #scaled }.
+        out add: { #distortion. 'distortion'. 0.0.  3.0.    #scaled }.
+        out add: { #echoCount.  'echoes'.     0.    8.      #direct }.
+        out add: { #echoDelay.  'echo delay'. 0.0.  0.5.    #scaled }.
+        out add: { #echoDecay.  'echo decay'. 0.0.  1.0.    #scaled }.
+        ^out
+    ]
+
+    "The fields whose value SHOWS in the envelope pane. The others are
+     audible, not visible, and dragging them repaints nothing."
+    WinSoundEd class >> curveFields ^ <Array> [
+        ^#(#duration #attack #decay #sustain #release #sweepStart #sweepEnd)
+    ]
+
+    "── the two conversions, written once ───────────────────────────────"
+
+    WinSoundEd class >> posFor: v <Number> lo: lo <Number> hi: hi <Number> ^ <Integer> [
+        ^((((v - lo) * 1000.0 / (hi - lo)) rounded) max: 0) min: 1000
+    ]
+
+    WinSoundEd class >> valueFor: pos <Integer> lo: lo <Number> hi: hi <Number> ^ <Number> [
+        ^lo + (pos * 1.0 / 1000.0 * (hi - lo))
+    ]
+
+    WinSoundEd class >> round2: v <Number> ^ <String> [
+        ^((v * 100) rounded / 100.0) printString
+    ]
+
+    WinSoundEd class >> readingFor: field <Array> ^ <String> [
+        | ev v |
+        ev := field at: 1.
+        v := self doc perform: ev.
+        ev == #echoCount ifTrue: [ ^v printString ].
+        (ev == #sweepStart or: [ ev == #sweepEnd ])
+            ifTrue: [ ^v rounded printString , ' Hz' ].
+        (ev == #duration or: [ ev == #echoDelay ])
+            ifTrue: [ ^(self round2: v) , ' s' ].
+        ^self round2: v
+    ]
+
+    "── the spec ────────────────────────────────────────────────────────"
+
+    WinSoundEd class >> spec ^ <WinNode> [
+        "LANDSCAPE, like the instrument panel it is — the Mac's is 740x580 and
+         the first cut here was a 480x980 tower, because the layout had no way
+         to say `columns` until weighted rows existed. Left: what you LISTEN
+         with — the envelope, the verbs, the oscillators, the sheet. Right:
+         the twelve recipe sliders in two columns of six, the Mac's own 2x6."
+        | d |
+        d := self doc.
+        ^WinSpec window: 'Sound Editor' id: #soundWin
+            body: (WinSpec stack: {
+                WinSpec text: self status id: #status.
+                WinSpec row: {
+                    WinSpec stack: {
+                        WinSpec rgbaPane: #env width: 420 height: 120.
+                        WinSpec row: {
+                            WinSpec button: 'Play' event: #play id: #bPlay.
+                            WinSpec button: 'Preset: ' , self presetLabel
+                                    event: #preset id: #bPreset.
+                            WinSpec button: 'Random' event: #random id: #bRandom.
+                            WinSpec button: 'Mutate' event: #mutate id: #bMutate.
+                            WinSpec button: 'New' event: #new id: #bNew
+                        } id: #verbs.
+                        self oscCard.
+                        WinSpec card: 'Sheet' children: {
+                            WinSpec input: 'Name' value: d name event: #name id: #nameField.
+                            WinSpec row: {
+                                WinSpec button: 'Save' event: #save id: #bSave.
+                                WinSpec button: 'Copy Code' event: #copy id: #bCopy
+                            } id: #sheetButtons
+                        } id: #sheetCard
+                    } id: #leftCol.
+                    self recipeCard
+                } weights: #(10 11) id: #main
+            } id: #root)
+    ]
+
+    WinSoundEd class >> presetLabel ^ <String> [
+        (self presetIx < 0 or: [ self presetIx > 11 ]) ifTrue: [ ^'-' ].
+        ^SoundDoc presetNames at: self presetIx + 1
+    ]
+
+    WinSoundEd class >> recipeCard ^ <WinNode> [
+        "Two columns of six — the Mac's own 2x6 grid, expressed as a weighted
+         row of two stacks so each slider gets half the card."
+        | fields a b |
+        fields := self recipeFields.
+        a := OrderedCollection new.
+        b := OrderedCollection new.
+        1 to: fields size do: [ :i |
+            (i <= 6 ifTrue: [ a ] ifFalse: [ b ])
+                add: (self sliderFor: (fields at: i)) ].
+        ^WinSpec card: 'Recipe' children: {
+            WinSpec row: {
+                WinSpec stack: a id: #recipeA.
+                WinSpec stack: b id: #recipeB
+            } weights: #(1 1) id: #recipeCols
+        } id: #recipeCard
+    ]
+
+    WinSoundEd class >> sliderFor: field <Array> ^ <WinNode> [
+        | ev v |
+        ev := field at: 1.
+        v := self doc perform: ev.
+        (field at: 5) == #direct ifTrue: [
+            ^WinSpec slider: (field at: 2) , '  ' , (self readingFor: field)
+                    value: v min: (field at: 3) max: (field at: 4)
+                    event: ev id: ev ].
+        ^WinSpec slider: (field at: 2) , '  ' , (self readingFor: field)
+                value: (self posFor: v lo: (field at: 3) hi: (field at: 4))
+                min: 0 max: 1000
+                event: ev id: ev
+    ]
+
+    WinSoundEd class >> oscCard ^ <WinNode> [
+        | d kids |
+        d := self doc.
+        kids := OrderedCollection new.
+        1 to: d oscCount do: [ :i |
+            kids add: (WinSpec button: 'osc ' , i printString , ': '
+                                , (d oscWaveNameAt: i)
+                          event: (self oscEvent: i kind: 'Wave')
+                          id: (self oscEvent: i kind: 'Wave')).
+            kids add: (self oscSlider: i kind: 'Freq' label: 'freq'
+                            value: ((d oscAt: i) at: 2) lo: 20.0 hi: 8000.0).
+            kids add: (self oscSlider: i kind: 'Amp' label: 'amp'
+                            value: ((d oscAt: i) at: 3) lo: 0.0 hi: 1.0).
+            kids add: (self oscSlider: i kind: 'Pw' label: 'width'
+                            value: ((d oscAt: i) at: 5) lo: 0.01 hi: 0.99) ].
+        kids add: (WinSpec row: {
+            WinSpec button: 'Osc +' event: #oscPlus id: #bOscPlus.
+            WinSpec button: 'Osc -' event: #oscMinus id: #bOscMinus
+        } id: #oscButtons).
+        ^WinSpec card: 'Oscillators (' , d oscCount printString , ')'
+                children: kids id: #oscCard
+    ]
+
+    WinSoundEd class >> oscEvent: i <Integer> kind: aString <String> ^ <Symbol> [
+        ^('osc' , i printString , aString) asSymbol
+    ]
+
+    WinSoundEd class >> oscSlider: i <Integer> kind: kind <String> label: aLabel <String>
+                        value: v <Number> lo: lo <Number> hi: hi <Number> ^ <WinNode> [
+        | ev |
+        ev := self oscEvent: i kind: kind.
+        ^WinSpec slider: 'osc ' , i printString , ' ' , aLabel , '  '
+                        , (kind = 'Freq'
+                            ifTrue: [ v rounded printString , ' Hz' ]
+                            ifFalse: [ self round2: v ])
+                value: (self posFor: v lo: lo hi: hi)
+                min: 0 max: 1000
+                event: ev id: ev
+    ]
+
+    "── events ──────────────────────────────────────────────────────────"
+
+    WinSoundEd class >> handle: event <Symbol> value: value <Object> [
+        | d |
+        d := self doc.
+        event == #play ifTrue: [ ^self audition ].
+        event == #preset ifTrue: [
+            PresetIx := (self presetIx + 1) \\ 12.
+            d loadPreset: self presetIx.
+            self invalidateEnv.
+            self status: 'preset: ' , self presetLabel.
+            ^self audition ].
+        event == #random ifTrue: [
+            d randomize: self rng.
+            PresetIx := -1.
+            self invalidateEnv.
+            self status: 'randomized (seed ' , d seed printString , ')'.
+            ^self audition ].
+        event == #mutate ifTrue: [
+            "Nudge, don't reroll — and the preset name is KEPT: a mutated coin
+             is still recognisably the coin, which is why the verb exists."
+            d mutate: self rng.
+            self invalidateEnv.
+            self status: 'mutated (seed ' , d seed printString , ')'.
+            ^self audition ].
+        event == #new ifTrue: [
+            Doc := SoundDoc new.
+            PresetIx := -1.
+            self invalidateEnv.
+            ^self status: 'a fresh 440Hz sine' ].
+        event == #save ifTrue: [ ^self save ].
+        event == #copy ifTrue: [ ^self copyCode ].
+        event == #name ifTrue: [ d name: value. ^self ].
+        event == #oscPlus ifTrue: [
+            d addOsc
+                ifTrue: [ ^self status: d oscCount printString , ' oscillators' ]
+                ifFalse: [ ^self status: 'four oscillators is the stack' ] ].
+        event == #oscMinus ifTrue: [
+            d removeOsc
+                ifTrue: [ ^self status: d oscCount printString , ' oscillator'
+                            , (d oscCount = 1 ifTrue: [ '' ] ifFalse: [ 's' ]) ]
+                ifFalse: [ ^self status: 'one oscillator stays' ] ].
+        (self handleRecipe: event value: value) ifTrue: [ ^self ].
+        (self handleOsc: event value: value) ifTrue: [ ^self ].
+        ^self
+    ]
+
+    WinSoundEd class >> handleRecipe: event <Symbol> value: pos <Object> ^ <Boolean> [
+        | d |
+        d := self doc.
+        self recipeFields do: [ :field |
+            (field at: 1) == event ifTrue: [
+                d perform: ((field at: 1) asString , ':') asSymbol
+                  with: ((field at: 5) == #direct
+                    ifTrue: [ pos ]
+                    ifFalse: [ self valueFor: pos lo: (field at: 3) hi: (field at: 4) ]).
+                (self curveFields includes: event) ifTrue: [ self invalidateEnv ].
+                ^true ] ].
+        ^false
+    ]
+
+    WinSoundEd class >> handleOsc: event <Symbol> value: pos <Object> ^ <Boolean> [
+        | d |
+        d := self doc.
+        1 to: d oscCount do: [ :i |
+            event == (self oscEvent: i kind: 'Wave') ifTrue: [
+                "A wave click CYCLES and AUDITIONS — the Mac's own behaviour,
+                 and the quickest way to hear the six shapes side by side."
+                d osc: i wave: (((d oscAt: i) at: 1) + 1) \\ 6.
+                self audition.
+                ^true ].
+            event == (self oscEvent: i kind: 'Freq') ifTrue: [
+                d osc: i freq: (self valueFor: pos lo: 20.0 hi: 8000.0).
+                ^true ].
+            event == (self oscEvent: i kind: 'Amp') ifTrue: [
+                d osc: i amp: (self valueFor: pos lo: 0.0 hi: 1.0).
+                ^true ].
+            event == (self oscEvent: i kind: 'Pw') ifTrue: [
+                d osc: i pw: (self valueFor: pos lo: 0.01 hi: 0.99).
+                ^true ] ].
+        ^false
+    ]
+
+    "── the verbs ───────────────────────────────────────────────────────"
+
+    WinSoundEd class >> audition [
+        "THE REAL SYNTH: primitive 263 in the primary, byte-for-byte the
+         engine the games use. `paramsList printString` is a literal array,
+         so the wire text parses on the far side with nothing to escape.
+
+         FAILURE-SOFT, because the worker seam is allowed to be absent —
+         headless there is no primary to send to, and an editor whose Play
+         can take its own handler down is broken in the way that matters."
+        [ Worker uiDoit: 'Sound playEffect: ' , self doc paramsList printString
+              onReply: [ :r | ] ]
+            on: Error do: [ :e | self status: 'audition: ' , e messageText ].
+        ^self
+    ]
+
+    WinSoundEd class >> save [
+        | d reply |
+        d := self doc.
+        (SpriteDoc validName: d name) ifFalse: [
+            ^self status: 'save: name must be a capitalised identifier' ].
+        reply := [ WinHost persistClass: d sheetSource ]
+            on: Error do: [ :e | Array with: false with: e messageText ].
+        ^self status: ((reply at: 1)
+            ifTrue: [ 'saved ' , d name ]
+            ifFalse: [ 'save FAILED: ' , (reply at: 2) printString ])
+    ]
+
+    WinSoundEd class >> copyCode [
+        [ WinShell clipboardText: self doc codeSnippet ]
+            on: Error do: [ :e | ^self status: 'copy FAILED: ' , e messageText ].
+        ^self status: 'code copied to the clipboard'
+    ]
+
+    "── the envelope pane ───────────────────────────────────────────────"
+
+    WinSoundEd class >> invalidateEnv [
+        (WinToolWindow named: #soundEd) ifNotNil: [ :t | t invalidatePane: #env ].
+        ^self
+    ]
+
+    "The engine's own ADSR shape: gate held for `duration`, release after.
+     PURE, and tested — it is the whole meaning of the picture."
+    WinSoundEd class >> envLevelAt: t <Number> ^ <Number> [
+        | d a dk sus dur rel |
+        d := self doc.
+        a := d attack.
+        dk := d decay.
+        sus := d sustain.
+        dur := d duration.
+        rel := d release.
+        t < a ifTrue: [ ^a <= 0 ifTrue: [ 1.0 ] ifFalse: [ t / a ] ].
+        t < (a + dk) ifTrue: [
+            dk <= 0 ifTrue: [ ^sus ].
+            ^1.0 - ((1.0 - sus) * ((t - a) / dk)) ].
+        t < dur ifTrue: [ ^sus ].
+        rel <= 0 ifTrue: [ ^0.0 ].
+        ^(sus * (1.0 - ((t - dur) / rel))) max: 0.0
+    ]
+
+    WinSoundEd class >> paintEnvOn: hwnd <Integer> [
+        "The Mac's visualization, colour for colour: a (20,22,28) backdrop,
+         the sweep as an amber curve scaled to the MODEL's 4000Hz ceiling —
+         not the slider's — and the envelope as a two-pixel blue trace."
+        | d w h base stride total sw t f lvl y back |
+        hwnd = 0 ifTrue: [ ^self ].
+        (self attach: hwnd) ifFalse: [ ^self ].
+        d := self doc.
+        w := 420.
+        h := 120.
+        base := WinPixels planeFor: hwnd width: w height: h.
+        base = 0 ifTrue: [ ^self ].
+        stride := WinPixels strideFor: hwnd.
+        back := WinPixels bgraR: 20 g: 22 b: 28.
+        0 to: h - 1 do: [ :py |
+            0 to: w - 1 do: [ :px |
+                WinPixels at: base x: px y: py stride: stride put: back ] ].
+        total := d duration + d release.
+        total <= 0 ifTrue: [ ^self ].
+        sw := d sweepStart > 0 or: [ d sweepEnd > 0 ].
+        0 to: w - 1 do: [ :x |
+            t := x * 1.0 * total / (w - 1).
+            sw ifTrue: [
+                f := d sweepStart + ((d sweepEnd - d sweepStart)
+                        * ((t min: d duration) / d duration)).
+                y := h - 6 - (((f / 4000.0 * (h - 12)) rounded) min: h - 12).
+                WinPixels at: base x: x y: (y max: 0) stride: stride
+                          put: (WinPixels bgraR: 214 g: 138 b: 64) ].
+            lvl := self envLevelAt: t.
+            y := h - 6 - (((lvl * (h - 12)) rounded) min: h - 12).
+            y := y max: 0.
+            WinPixels at: base x: x y: y stride: stride
+                      put: (WinPixels bgraR: 96 g: 148 b: 230).
+            y < (h - 1) ifTrue: [
+                WinPixels at: base x: x y: y + 1 stride: stride
+                          put: (WinPixels bgraR: 96 g: 148 b: 230) ] ].
+        WinRender present: hwnd.
+        ^self
+    ]
+
+    WinSoundEd class >> attach: hwnd <Integer> ^ <Boolean> [
+        (WinRender cellWidthFor: hwnd) = 0 ifFalse: [ ^true ].
+        ^[ WinRender attach: hwnd points: 9 dpi: WinShell editorMetricsDpi ]
+            on: Error do: [ :e | false ]
+    ]
+
+    "── registration ────────────────────────────────────────────────────"
+
+    WinSoundEd class >> install [
+        WinToolWindow
+            register: #soundEd title: 'Sound Editor' width: 1150 height: 720
+            render: [ WinSoundEd spec ]
+            handler: [ :event :value |
+                WinSoundEd handle: event value: value.
+                (WinToolWindow named: #soundEd) rerender ]
+            paint: [ :tool :paneId :region |
+                paneId = 'env' ifTrue: [
+                    WinSoundEd paintEnvOn: (tool paneHwnd: #env) ] ].
+        ^self
+    ]
+
+    "── the scripted surface ────────────────────────────────────────────"
+
+    WinSoundEd class >> sndParams ^ <String> [ ^self doc paramsList printString ]
+    WinSoundEd class >> sndStatus ^ <String> [ ^self status ]
+    WinSoundEd class >> sndPreset: i <Integer> [
+        PresetIx := ((i max: 0) min: 11) - 1.
+        ^self handle: #preset value: nil
+    ]
+]
+
+WinSoundEd install.

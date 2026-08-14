@@ -180,6 +180,25 @@ Object subclass: AppRender [
         ^self
     ]
 
+    "── the text-grid metrics, and why they answer what they answer ─────
+
+     WINARMVM's panes have no drawing surface until a renderer is ATTACHED to
+     one, so its tools open with a guard: `(WinRender cellWidthFor: hwnd) = 0
+     ifFalse: [ ^true ]. ^WinRender attach: …`. Here a pane has its surface
+     from birth — `AppSurfaces` registered it as the realizer created the view
+     — so the honest answer to `have you got a cell width` is `yes, nothing to
+     do`, and a non-zero width is how that is said in the vocabulary the tools
+     already speak. `attach:points:dpi:` therefore never runs on this platform;
+     it answers true so a tool that calls it anyway is not told it failed."
+
+    AppRender class >> cellWidthFor: handle <Integer> ^ <Integer> [
+        ^(AppSurfaces at: handle) isNil ifTrue: [ 0 ] ifFalse: [ 8 ]
+    ]
+
+    AppRender class >> attach: handle <Integer> points: pts <Integer> dpi: dpi <Integer> ^ <Boolean> [
+        ^(AppSurfaces at: handle) isNil not
+    ]
+
     "A pane's size, for a tool that wants to fit its drawing to it."
     AppRender class >> widthFor: handle <Integer> ^ <Integer> [
         | s |
