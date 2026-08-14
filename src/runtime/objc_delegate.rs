@@ -151,6 +151,27 @@ fn dispatch(this: *mut c_void, selector: &str, args: &[ArgVal], ret: RetShape) -
     if crate::embed::callback_active() {
         return 0;
     }
+    // THE UI VM DOES ONE THING AT A TIME (the author's rule). While the
+    // thread is inside ANY guest entry, this synchronous door lets QUERIES
+    // through and refuses EVENTS, and the return shape is what tells them
+    // apart:
+    //
+    //   Id / Int — a data-source or toolbar READ (row counts, cell values,
+    //   toolbar items). These have nested inside execs since CG5 — a
+    //   `reloadData` in a refresh exec asks synchronously — and they answer
+    //   from snapshots by design. Refusing them is not safety, it is damage:
+    //   the first cut of this gate refused everything and THE TOOLBAR
+    //   VANISHED, because AppKit asked for its items mid-exec, was handed
+    //   nil, and built an empty bar.
+    //
+    //   Void / Bool — an EVENT or a consent (`windowShouldClose:`, actions,
+    //   text changes). These mutate, and one of them delivered mid-exec is
+    //   the interleaving the rule forbids: refused with the shape default
+    //   (a close answers NO, an action does nothing) — the user acts again
+    //   when the VM is idle, and every queued path is unaffected.
+    if crate::embed::guest_active() && matches!(ret, RetShape::Void | RetShape::Bool) {
+        return 0;
+    }
     // SAFETY: the UI worker's `VmHandle` outlives the run loop (design §3 step 4;
     // dropped only at process exit, or re-published across a CG7 restart), and it
     // was published on THIS (main) thread. The VM is quiescent between callbacks

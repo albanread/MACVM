@@ -172,6 +172,21 @@ fn refresh_metrics(st: &mut DrainState) {
 /// Runs on the main thread ONLY in `NSDefaultRunLoopMode`, so a snapshot never
 /// swaps mid-tracking/modal.
 extern "C" fn drain_perform(info: *mut c_void) {
+    // THE DRAIN IS THE QUEUE'S ONE CONSUMER, AND IT DOES NOT RE-ENTER. A
+    // window op inside one of the execs below can pump the run loop (AppKit
+    // does this for ordering and animation), and the pumped loop then fires
+    // THIS source again — a nested drain, exec-ing into a VM whose
+    // interpreter is already mid-flight. That is the frame tear that aborted
+    // the GUI twice on 2026-08-14 (`Frame::method: frame method slot is not
+    // a CompiledMethod`, through this function's unwind boundary both times):
+    // it survived the C6 gate because this path is not a delegate callback.
+    // Refusing re-entry loses nothing: the pass already on the stack drains
+    // its queues to empty when control returns to it, and anything that
+    // arrives later re-fires the source. One drain, one thing at a time —
+    // the author's rule, applied to the drain itself.
+    if macvm::embed::guest_active() {
+        return;
+    }
     // SAFETY: `info` is the `&mut *Box<DrainState>` main installed; this runs on
     // the main thread where nothing else borrows it concurrently.
     let st = unsafe { &mut *(info as *mut DrainState) };

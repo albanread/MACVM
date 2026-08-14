@@ -142,6 +142,52 @@ thread_local! {
     static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
 }
 
+thread_local! {
+    /// Depth of top-level guest entries live on THIS thread — every way in
+    /// (`exec`, `eval` and its typed twins, `load_source`, `render_fragment`,
+    /// `fire_widget_action`, `dispatch_callback`) counts itself here. See
+    /// [`guest_active`].
+    static GUEST_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Is this thread currently inside ANY top-level guest entry?
+///
+/// THE UI VM DOES ONE THING AT A TIME — the author's rule, stated after the
+/// 2026-08-14 abort, and the invariant this predicate lets the C6 door
+/// ENFORCE rather than assume. Every asynchronous source already queues
+/// (worker envelopes, C4 actions, the control channel — all drained
+/// serially); the one path that could interleave was a SYNCHRONOUS delegate
+/// callback delivered while an exec was mid-flight — a window op inside a
+/// drain exec pumping AppKit into `windowShouldClose:` — which re-borrowed a
+/// live `&mut VmState` and tore the interpreter's frames
+/// (`Frame::method: frame method slot is not a CompiledMethod`, aborting the
+/// whole GUI through `drain_perform`'s unwind boundary). The door now reads
+/// this and fails closed while the VM is busy: sync when idle, refused when
+/// not, one message at a time.
+pub fn guest_active() -> bool {
+    GUEST_DEPTH.with(Cell::get) > 0
+}
+
+/// RAII depth bump for the entry functions. RAII is SOUND here where
+/// [`callback_active`]'s flag is managed manually, and the difference is
+/// which frame holds the state: every entry fn puts its `sigsetjmp` INLINE in
+/// its own frame, so a guest fault `siglongjmp`s back INTO that frame and
+/// leaves through an ordinary `return` — the guard's Drop always runs. The
+/// manual discipline exists for state that must survive inner frames being
+/// skipped, which this is not.
+pub(crate) struct GuestEntry;
+impl GuestEntry {
+    pub(crate) fn enter() -> GuestEntry {
+        GUEST_DEPTH.with(|c| c.set(c.get() + 1));
+        GuestEntry
+    }
+}
+impl Drop for GuestEntry {
+    fn drop(&mut self) {
+        GUEST_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
 /// Is a C6 delegate callback currently executing on this thread? (CG3 review.)
 ///
 /// A delegate callback is a **top-level** VM entry, sound precisely because the
@@ -1092,6 +1138,7 @@ impl VmHandle {
     /// transcript sink first.
     #[allow(unsafe_code)]
     pub fn eval(&mut self, source: &str) -> Result<String, GuestError> {
+        let _guest = GuestEntry::enter();
         let slot = deopt_trap::claim_jmp_slot();
         // SAFETY: `sigsetjmp` is called directly, inline, at this exact call
         // site — its frame (this `eval` invocation) stays live for the whole
@@ -1145,6 +1192,7 @@ impl VmHandle {
     /// discards the value.
     #[allow(unsafe_code)]
     pub fn exec(&mut self, source: &str) -> Result<(), GuestError> {
+        let _guest = GuestEntry::enter();
         let slot = deopt_trap::claim_jmp_slot();
         // SAFETY: as `eval` — `sigsetjmp` inline at this call site, whose
         // frame stays live for the whole recovery window.
@@ -1193,6 +1241,7 @@ impl VmHandle {
     /// had already succeeded).
     #[allow(unsafe_code)]
     pub fn load_source(&mut self, source: &str) -> Result<(), GuestError> {
+        let _guest = GuestEntry::enter();
         let slot = deopt_trap::claim_jmp_slot();
         // SAFETY: as `eval`/`exec` — `sigsetjmp` inline at this call site,
         // whose frame stays live for the whole recovery window.
@@ -1246,6 +1295,7 @@ impl VmHandle {
         body: impl FnOnce(&mut VmState) -> u64,
     ) -> u64 {
         use std::io::Write as _;
+        let _guest = GuestEntry::enter();
         // Re-entrancy guard (CG3 review): a delegate callback is a TOP-LEVEL
         // entry, sound only because the VM is quiescent. If one is already active
         // on this thread — a nested AppKit callback pumped from a modal/tracking
@@ -1353,6 +1403,7 @@ impl VmHandle {
     /// page, matching `ElementSMAPPL`'s own `ifError:` discipline.
     #[allow(unsafe_code)]
     pub fn render_fragment(&mut self, code: &str) -> Result<String, GuestError> {
+        let _guest = GuestEntry::enter();
         let source = format!("(Visual coerce: ([{code}] value)) htmlFragment.");
         let slot = deopt_trap::claim_jmp_slot();
         // SAFETY: as `eval` — `sigsetjmp` inline at this call site, whose frame
@@ -1408,6 +1459,7 @@ impl VmHandle {
     /// rather than a render error.
     #[allow(unsafe_code)]
     pub fn fire_widget_action(&mut self, action_id: &str) -> Result<Option<String>, GuestError> {
+        let _guest = GuestEntry::enter();
         // action_id is a worker-minted 'wN' id (SmapplRegistry), never user
         // text, so it needs no quoting — but guard the assumption cheaply.
         debug_assert!(action_id.bytes().all(|b| b.is_ascii_alphanumeric()));
@@ -1456,6 +1508,7 @@ impl VmHandle {
     /// `Err`, like `render_fragment`'s own non-`String` case.
     #[allow(unsafe_code)]
     pub fn eval_to_string(&mut self, code: &str) -> Result<String, GuestError> {
+        let _guest = GuestEntry::enter();
         let source = format!("([{code}] value).");
         let slot = deopt_trap::claim_jmp_slot();
         // SAFETY: as `render_fragment` — `sigsetjmp` inline at this call site,
@@ -1501,6 +1554,7 @@ impl VmHandle {
     /// answer is an `Err`.
     #[allow(unsafe_code)]
     pub fn eval_to_bytes(&mut self, code: &str) -> Result<Vec<u8>, GuestError> {
+        let _guest = GuestEntry::enter();
         let source = format!("([{code}] value).");
         let slot = deopt_trap::claim_jmp_slot();
         // SAFETY: as `render_fragment` — `sigsetjmp` inline at this call site,
@@ -5317,6 +5371,39 @@ mod tests {
              ({sounds_in_second_half} sounds in frames {}..{FRAMES})",
             FRAMES / 2
         );
+    }
+
+    // ── one thing at a time (docs/appspec.md; the 2026-08-14 abort) ──────
+
+    /// The predicate the C6 door reads. Depth nests, RAII unwinds it on every
+    /// normal exit, and a real guest entry (`dispatch_callback` here, the same
+    /// path a delegate ticket takes) reports busy from the inside and idle
+    /// again after — which is exactly what the door needs to refuse a
+    /// synchronous callback that would interleave with a mid-flight exec.
+    #[test]
+    fn guest_active_reports_any_live_entry_and_clears_after() {
+        assert!(!crate::embed::guest_active(), "idle at rest");
+        {
+            let _a = crate::embed::GuestEntry::enter();
+            assert!(crate::embed::guest_active());
+            {
+                let _b = crate::embed::GuestEntry::enter();
+                assert!(crate::embed::guest_active(), "depth nests");
+            }
+            assert!(crate::embed::guest_active(), "still inside the outer entry");
+        }
+        assert!(!crate::embed::guest_active(), "clean after both exits");
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        let got = vm.dispatch_callback(7, |_vm| {
+            assert!(
+                crate::embed::guest_active(),
+                "a delegate dispatch IS a guest entry — the door must see it"
+            );
+            42
+        });
+        assert_eq!(got, 42);
+        assert!(!crate::embed::guest_active(), "and it is over when it is over");
     }
 
     // ── multi-Smalltalk workers, M1 (docs/multi-smalltalk-worker.md §10) ──
