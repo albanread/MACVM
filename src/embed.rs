@@ -1758,6 +1758,16 @@ impl VmHandle {
     /// `GameStep` pattern): the host loop calls this, then execs
     /// `Worker dispatchPending.`, whose `primPoll` takes it. Rust bytes only
     /// — nothing here is visible to the GC.
+    /// Tell this PRIMARY which of its registered workers is the UI — the
+    /// display every app VM it later spawns is introduced to, and which is
+    /// introduced to them (`docs/worker_peer_links.md` §3). Call once, right
+    /// after `register_hosted_worker`. A primary never told this introduces
+    /// nobody, which is the correct headless behaviour rather than a
+    /// degraded one.
+    pub fn set_ui_peer(&mut self, handle: u32) -> bool {
+        crate::runtime::workers::set_ui_peer(&mut self.vm, handle)
+    }
+
     /// Hand this (worker-role) VM its own inbox — the link it offers as an
     /// envelope's `reply_to` so a peer can answer it directly
     /// (`docs/worker_peer_links.md`). Called by the worker thread right after

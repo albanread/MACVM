@@ -369,6 +369,13 @@ pub enum WorkerState {
         /// This primary's process-unique epoch (the global-table section
         /// above): workers born of it exit when it is marked dead.
         epoch: u64,
+        /// WHICH LINK IS THE UI, if this embedding has one. The primary is
+        /// the only VM that knows everyone, so it is the only one that can
+        /// introduce a newly spawned worker to the display and vice versa
+        /// (`docs/worker_peer_links.md` §3). `None` in a headless embedding,
+        /// where nothing is introduced and workers simply talk to their
+        /// parent as they always did.
+        ui_peer: Option<u32>,
     },
     Worker {
         self_id: u32,
@@ -419,6 +426,7 @@ impl WorkerState {
             },
             boot,
             epoch: NEXT_PRIMARY_EPOCH.fetch_add(1, Ordering::Relaxed),
+            ui_peer: None,
         }
     }
 
@@ -614,11 +622,13 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
         inbox_tx,
         boot,
         epoch,
+        ui_peer,
         ..
     } = &mut **ws
     else {
-        return None; // workers don't spawn workers (v1 star topology)
+        return None; // workers don't spawn workers (star topology by design)
     };
+    let ui_peer = *ui_peer;
     // Reclaim a TERMINATED slot's index before growing the fleet. `terminate`
     // (below) marks a link dead but never shrinks `links` — a dead slot's id
     // must stay stable in case an in-flight reply is still keyed by it — so
@@ -651,6 +661,14 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
     // like the primary's link — a spawned worker parks in `rx.recv()`, so
     // there is no run-loop to poke.
     let self_inbox = InboxSender::detached(tx.clone());
+    // The display's link, resolved once: the new worker gets a copy on its own
+    // thread (below), and the same link carries the introduction that teaches
+    // the display about the new worker.
+    let ui_link = ui_peer.and_then(|h| link_for(links, h).map(|l| (h, l.inbox.clone())));
+    let ui_link_for_worker = ui_link.clone();
+    // The new worker's own inbox again, for the introduction below — cloned
+    // here because the `WorkerLink` takes ownership of `tx` further down.
+    let intro_reply_to = InboxSender::detached(tx.clone());
     let boot = boot.clone();
     let to_primary = inbox_tx.clone();
     // The global-table row (one per SPAWN, not per id — reused ids get fresh
@@ -668,6 +686,7 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
             &rx,
             &to_primary,
             self_inbox,
+            ui_link_for_worker,
             init.as_deref(),
         )
     });
@@ -676,6 +695,25 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
         alive: true,
         gen,
     };
+    // ── the two introductions (`docs/worker_peer_links.md` §3) ──────────
+    //
+    // Learning answers "how do I reply", never "how do I start", so the first
+    // link in each direction is handed over here — by the primary, because it
+    // is the only VM that knows everyone. After this it is out of the path.
+    if let Some((_ui_handle, ui_inbox)) = &ui_link {
+        // The DISPLAY learns the new worker. An introduction is an ordinary
+        // envelope with an empty payload — the drain treats a payload-less
+        // envelope as a no-op, so the Smalltalk side sees nothing at all,
+        // while the Rust learning rule caches `from` + `reply_to` on its way
+        // in. Being an envelope rather than an API is the point: it needs no
+        // new mechanism and travels the exact path every later frame will.
+        let _ = ui_inbox.send(Envelope {
+            from: id,
+            corr: 0,
+            bytes: Vec::new(),
+            reply_to: Some(intro_reply_to),
+        });
+    }
     match reuse_idx {
         Some(idx) => links[idx] = link,
         None => links.push(link),
@@ -754,6 +792,7 @@ fn worker_main(
     rx: &Receiver<Envelope>,
     to_primary: &InboxSender,
     self_inbox: InboxSender,
+    ui_link: Option<(u32, InboxSender)>,
     init: Option<&str>,
 ) {
     let Ok(mut handle) = boot() else {
@@ -765,11 +804,18 @@ fn worker_main(
     // Its own link, so anything it messages can answer it directly rather
     // than through the primary (`docs/worker_peer_links.md`).
     handle.set_self_inbox(self_inbox);
+    // And the display's link, installed BEFORE the init doit runs so a worker
+    // whose very first act is to draw something already has somewhere to send
+    // it. Introductions happen on this thread because the peer list lives in
+    // this VM, which the spawner cannot touch.
+    if let Some((ui_handle, ui_inbox)) = ui_link {
+        handle.add_worker_peer(ui_handle, ui_inbox);
+    }
     // Monitor tab: this thread owns the handle, so it is the one place the
     // worker's metrics can be sampled — published at every quiescent point
     // (post-boot, post-dispatch). An idle worker's numbers are frozen, which
     // is exactly right: nothing is running.
-    let mon = crate::embed::monitor_register(format!("worker {id}"), "worker");
+    let mon = crate::embed::monitor_register(format!("worker {}", handle_slot(id)), "worker");
     mon.publish(handle.metrics());
     // From here on, everything the worker prints (Transcript, error traces)
     // reaches the primary's transcript instead of a stray stdout (M2).
@@ -952,6 +998,42 @@ pub fn alive(vm: &VmState, id: u32) -> bool {
         return false;
     };
     link_for(links, id).map(|l| l.alive).unwrap_or(false)
+}
+
+/// The handle this VM knows as the DISPLAY, or 0 if it has none. A primary
+/// answers whichever link it was told is the UI; a worker answers the peer it
+/// was introduced to at spawn. It is the one piece of the peer-link machinery
+/// the guest needs by NAME — a worker holds the display's link, but Smalltalk
+/// has to be able to say `send this there`, and a handle is how you say it.
+pub fn ui_peer_handle(vm: &VmState) -> u32 {
+    match vm.workers.as_deref() {
+        Some(WorkerState::Primary { ui_peer, .. }) => ui_peer.unwrap_or(0),
+        // A worker was introduced to exactly one display, so the first peer
+        // it holds that is not its parent IS the display. There is no
+        // ambiguity to resolve because there is no general peer discovery:
+        // the only link a worker is GIVEN is the UI's, and everything else it
+        // holds it learned from someone who spoke to it first.
+        Some(WorkerState::Worker { peers, .. }) => peers.first().map(|(h, _)| *h).unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// Tell this primary which of its registered workers is the UI — the display
+/// every app VM it spawns should be introduced to (`docs/worker_peer_links.md`
+/// §3). The Cocoa host calls this right after `register_hosted_worker`. A
+/// primary that is never told simply introduces nobody.
+pub fn set_ui_peer(vm: &mut VmState, handle: u32) -> bool {
+    let Some(ws) = vm.workers.as_mut() else {
+        return false;
+    };
+    let WorkerState::Primary { ui_peer, links, .. } = &mut **ws else {
+        return false;
+    };
+    if link_for(links, handle).is_none() {
+        return false; // not one of ours, or already superseded
+    }
+    *ui_peer = Some(handle);
+    true
 }
 
 /// The PRIMARY's own inbox sender, cloned for the Cocoa bridge (C4): a

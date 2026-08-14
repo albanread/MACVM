@@ -284,6 +284,18 @@ fn primary_thread_main(
         return;
     };
 
+    // THE DISPLAY IS NAMED (`docs/worker_peer_links.md` §3): from here on,
+    // every app VM this primary spawns is introduced to the UI worker and the
+    // UI worker to it, so the two talk directly and the primary is out of the
+    // path. Without this the primary introduces nobody and workers reach only
+    // their parent — which is exactly the state that stalled AppSpec A5.
+    if !primary.set_ui_peer(id) {
+        let _ = ready_tx.send(Err(VmError {
+            msg: "set_ui_peer failed (the UI worker is not a live link of this primary)".into(),
+        }));
+        return;
+    }
+
     // Signal ready: hand main the id + the drain channel + the reply link.
     if ready_tx.send(Ok((id, hosted_inbox, to_primary))).is_err() {
         return; // main gone — nothing to serve

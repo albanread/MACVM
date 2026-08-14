@@ -1166,6 +1166,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    PrimDesc {
+        id: 229,
+        name: "Worker class>>primUiPeer",
+        f: prim_worker_ui_peer,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
     // cocoa bridge C0 (docs/cocoa_bridge_design.md §8, prims 230-239).
     PrimDesc {
         id: 230,
@@ -2460,6 +2468,16 @@ fn prim_worker_alive(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 fn prim_worker_self_id(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let _ = args;
     let id = vm.workers.as_ref().map_or(0, |ws| ws.self_id());
+    PrimResult::Ok(SmallInt::new(i64::from(id)).oop())
+}
+
+/// `Worker class>>primUiPeer` (229): the handle this VM knows as the display,
+/// or 0. A worker is INTRODUCED to the UI when it is spawned
+/// (`docs/worker_peer_links.md` §3) and holds its link, but Smalltalk needs a
+/// handle to name it in a `send`.
+fn prim_worker_ui_peer(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let _ = args;
+    let id = crate::runtime::workers::ui_peer_handle(vm);
     PrimResult::Ok(SmallInt::new(i64::from(id)).oop())
 }
 
@@ -5570,6 +5588,7 @@ mod tests {
             (226, "Worker class>>primSelfId"),
             (227, "Worker class>>pickle:"),
             (228, "Worker class>>unpickle:"),
+            (229, "Worker class>>primUiPeer"),
             // cocoa bridge C0 (docs/cocoa_bridge_design.md)
             (230, "Cocoa class>>primClassNamed:"),
             (231, "ObjcRef>>primSend:"),

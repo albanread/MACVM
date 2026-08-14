@@ -155,6 +155,31 @@ Object subclass: Worker [
 
     "── receiving, worker side: the host loop execs `Worker dispatchPending.`
        once per inbound message (the GameStep staging pattern) ──"
+    "── the display (docs/worker_peer_links.md) ──────────────────────────
+     THE ONE PEER A WORKER IS GIVEN RATHER THAN TAUGHT. Everything else it can
+     reach, it can reach because that peer spoke to it first; the display is
+     handed over at spawn, by the primary, because a worker whose first act is
+     to draw something has to have somewhere to send it. Answers a handle, or
+     nil in an embedding with no display — headless is a correct state, not a
+     broken one, so callers check rather than assume."
+    Worker class >> uiPeer [
+        | h |
+        h := self primUiPeer.
+        ^h = 0 ifTrue: [ nil ] ifFalse: [ h ]
+    ]
+
+    Worker class >> hasUi ^ <Boolean> [ ^self primUiPeer ~= 0 ]
+
+    "A handle for the display, ready to `send:`/`send:onReply:` like any other
+     peer — which is the whole point of peer links: the display is not a
+     special channel, it is just a worker you happen to have been introduced
+     to."
+    Worker class >> ui [
+        | h |
+        h := self uiPeer.
+        ^h isNil ifTrue: [ nil ] ifFalse: [ self new setId: h ]
+    ]
+
     Worker class >> onMessage: aBlock [ Handler := aBlock ]
     Worker class >> dispatchPending [
         | env payload |
@@ -589,4 +614,5 @@ Object subclass: Worker [
     Worker class >> primTerminate: i [ <primitive: 224> ^self ]
     Worker class >> primAlive: i [ <primitive: 225> ^false ]
     Worker class >> primSelfId [ <primitive: 226> ^0 ]
+    Worker class >> primUiPeer [ <primitive: 229> ^0 ]
 ]
