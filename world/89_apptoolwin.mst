@@ -279,6 +279,8 @@ Object subclass: AppToolWindow [
         ^self
     ]
 
+    AppToolWindow class >> clearReports [ Reports := nil. ^self ]
+
     "── an instance ─────────────────────────────────────────────────────"
 
     | id title width height renderBlock handlerBlock paintBlock realizer lastSpec damage |

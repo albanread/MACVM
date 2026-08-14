@@ -1,0 +1,136 @@
+"62_windemotool_tests.mst — the portability claim, as a gate.
+
+ `world/91_windemotool.mst` is WINARMVM's `world/125_winui_demotool.mst`
+ BYTE FOR BYTE — sha1 fc737b3735b9e12b10a8a89cfbb9b3007d30ff12, not one
+ character changed, a file written for Win32 and never edited for this
+ platform. It declares a class called WinDemoTool, builds its window with
+ WinSpec, and reads its counters off WinToolWindow.
+
+ THIS FILE IS THE WHOLE ARC'S ACCEPTANCE TEST IN MINIATURE, arriving three
+ sprints before A4 needs it. The author's definition of done is that the
+ Windows sprite and sound editors `should just port over, no effort at all,
+ that's the point` — and the reason that is achievable is exactly what these
+ assertions pin: a tool contains no platform. Everything Windows-shaped in
+ the original lives in its realizer, and swapping the realizer is the entire
+ difference between running it here and running it there.
+
+ What is NOT claimed: that anything is on screen. The realizer under these
+ tests is the null one, so this pins the model, the differ, the counters and
+ the lifecycle. A2's Cocoa realizer is what puts pixels behind the same
+ assertions, and when it does, THESE tests should not need to change — that
+ is how we will know the seam held."
+
+TestCase subclass: WinDemoToolPortabilityTests [
+
+    "REGISTRATION IS RE-ESTABLISHED RATHER THAN ASSUMED. The vendored file ends
+     with `WinDemoTool install.`, so loading the world registers this tool — but
+     class variables are image-wide and AppToolWindowTests legitimately calls
+     `AppToolWindow reset` to get a clean registry of its own. Test order is not
+     a thing to depend on, so every test here calls the tool's OWN install
+     method, which is the same line the file runs at load time and therefore
+     still exercises the registration path through the aliases."
+    ensureDemo [
+        (AppToolWindow named: #demo) isNil ifTrue: [ WinDemoTool install ].
+        ^AppToolWindow named: #demo
+    ]
+
+    "Open the vendored Windows tool and answer its window, counters zeroed so
+     each test reads its own numbers."
+    freshDemo [
+        | w |
+        w := self ensureDemo.
+        w teardown.
+        WinDemoTool handle: #reset value: nil.
+        AppToolWindow resetCounts.
+        w open.
+        ^w
+    ]
+
+    "── it is there at all ──────────────────────────────────────────────"
+
+    testTheWindowsToolRegistersItselfThroughTheAliases [
+        | w |
+        w := self ensureDemo.
+        self assert: w isNil not.
+        self assert: w title equals: 'Declarative Demo'.
+        "Registered under the Win name, found under the App one — one registry."
+        self assert: (WinToolWindow named: #demo) == w.
+    ]
+
+    "The tool's spec is built by WinSpec, and what comes out is an ordinary
+     AppNode tree that our own validator accepts."
+    testItsSpecIsAValidAppNodeTree [
+        | spec |
+        spec := AppSpec normalize: WinDemoTool spec.
+        self assert: (spec isKindOf: AppNode).
+        self assert: spec type equals: #window.
+        self assert: (AppSpec validate: spec) isNil.
+    ]
+
+    "── it runs ─────────────────────────────────────────────────────────"
+
+    testItOpensAndRealizesItsControls [
+        | w |
+        w := self freshDemo.
+        self assert: w isOpen.
+        self assert: AppToolWindow rebuildCount equals: 1.
+        "Every named node in its spec reached the realizer as a placement."
+        self assert: (w realizer placedIds includes: 'bump').
+        self assert: (w realizer placedIds includes: 'clicks').
+        self assert: (w realizer placedIds includes: 'shapePick').
+    ]
+
+    "THE CLAIM THE TOOL PUTS ON ITS OWN FACE: press the button and the caption
+     changes while `rebuilds` stays exactly where it was. Asserted here rather
+     than merely looked at."
+    testThreeClicksPatchInPlaceAndNeverRebuild [
+        | w |
+        w := self freshDemo.
+        w dispatch: #bump value: nil.
+        w dispatch: #bump value: nil.
+        w dispatch: #bump value: nil.
+        self assert: WinDemoTool clicks equals: 3.
+        self assert: AppToolWindow patchCount equals: 3.
+        self assert: AppToolWindow rebuildCount equals: 1.
+    ]
+
+    "Its own showcase: past two clicks the shape list GROWS, and `options` is
+     on the differ's structured-patchable whitelist — so a control that could
+     have been rebuilt is refilled in place instead."
+    testGrowingTheOptionListStillDoesNotRebuild [
+        | w |
+        w := self freshDemo.
+        self assert: WinDemoTool shapeOptions size equals: 3.
+        w dispatch: #bump value: nil.
+        w dispatch: #bump value: nil.
+        w dispatch: #bump value: nil.
+        self assert: WinDemoTool shapeOptions size equals: 4.
+        self assert: AppToolWindow rebuildCount equals: 1.
+    ]
+
+    "Its handler takes values from real controls — a typed note, a checkbox, a
+     chosen option value (never its text, never its index)."
+    testValuesFromControlsReachTheModel [
+        | w |
+        w := self freshDemo.
+        w dispatch: #note value: 'hello'.
+        w dispatch: #loud value: true.
+        w dispatch: #colour value: #b.
+        self assert: WinDemoTool note equals: 'hello'.
+        self assert: WinDemoTool loud.
+        self assert: WinDemoTool colour equals: #b.
+        "And the face followed the model, without a rebuild."
+        self assert: AppToolWindow rebuildCount equals: 1.
+    ]
+
+    "Nothing in the tool raised on the way through — a portability failure
+     would most likely surface as a report rather than as a wrong number."
+    testItRunsWithoutReportingAnything [
+        | w |
+        AppToolWindow clearReports.
+        w := self freshDemo.
+        w dispatch: #bump value: nil.
+        w dispatch: #reset value: nil.
+        self assert: AppToolWindow reports isEmpty.
+    ]
+]

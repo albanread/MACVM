@@ -248,6 +248,12 @@
 # The names WINARMVM's tools were written against, so they load here unchanged.
 # Transitional — deleted when the sister repo adopts the AppSpec names.
 90_appspec_compat.mst
+# WINARMVM's world/125_winui_demotool.mst, VENDORED BYTE FOR BYTE (sha1
+# fc737b37...) — a tool written for Win32 and never edited for this platform.
+# It is the arc's acceptance test in miniature: it registers, opens, and
+# patches in place here through the compat aliases, which is only possible
+# because a tool contains no platform. Costs one registry entry until opened.
+91_windemotool.mst
 # SUnit (docs/sunit_design.md): tests for the world, written in the world.
 # TestCase/TestFailure/TestResult/TestRunner. Loads last in the world list so
 # a test file in tests.list can subclass TestCase.

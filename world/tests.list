@@ -80,3 +80,4 @@ tests/55_exception_resume_tests.mst
 tests/59_appspec_tests.mst
 tests/60_appspec_layout_tests.mst
 tests/61_apptoolwin_tests.mst
+tests/62_windemotool_tests.mst

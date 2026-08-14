@@ -1,0 +1,122 @@
+"125_winui_demotool.mst — WG14b's proof, and the shape every later tool copies.
+
+ A tool window is three things and no more: a title, a block that ANSWERS A
+ SPEC, and a block that HANDLES AN EVENT. There is no window code here, no
+ control code, no layout code and no teardown code — all of that is
+ `WinToolWindow`'s, which is the entire point of having built it.
+
+ IT SHOWS ITS OWN COUNTERS, deliberately. `patches` and `rebuilds` are on
+ screen because that is what makes the claim checkable by looking: press the
+ button and the caption changes while `rebuilds` stays exactly where it was.
+ If the id strategy ever stops working, this window says so in its own face
+ instead of merely flickering.
+
+ THE STATE IS THE TOOL'S OWN, held in class variables, which is why closing
+ the window can HIDE rather than destroy and reopening is instant."
+
+Object subclass: WinDemoTool [
+    <classVars: Clicks Note Loud Colour Shape>
+
+    WinDemoTool class >> clicks ^ <Integer> [ ^Clicks isNil ifTrue: [ 0 ] ifFalse: [ Clicks ] ]
+    WinDemoTool class >> note ^ <String> [ ^Note isNil ifTrue: [ 'edit me' ] ifFalse: [ Note ] ]
+    WinDemoTool class >> loud ^ <Boolean> [ ^Loud == true ]
+    WinDemoTool class >> colour ^ <Object> [ ^Colour isNil ifTrue: [ #g ] ifFalse: [ Colour ] ]
+    WinDemoTool class >> shape ^ <Object> [ ^Shape isNil ifTrue: [ 'circle' ] ifFalse: [ Shape ] ]
+
+    "The two spellings of an option side by side, on purpose: the colours are
+     Associations because their value and their label differ, the shapes are
+     plain Strings because they do not. Both realize the same way."
+    WinDemoTool class >> colourOptions ^ <Array> [
+        ^Array
+            with: (Association key: #r value: 'Red')
+            with: (Association key: #g value: 'Green')
+            with: (Association key: #b value: 'Blue')
+    ]
+
+    "GROWN BY A CLICK, which is what makes this the differ's showcase: adding
+     a shape patches the list box's contents in place rather than rebuilding
+     it, and `rebuilds` on screen stays where it was."
+    WinDemoTool class >> shapeOptions ^ <Array> [
+        ^self clicks > 2
+            ifTrue: [ #('circle' 'square' 'triangle' 'hexagon') ]
+            ifFalse: [ #('circle' 'square' 'triangle') ]
+    ]
+
+    "── the spec ────────────────────────────────────────────────────────
+
+     EVERY NODE IS NAMED. That is the whole discipline: a named tree diffs to
+     `set this caption` instead of `build this window again`, and the counters
+     below are what prove it did."
+
+    WinDemoTool class >> spec ^ <WinNode> [
+        ^WinSpec window: 'Declarative Demo' id: #demoWin body: (WinSpec stack: {
+            WinSpec heading: 'A window made of data' id: #head.
+            WinSpec text: 'Nothing here was placed by hand.' id: #blurb.
+            WinSpec divider: #rule.
+
+            WinSpec card: 'State' children: {
+                WinSpec text: 'clicks: ' , self clicks printString id: #clicks.
+                WinSpec text: 'note: ' , self note id: #noteEcho.
+                WinSpec text: 'loud: ' , self loud printString id: #loudEcho.
+                WinSpec text: 'colour: ' , self colour printString id: #colourEcho.
+                WinSpec text: 'shape: ' , self shape id: #shapeEcho
+            } id: #stateCard.
+
+            WinSpec card: 'Do something' children: {
+                WinSpec row: {
+                    WinSpec button: 'Click me' event: #bump id: #bump.
+                    WinSpec button: 'Reset' event: #reset id: #reset
+                } id: #buttons.
+                WinSpec input: 'Note' value: self note event: #note id: #noteField.
+                WinSpec checkbox: 'Loud' checked: self loud event: #loud id: #loudBox.
+                WinSpec select: 'Colour' value: self colour
+                        options: self colourOptions event: #colour id: #colourPick.
+                WinSpec listBox: 'Shape' value: self shape
+                        options: self shapeOptions event: #shape id: #shapePick
+            } id: #doCard.
+
+            WinSpec card: 'Reconciliation' children: {
+                WinSpec text: 'patches:  ' , WinToolWindow patchCount printString
+                        id: #patches.
+                WinSpec text: 'rebuilds: ' , WinToolWindow rebuildCount printString
+                        id: #rebuilds.
+                WinSpec text: 'a click should move the first, not the second.'
+                        id: #countsHint
+            } id: #countCard
+        } id: #root)
+    ]
+
+    "── the handler ─────────────────────────────────────────────────────
+
+     State in, rerender out. It never touches a control: what is on screen is
+     a function of the state, and saying so once is what makes the difference
+     between this and the Mac's editors, where every handler pokes its own
+     widget and the two can disagree."
+
+    WinDemoTool class >> handle: event <Symbol> value: value <Object> [
+        event == #bump ifTrue: [ Clicks := self clicks + 1 ].
+        event == #reset ifTrue: [
+            Clicks := 0. Note := nil. Loud := false. Colour := nil. Shape := nil ].
+        event == #note ifTrue: [ Note := value ].
+        event == #loud ifTrue: [ Loud := value ].
+        event == #colour ifTrue: [ Colour := value ].
+        event == #shape ifTrue: [ Shape := value ].
+        ^self
+    ]
+
+    "── registration ────────────────────────────────────────────────────
+     Declared at load time; it costs a dictionary entry until somebody opens
+     the Tools menu."
+
+    WinDemoTool class >> install [
+        WinToolWindow
+            register: #demo title: 'Declarative Demo' width: 460 height: 860
+            render: [ WinDemoTool spec ]
+            handler: [ :event :value |
+                WinDemoTool handle: event value: value.
+                (WinToolWindow named: #demo) rerender ].
+        ^self
+    ]
+]
+
+WinDemoTool install.
