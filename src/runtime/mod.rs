@@ -15,6 +15,7 @@ pub mod deopt;
 pub mod deps;
 pub mod error;
 pub mod ffi;
+pub mod fleet; // the fleet registry — process services S4 (docs/process_services.md §5)
 pub mod frames;
 pub mod globals;
 pub mod lookup;

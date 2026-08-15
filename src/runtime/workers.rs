@@ -205,6 +205,23 @@ pub struct InboxSender {
 pub struct InboxClosed;
 
 impl InboxSender {
+    /// A hosted peer's pair: the fleet keeps the sender as the peer's link;
+    /// the host thread drains the `HostedInbox`. Extracted from
+    /// `register_hosted_worker` so the fleet can mint one without reaching
+    /// into these fields.
+    pub(crate) fn hosted_pair(wake: InboxWakeFn) -> (InboxSender, HostedInbox) {
+        let (tx, rx) = channel::<Envelope>();
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        (
+            InboxSender {
+                tx,
+                wake_pending: wake_pending.clone(),
+                wake: Arc::new(Mutex::new(Some(wake))),
+            },
+            HostedInbox { rx, wake_pending },
+        )
+    }
+
     /// Enqueue + (coalesced) wake. An `Err` means the primary is gone —
     /// its whole process is exiting; the caller's thread just winds down.
     pub fn send(&self, env: Envelope) -> Result<(), InboxClosed> {
@@ -232,7 +249,7 @@ impl InboxSender {
     /// weight; the coalesced flag is set-once-and-ignored, `send` behaves as a
     /// bare channel push). The hosted-worker path builds its `InboxSender`
     /// inline with a real wake instead ([`register_hosted_worker`]).
-    fn detached(tx: Sender<Envelope>) -> InboxSender {
+    pub(crate) fn detached(tx: Sender<Envelope>) -> InboxSender {
         InboxSender {
             tx,
             wake_pending: Arc::new(AtomicBool::new(false)),
@@ -287,7 +304,7 @@ const SLOT_MASK: u32 = (1 << SLOT_BITS) - 1;
 
 /// The handle naming generation `gen` of slot `slot` (1-based, as ids have
 /// always been).
-fn make_handle(slot: u32, gen: u32) -> u32 {
+pub(crate) fn make_handle(slot: u32, gen: u32) -> u32 {
     (gen << SLOT_BITS) | (slot & SLOT_MASK)
 }
 
@@ -360,22 +377,14 @@ impl HostedInbox {
 /// that spawns, `Worker` inside each spawned VM.
 pub enum WorkerState {
     Primary {
-        links: Vec<WorkerLink>,
         inbox_rx: Receiver<Envelope>,
         /// For cloning to new workers and for synthesizing control
         /// envelopes into our own inbox.
         inbox_tx: InboxSender,
-        boot: WorkerBootFn,
-        /// This primary's process-unique epoch (the global-table section
-        /// above): workers born of it exit when it is marked dead.
+        /// This primary's process-unique epoch. Everything else a primary
+        /// used to hold here — links, the boot fn, the display — lives in
+        /// `fleet` now (docs/process_services.md S4), keyed by this.
         epoch: u64,
-        /// WHICH LINK IS THE UI, if this embedding has one. The primary is
-        /// the only VM that knows everyone, so it is the only one that can
-        /// introduce a newly spawned worker to the display and vice versa
-        /// (`docs/worker_peer_links.md` §3). `None` in a headless embedding,
-        /// where nothing is introduced and workers simply talk to their
-        /// parent as they always did.
-        ui_peer: Option<u32>,
     },
     Worker {
         self_id: u32,
@@ -416,6 +425,7 @@ impl Drop for WorkerState {
         // watchdog's fatal hook calling `note_primary_dead` directly.
         if let WorkerState::Primary { epoch, .. } = self {
             note_primary_dead(*epoch);
+            crate::runtime::fleet::retire_epoch(*epoch);
         }
     }
 }
@@ -423,17 +433,17 @@ impl Drop for WorkerState {
 impl WorkerState {
     pub fn new_primary(boot: WorkerBootFn) -> WorkerState {
         let (tx, rx) = channel::<Envelope>();
+        let inbox_tx = InboxSender {
+            tx,
+            wake_pending: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(Mutex::new(None)),
+        };
+        let epoch = NEXT_PRIMARY_EPOCH.fetch_add(1, Ordering::Relaxed);
+        crate::runtime::fleet::register_epoch(epoch, boot, inbox_tx.clone());
         WorkerState::Primary {
-            links: Vec::new(),
             inbox_rx: rx,
-            inbox_tx: InboxSender {
-                tx,
-                wake_pending: Arc::new(AtomicBool::new(false)),
-                wake: Arc::new(Mutex::new(None)),
-            },
-            boot,
-            epoch: NEXT_PRIMARY_EPOCH.fetch_add(1, Ordering::Relaxed),
-            ui_peer: None,
+            inbox_tx,
+            epoch,
         }
     }
 
@@ -548,9 +558,9 @@ impl WorkerState {
 /// empty payload can be produced by no ordinary send (`nextCorr` counts up
 /// from 1; the boot nudge and peer introductions use corr 0), so the loop can
 /// treat it as what it is: an order, not a message.
-const TERMINATE_CORR: u64 = u64::MAX;
+pub(crate) const TERMINATE_CORR: u64 = u64::MAX;
 
-fn terminate_envelope() -> Envelope {
+pub(crate) fn terminate_envelope() -> Envelope {
     Envelope {
         from: 0,
         corr: TERMINATE_CORR,
@@ -559,7 +569,7 @@ fn terminate_envelope() -> Envelope {
     }
 }
 
-fn died_envelope(id: u32) -> Envelope {
+pub(crate) fn died_envelope(id: u32) -> Envelope {
     Envelope {
         from: id,
         corr: 0,
@@ -646,72 +656,22 @@ impl crate::embed::TranscriptSink for ForwardTranscript {
     }
 }
 
-/// Spawn a worker VM (prim 220). Fails (None) with no registered primary
-/// role/boot fn, or at the cap. The `init` doit (if any) runs once in the
-/// fresh worker before its dispatch loop — how a worker gets its
-/// `Worker onMessage:` handler installed.
-pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
-    let ws = vm.workers.as_mut()?;
-    let WorkerState::Primary {
-        links,
-        inbox_tx,
-        boot,
-        epoch,
-        ui_peer,
-        ..
-    } = &mut **ws
-    else {
-        return None; // workers don't spawn workers (star topology by design)
-    };
-    let ui_peer = *ui_peer;
-    // Reclaim a TERMINATED slot's index before growing the fleet. `terminate`
-    // (below) marks a link dead but never shrinks `links` — a dead slot's id
-    // must stay stable in case an in-flight reply is still keyed by it — so
-    // without this reuse, a demo that spawns N workers per launch and
-    // cleanly terminates them every time (GamePane's `onReset:` hook) still
-    // permanently consumes N slots per launch and hits MAX_WORKERS after
-    // MAX_WORKERS/N launches even though nothing is actually alive: exactly
-    // ParallelMandel's "breaks after a little use" (observed live: launch 5
-    // of 4-worker rounds hit the cap with zero live workers). `MAX_WORKERS`
-    // is documented as "a pool of up to 16 CONCURRENT worker VMs" (README) —
-    // a monotonic ever-spawned counter was never the intent.
-    let reuse_idx = links.iter().position(|l| !l.alive);
-    // The slot, and WHICH OCCUPANT of it: reclaiming bumps the generation, so
-    // the handle handed out below has never been handed out before even
-    // though the slot has been used.
-    let (slot, gen) = match reuse_idx {
-        Some(idx) => ((idx + 1) as u32, links[idx].gen.wrapping_add(1)),
-        None => {
-            if links.len() >= MAX_WORKERS {
-                return None;
-            }
-            (links.len() as u32 + 1, 1)
-        }
-    };
-    let id = make_handle(slot, gen);
-    let (tx, rx) = channel::<Envelope>();
-    // The worker's OWN inbox, cloned before the primary's link takes the
-    // sender: this is what the new VM offers as `reply_to` so a peer it
-    // messages can answer it directly (`docs/worker_peer_links.md`). Detached
-    // like the primary's link — a spawned worker parks in `rx.recv()`, so
-    // there is no run-loop to poke.
-    let self_inbox = InboxSender::detached(tx.clone());
-    // The display's link, resolved once: the new worker gets a copy on its own
-    // thread (below), and the same link carries the introduction that teaches
-    // the display about the new worker.
-    let ui_link = ui_peer.and_then(|h| link_for(links, h).map(|l| (h, l.inbox.clone())));
-    let ui_link_for_worker = ui_link.clone();
-    // The new worker's own inbox again, for the introduction below — cloned
-    // here because the `WorkerLink` takes ownership of `tx` further down.
-    let intro_reply_to = InboxSender::detached(tx.clone());
-    let boot = boot.clone();
-    let to_primary = inbox_tx.clone();
-    // The global-table row (one per SPAWN, not per id — reused ids get fresh
-    // rows) and the shared liveness flag the thread clears on any exit.
-    let epoch = *epoch;
+/// The thread half of a spawn, called by `fleet::spawn` after the registry
+/// half: the global-table row, the liveness flag, and the detached thread
+/// running `worker_main`. (S21: never joined.)
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_worker_thread(
+    id: u32,
+    epoch: u64,
+    rx: Receiver<Envelope>,
+    self_inbox: InboxSender,
+    to_primary: InboxSender,
+    boot: WorkerBootFn,
+    ui_link: Option<(u32, InboxSender)>,
+    init: Option<String>,
+) {
     let alive = Arc::new(AtomicBool::new(true));
     worker_table_register(id, epoch, alive.clone());
-    // Detached on purpose (S21: never join a VM worker thread).
     std::thread::spawn(move || {
         worker_main(
             id,
@@ -721,39 +681,24 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
             &rx,
             &to_primary,
             self_inbox,
-            ui_link_for_worker,
+            ui_link,
             init.as_deref(),
         )
     });
-    let link = WorkerLink {
-        inbox: InboxSender::detached(tx),
-        alive: true,
-        gen,
+}
+
+/// Spawn a worker VM (prim 220). Fails (None) with no registered primary
+/// role/boot fn, or at the cap. The `init` doit (if any) runs once in the
+/// fresh worker before its dispatch loop — how a worker gets its
+/// `Worker onMessage:` handler installed.
+pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
+    // The registry half lives in the fleet now (S4): this VM contributes only
+    // its epoch — the authorization — and the fleet does the rest.
+    let ws = vm.workers.as_ref()?;
+    let WorkerState::Primary { epoch, .. } = &**ws else {
+        return None; // workers don't spawn (policy; the display gains it in S4b)
     };
-    // ── the two introductions (`docs/worker_peer_links.md` §3) ──────────
-    //
-    // Learning answers "how do I reply", never "how do I start", so the first
-    // link in each direction is handed over here — by the primary, because it
-    // is the only VM that knows everyone. After this it is out of the path.
-    if let Some((_ui_handle, ui_inbox)) = &ui_link {
-        // The DISPLAY learns the new worker. An introduction is an ordinary
-        // envelope with an empty payload — the drain treats a payload-less
-        // envelope as a no-op, so the Smalltalk side sees nothing at all,
-        // while the Rust learning rule caches `from` + `reply_to` on its way
-        // in. Being an envelope rather than an API is the point: it needs no
-        // new mechanism and travels the exact path every later frame will.
-        let _ = ui_inbox.send(Envelope {
-            from: id,
-            corr: 0,
-            bytes: Vec::new(),
-            reply_to: Some(intro_reply_to),
-        });
-    }
-    match reuse_idx {
-        Some(idx) => links[idx] = link,
-        None => links.push(link),
-    }
-    Some(id)
+    crate::runtime::fleet::spawn(*epoch, init)
 }
 
 /// Register an *externally-hosted* worker on an EXISTING thread — no
@@ -782,36 +727,11 @@ pub fn register_hosted_worker(
     vm: &mut VmState,
     wake: InboxWakeFn,
 ) -> Option<(u32, HostedInbox, InboxSender)> {
-    let ws = vm.workers.as_mut()?;
-    let WorkerState::Primary {
-        links, inbox_tx, ..
-    } = &mut **ws
-    else {
-        return None; // only the primary registers peers (v1 star topology)
-    };
-    if links.len() >= MAX_WORKERS {
+    let ws = vm.workers.as_ref()?;
+    let WorkerState::Primary { epoch, .. } = &**ws else {
         return None;
-    }
-    let (tx, rx) = channel::<Envelope>();
-    // A hosted worker takes a fresh slot (it is registered once, at boot) and
-    // so is always generation 1 — but it is HANDLED the same way, because
-    // nothing downstream should care which kind of worker a handle names.
-    let slot = links.len() as u32 + 1;
-    let gen = 1;
-    let id = make_handle(slot, gen);
-    let wake_pending = Arc::new(AtomicBool::new(false));
-    let inbox = InboxSender {
-        tx,
-        wake_pending: wake_pending.clone(),
-        wake: Arc::new(Mutex::new(Some(wake))),
     };
-    let to_primary = inbox_tx.clone();
-    links.push(WorkerLink {
-        inbox,
-        alive: true,
-        gen,
-    });
-    Some((id, HostedInbox { rx, wake_pending }, to_primary))
+    crate::runtime::fleet::register_hosted(*epoch, wake)
 }
 
 /// The worker thread body: boot (via the registered closure), take on the
@@ -956,39 +876,11 @@ pub fn send(vm: &mut VmState, id: u32, corr: u64, bytes: Vec<u8>) -> bool {
         return false;
     };
     match &mut **ws {
-        WorkerState::Primary {
-            links, inbox_tx, ..
-        } => {
+        WorkerState::Primary { epoch, .. } => {
             if id == 0 {
                 return false;
             }
-            // A STALE HANDLE IS REFUSED, not redirected: if this slot has
-            // been reclaimed since the handle was minted, its generation no
-            // longer matches and there is nobody here by that name.
-            let Some(link) = link_for_mut(links, id) else {
-                return false;
-            };
-            if !link.alive {
-                return false;
-            }
-            let env = Envelope {
-                from: 0,
-                corr,
-                bytes,
-                reply_to: None,
-            };
-            // `InboxSender::send` enqueues then fires the (coalesced) wake —
-            // a no-op for a spawned worker (detached hook), a run-loop poke
-            // for a hosted one. Its `Err` is the same dead-receiver signal the
-            // old bare `tx.send` gave.
-            if link.inbox.send(env).is_err() {
-                // The worker's receiver is gone — it died between messages.
-                // Mark it and deliver the death notice through the inbox.
-                link.alive = false;
-                let _ = inbox_tx.send(died_envelope(id));
-                return false;
-            }
-            true
+            crate::runtime::fleet::send_to(*epoch, id, corr, bytes)
         }
         WorkerState::Worker {
             self_id,
@@ -1038,25 +930,13 @@ pub fn send(vm: &mut VmState, id: u32, corr: u64, bytes: Vec<u8>) -> bool {
 /// Terminate worker `id` (prim 224): drop its channel — its thread exits on
 /// the next `recv()` — and mark it dead. Idempotent.
 pub fn terminate(vm: &mut VmState, id: u32) -> bool {
-    let Some(ws) = vm.workers.as_mut() else {
+    let Some(ws) = vm.workers.as_ref() else {
         return false;
     };
-    let WorkerState::Primary { links, .. } = &mut **ws else {
+    let WorkerState::Primary { epoch, .. } = &**ws else {
         return false;
     };
-    let Some(link) = link_for_mut(links, id) else {
-        return false;
-    };
-    link.alive = false;
-    // THE ORDER GOES FIRST, down the still-live channel: since peer links,
-    // the worker holds a clone of its own sender, so the disconnect below no
-    // longer reaches a worker on its own (see `terminate_envelope`). Then
-    // dead-end OUR sender as before — the disconnect still serves the
-    // pre-peer-links case and stops any further primary-side sends.
-    let _ = link.inbox.send(terminate_envelope());
-    let (dead_tx, _) = channel::<Envelope>();
-    link.inbox = InboxSender::detached(dead_tx);
-    true
+    crate::runtime::fleet::terminate(*epoch, id)
 }
 
 /// Is worker `id` believed alive (prim 225)? False once death is DETECTED
@@ -1072,7 +952,7 @@ pub fn alive(vm: &VmState, id: u32) -> bool {
     let Some(ws) = vm.workers.as_ref() else {
         return false;
     };
-    let WorkerState::Primary { links, epoch, .. } = &**ws else {
+    let WorkerState::Primary { epoch, .. } = &**ws else {
         return false;
     };
     // Scoped by OUR epoch: handles repeat across primaries (each generation's
@@ -1080,7 +960,7 @@ pub fn alive(vm: &VmState, id: u32) -> bool {
     if let Some(a) = worker_table_alive_arc_scoped(*epoch, id) {
         return a.load(Ordering::Acquire);
     }
-    link_for(links, id).map(|l| l.alive).unwrap_or(false)
+    crate::runtime::fleet::link_alive(*epoch, id)
 }
 
 /// The registration a `tickEvery:` needs, per role (`docs/process_services.md`
@@ -1122,7 +1002,9 @@ pub fn worker_table_alive_arc_scoped(epoch: u64, id: u32) -> Option<Arc<AtomicBo
 /// has to be able to say `send this there`, and a handle is how you say it.
 pub fn ui_peer_handle(vm: &VmState) -> u32 {
     match vm.workers.as_deref() {
-        Some(WorkerState::Primary { ui_peer, .. }) => ui_peer.unwrap_or(0),
+        Some(WorkerState::Primary { epoch, .. }) => {
+            crate::runtime::fleet::display_of(*epoch).unwrap_or(0)
+        }
         // A worker was introduced to exactly one display, so the first peer
         // it holds that is not its parent IS the display. There is no
         // ambiguity to resolve because there is no general peer discovery:
@@ -1139,21 +1021,13 @@ pub fn ui_peer_handle(vm: &VmState) -> u32 {
 /// poisoned: their lifecycle belongs to the host that registered them.
 /// Answers how many were asked.
 pub fn terminate_all(vm: &mut VmState) -> usize {
-    let Some(ws) = vm.workers.as_mut() else {
+    let Some(ws) = vm.workers.as_ref() else {
         return 0;
     };
-    let WorkerState::Primary { links, .. } = &mut **ws else {
+    let WorkerState::Primary { epoch, .. } = &**ws else {
         return 0;
     };
-    let mut n = 0;
-    for link in links.iter_mut() {
-        if link.alive {
-            let _ = link.inbox.send(terminate_envelope());
-            link.alive = false;
-            n += 1;
-        }
-    }
-    n
+    crate::runtime::fleet::terminate_all(*epoch)
 }
 
 /// THE EXIT SEQUENCE (`docs/process_services.md` §4), shared by both hosts:
@@ -1191,17 +1065,13 @@ pub fn all_workers_dead() -> bool {
 /// §3). The Cocoa host calls this right after `register_hosted_worker`. A
 /// primary that is never told simply introduces nobody.
 pub fn set_ui_peer(vm: &mut VmState, handle: u32) -> bool {
-    let Some(ws) = vm.workers.as_mut() else {
+    let Some(ws) = vm.workers.as_ref() else {
         return false;
     };
-    let WorkerState::Primary { ui_peer, links, .. } = &mut **ws else {
+    let WorkerState::Primary { epoch, .. } = &**ws else {
         return false;
     };
-    if link_for(links, handle).is_none() {
-        return false; // not one of ours, or already superseded
-    }
-    *ui_peer = Some(handle);
-    true
+    crate::runtime::fleet::set_display(*epoch, handle)
 }
 
 /// The PRIMARY's own inbox sender, cloned for the Cocoa bridge (C4): a
@@ -1224,11 +1094,10 @@ pub fn primary_inbox_sender(vm: &crate::runtime::vm_state::VmState) -> Option<In
 /// messages ride. `None` if this VM is not a primary, or there is no live worker
 /// `id`.
 pub fn worker_inbox_sender(vm: &crate::runtime::vm_state::VmState, id: u32) -> Option<InboxSender> {
-    let WorkerState::Primary { links, .. } = vm.workers.as_deref()? else {
+    let WorkerState::Primary { epoch, .. } = vm.workers.as_deref()? else {
         return None;
     };
-    let link = link_for(links, id)?;
-    link.alive.then(|| link.inbox.clone())
+    crate::runtime::fleet::inbox_of(*epoch, id)
 }
 
 /// THIS VM's own outbound inbox sender, whatever its role — the sender a Cocoa
