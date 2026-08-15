@@ -3,10 +3,13 @@
 Screenshots of the shipping macOS app (`cocoa_gui/`), captured from the signed
 build at 1400px wide. Every image is the real window, not a mockup.
 
-Most shots date from 2026-08-10; the **Docs** and **Monitor** views and the
-whole **Apps** section were recaptured 2026-08-15 from the notarized
-[v2026.08.15](https://github.com/albanread/MACVM/releases/latest) build, which
-is where this environment changed most.
+The original set dates from 2026-08-10. The **Docs** and **Monitor** views, the
+whole **Apps** section, and **nine demos** (Life, Minesweeper, FreeCell, Plasma,
+Text Pages, Copper Bars, Attractor, Julia, FFT Scope) were captured 2026-08-15
+from the notarized
+[v2026.08.15](https://github.com/albanread/MACVM/releases/latest) build — which
+is both where the environment changed most and everything the Demos menu has
+grown since.
 
 **Why this exists:** a Windows port needs to know what it is porting. The
 Cocoa app is the reference implementation of the environment, and a
@@ -48,16 +51,41 @@ Canvas, Docs, Debugger, Monitor — the class library first, tools after.
 
 Launched from the **Demos** menu, which starts each one *top-level on the
 primary VM* — a frame loop has to own its activation, so it cannot be started
-from a Workspace doit. Each opens its own 320×240 Metal window; **Escape**
-ends it. One runs at a time.
+from a Workspace doit. Each opens its own Metal window; **Escape** ends it. One
+runs at a time. Every one is a single readable Smalltalk class you can open in
+the Browser while it runs.
+
+### Games
 
 | | |
 |---|---|
-| ![Breakout](10-demo-breakout.png) | **Breakout** — the reference game. Paddle on the arrow keys, brick collision, lives, score, sound. One readable class; the best first read for anyone learning the engine. |
-| ![MandelZoom](11-demo-mandelzoom.png) | **MandelZoom** — per-pixel Mandelbrot with a zoom. Pure compute, and the clearest demonstration of the JIT at full stretch. |
-| ![Worms](12-demo-worms.png) | **Worms** — sprite handling and swarm movement. |
+| ![Breakout](10-demo-breakout.png) | **Breakout** — the reference game. Paddle on the arrow keys, brick collision, lives, score, sound. The best first read for anyone learning the engine. |
 | ![Galaxigans](13-demo-galaxigans.png) | **Galaxigans** — a full arcade game: sprite sheets, waves, score, HUD, attract mode. |
-| ![ParallelMandel](14-demo-parallelmandel.png) | **Parallel Mandelbrot** — the same fractal computed across several worker VMs at once, with the bands composited into one frame. The demo that exercises the multi-VM machinery. |
+| ![Worms](12-demo-worms.png) | **Worms** — sprite handling and swarm movement. |
+| ![Game of Life](20-demo-life.png) | **Game of Life** — Conway, with the generation and population counted on screen. SPACE pauses; the left button *draws* live cells and the right one erases, and because drawing reads the button's held state rather than a click, dragging paints a stroke. |
+| ![Minesweeper](21-demo-minesweeper.png) | **Minesweeper** — an 18×12 field with 32 mines. Left click reveals, right click flags, SPACE deals a new board. `Minesweeper launchWithSeed: 12345` deals the same board every time, which is how its tests are written. |
+| ![FreeCell](22-demo-freecell.png) | **FreeCell** — the card game, dealt to Microsoft's published deal specification, so deal numbers mean what they mean everywhere else: `FreeCell launchDeal: 617` is the famously hard one, and 11982 is the one deal of the original 32000 nobody can win. Drag with the mouse; right-click sends a card up. |
+
+### Compute
+
+| | |
+|---|---|
+| ![MandelZoom](11-demo-mandelzoom.png) | **MandelZoom** — per-pixel Mandelbrot with a zoom. Pure compute, and the clearest demonstration of the JIT at full stretch. |
+| ![ParallelMandel](14-demo-parallelmandel.png) | **Parallel Mandelbrot** — the same fractal computed across several worker VMs at once, the bands composited into one frame. The demo that exercises the multi-VM machinery. |
+| ![Julia](27-demo-julia.png) | **Julia** — a live Julia set animated by moving its constant, every pixel recomputed per frame and written straight into GPU memory. SPACE cycles the palette. |
+| ![Attractor](26-demo-attractor.png) | **Attractor** — a de Jong strange attractor drawn by *density*: millions of points accumulated into a buffer, brightness where the orbit lingers. SPACE jumps to new parameters. |
+| ![FFT Scope](28-demo-fftscope.png) | **FFT Scope** — a live spectrum analyser and the worked example for the Accelerate surface. Each frame synthesizes a two-tone signal entirely with vector ops, draws the waveform, transforms it in place with vDSP's split-complex FFT, and draws the 128-bin spectrum — sixty FFTs a second from a dynamic language. Arrow keys steer the second tone. |
+
+### The screen is memory
+
+Three demos exist to show the same claim from different angles: a VM can write
+*video memory* rather than sending drawing commands.
+
+| | |
+|---|---|
+| ![Plasma](23-demo-plasma.png) | **Plasma (direct GPU memory)** — the hardest case for a command protocol, since every pixel changes every frame. Here it is one buffer the VM fills. SPACE cycles the palette. |
+| ![Text Pages](24-demo-textpages.png) | **Text Pages** — the text plane: a 53×30 page of four-byte cells. Showing a page copies 6360 bytes and sends no commands at all, and turning the page costs the same whether it is empty or full. |
+| ![Copper Bars](25-demo-copper.png) | **Copper Bars** — the oldest trick in the raster book and the exact opposite of the framebuffer: the screen is filled *once* and never redrawn, and the bars move by rewriting the palette — 960 bytes a frame. |
 
 ---
 
