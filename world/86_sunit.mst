@@ -201,8 +201,8 @@ Object subclass: TestCase [
         "The workhorse, and the one whose MESSAGE matters: a bare 'assertion
          failed' tells you a test broke, this tells you how."
         actual = expected ifFalse: [
-            self fail: 'expected ', expected printString,
-                       ' but was ', actual printString ].
+            self fail: 'expected ', (self describe: expected),
+                       ' but was ', (self describe: actual) ].
         ^self
     ]
 
@@ -210,17 +210,17 @@ Object subclass: TestCase [
         "Same check, but say what it was FOR when the values alone do not
          explain it."
         actual = expected ifFalse: [
-            self fail: aString, ' (expected ', expected printString,
-                       ' but was ', actual printString, ')' ].
+            self fail: aString, ' (expected ', (self describe: expected),
+                       ' but was ', (self describe: actual), ')' ].
         ^self
     ]
 
     assert: actual closeTo: expected precision: epsilon [
         "Floats. Comparing them with = is a bug waiting for a rounding error."
         (actual - expected) abs > epsilon ifTrue: [
-            self fail: 'expected ', expected printString,
-                       ' +/- ', epsilon printString,
-                       ' but was ', actual printString ].
+            self fail: 'expected ', (self describe: expected),
+                       ' +/- ', (self describe: epsilon),
+                       ' but was ', (self describe: actual) ].
         ^self
     ]
 
@@ -234,7 +234,7 @@ Object subclass: TestCase [
         raised := false.
         [ aBlock value ] on: anExceptionClass do: [ :e | raised := true ].
         raised ifFalse: [
-            self fail: 'expected ', anExceptionClass printString, ' but nothing was raised' ].
+            self fail: 'expected ', (self describe: anExceptionClass), ' but nothing was raised' ].
         ^self
     ]
 
@@ -249,6 +249,32 @@ Object subclass: TestCase [
 
     fail [ ^self fail: 'failed' ]
     fail: aString [ "Signal a FAILURE (not an error)." ^TestFailure new signal: aString ]
+
+    "── describing values without becoming the bug ───────────────────────
+     Every message this class builds runs `printString` on a value the TEST
+     supplied, and a printOn: that raises turns the report into the failure:
+     the real assertion is lost and what surfaces is the reporter's own
+     error, attributed to the same test. That is not hypothetical — it cost
+     a long debugging session, where a `does not understand instVarAt:put:`
+     surfaced as `symbols are immutable` from the reporting path.
+
+     So nothing here calls printString directly. A value that cannot print
+     is described by its class instead, the assertion's own message
+     survives, and the fact that printing failed is stated rather than
+     swallowed."
+    describe: anObject [
+        "The parentheses around the inner handler are load-bearing: without
+         them `,` binds to the do: ARGUMENT rather than the handler's result,
+         so the fallback tried to concatenate a BlockClosure and raised —
+         inside the very method that exists to stop reporting from raising.
+         Its own test caught it."
+        | name |
+        name := [ anObject class name asString ]
+                    on: Error do: [ :e2 | 'object' ].
+        ^[ anObject printString ]
+            on: Error
+            do: [ :e | '<a ' , name , ' whose printString raised>' ]
+    ]
 
     "── running ──────────────────────────────────────────────────────────"
 
@@ -372,6 +398,20 @@ Object subclass: TestRunner [
         ^result
     ]
 
+    "An exception's own messageText can be nil, and — in the case that
+     matters — asking for it can RAISE, because a handler is running while
+     something in the image is already broken. If that escaped here it would
+     abort the entire suite from inside the code whose job is to report one
+     test's failure, which is the worst possible place to lose control.
+     Answers a description either way."
+    TestRunner class >> textOf: anException [
+        ^[ anException messageText
+               ifNil: [ [ anException class name asString ]
+                            on: Error do: [ :e2 | 'unnamed exception' ] ] ]
+            on: Error
+            do: [ :e | '<exception whose messageText raised>' ]
+    ]
+
     TestRunner class >> runOne: cls selector: sel into: result [
         "One test, timed, with the two outcomes kept apart.
 
@@ -407,15 +447,16 @@ Object subclass: TestRunner [
         message := ''.
         [ [ (cls selector: sel) runCase ]
               on: TestFailure
-              do: [ :e | outcome := #fail. message := e messageText ] ]
+              do: [ :e | outcome := #fail. message := self textOf: e ] ]
           on: Error
           do: [ :e |
               "Only if the failure handler did not already claim it — see
                above: after a caught TestFailure the block may keep running and
                raise something else on the way out."
-              outcome == #pass ifTrue: [ outcome := #error. message := e messageText ] ].
+              outcome == #pass ifTrue: [ outcome := #error. message := self textOf: e ] ].
         ms := Time millisecondClockValue - t0.
         outcome == #pass ifTrue: [ ^result pass: name ms: ms ].
+        message isNil ifTrue: [ message := '(no message)' ].
         outcome == #fail ifTrue: [ ^result fail: name ms: ms message: message ].
         ^result error: name ms: ms message: message
     ]

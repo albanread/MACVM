@@ -54,10 +54,69 @@ TestCase subclass: RaiseCases [
     testExpectedARaiseButGotNone [ self should: [ 1 + 1 ] raise: Error ]
 ]
 
+"I cannot be printed. A test that fails while comparing me used to lose its
+ own message: `printString` raised inside the reporter, and what surfaced was
+ the printing error attributed to the test — the real assertion gone. I exist
+ so that can never regress."
+Object subclass: Unprintable [
+    printOn: aStream [ ^self error: 'printOn: deliberately raises' ]
+]
+
+"An exception whose messageText raises. Asking a broken image for an error's
+ text is exactly when this happens, and it used to escape the runner's own
+ handler and abort the WHOLE suite from inside the code meant to report one
+ test."
+Error subclass: UnreportableError [
+    messageText [ ^self error: 'messageText deliberately raises' ]
+]
+
+"The reporting-path cases. Each FAILS or ERRORS on purpose; SUnitTest runs
+ them and asserts the framework survived and said something useful."
+TestCase subclass: ReportingHazards [
+    ReportingHazards class >> isHelper [ "Run BY SUnitTest, not as part of a full run." ^true ]
+    testFailsComparingUnprintableValues [
+        self assert: Unprintable new equals: Unprintable new ]
+    testRaisesAnUnreportableError [
+        UnreportableError new signal ]
+]
+
 "--- the suite proper. It comes LAST because it names the helper classes
  above, and this dialect resolves globals when a method is compiled: a file
  may only reference names already bound. ---"
 TestCase subclass: SUnitTest [
+
+    "── the reporter must never become the failure ───────────────────────
+     Both cases below used to take the run down or replace the real message
+     with the reporter's own error. The assertions are about SURVIVAL and
+     ATTRIBUTION: the right number of results, recorded against the right
+     test, with a message that admits what went wrong."
+
+    testUnprintableValuesStillProduceAFailure [
+        | r msg |
+        r := TestRunner run: (Array with: ReportingHazards).
+        "two tests, two results — the suite did not abort partway"
+        self assert: r runCount equals: 2
+             description: 'the run must survive a reporter that cannot print'.
+        self assert: r failureCount equals: 1
+             description: 'an unprintable comparison is still a FAILURE'.
+        msg := r failures first at: 3.
+        "the assertion's OWN wording survives, and the printing problem is
+         stated rather than swallowed"
+        self assert: (msg includesSubstring: 'expected')
+             description: 'the assertion message must survive'.
+        self assert: (msg includesSubstring: 'printString raised')
+             description: 'and it must SAY that printing failed'
+    ]
+
+    testUnreportableErrorIsRecordedNotFatal [
+        | r msg |
+        r := TestRunner run: (Array with: ReportingHazards).
+        self assert: r errorCount equals: 1
+             description: 'an exception whose messageText raises is an ERROR, not a crash'.
+        msg := r errors first at: 3.
+        self assert: msg isString description: 'a message must still be recorded'.
+        self assert: msg isEmpty not description: 'and it must not be empty'
+    ]
 
     testAssertEqualsSaysWhatItExpected [
         "The message is the feature. 'assertion failed' tells you a test broke;
