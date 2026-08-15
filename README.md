@@ -15,6 +15,10 @@ buttons — including a live temperature explorer that runs from absolute zero t
 the surface of the sun, and a weather app that fetches a real forecast over a
 socket. Everything else here is for building it yourself.
 
+Want to see it before downloading? [**docs/gallery**](docs/gallery/) is a
+screenshot tour of every view, demo, tool and app, with notes on what each one
+is for.
+
 ## Motivation
 
 A from-scratch Apple Silicon compiler for Smalltalk — the most complex
