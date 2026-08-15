@@ -56,6 +56,13 @@ Object subclass: WorkerMessage [
          dispatches top-level like any message, whichever VM asked."
         ^(payload isKindOf: Array) and: [ (payload size >= 1) and: [ (payload at: 1) == #tick ] ]
     ]
+    isVmExiting [
+        "A VM'S OWN GOODBYE ({#vmExiting. id. reason} — `Worker exit:`), which
+         is different in kind from #workerDied: that one is the RUNTIME
+         reporting a death after the fact, this one is the VM itself, still
+         running, saying it has chosen to go. It always arrives first."
+        ^(payload isKindOf: Array) and: [ (payload size >= 2) and: [ (payload at: 1) == #vmExiting ] ]
+    ]
     isUiReq [
         "Is this a UI worker → primary request ({#uiReq. corr. verb. ...} —
          Cocoa GUI CG4, cocoa_gui_design.md §7.3)? Matched by SHAPE before any
@@ -95,7 +102,7 @@ Object subclass: WorkerMessage [
  harmless to load anywhere."
 Object subclass: Worker [
     | id |
-    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler AnyDiedHook DeadlineSweepHook InFlightPeer InFlightCorr TickHandler DeathWatchers>
+    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler AnyDiedHook DeadlineSweepHook InFlightPeer InFlightCorr TickHandler DeathWatchers ExitWatchers>
 
     "── spawning (primary side) ──"
     Worker class >> spawn: initSource [
@@ -309,6 +316,17 @@ Object subclass: Worker [
         ^self
     ]
 
+    "THE OTHER ENDING: a VM that chose to go (`Worker exit:`) announces itself
+     before it does, and these watchers hear it — with the reason, which is
+     what lets a registry say `exited (closed)` where it would otherwise have
+     to guess `died`. Plural and unconditional, exactly like the death
+     watchers; a 2-argument block, id and reason."
+    Worker class >> alsoOnVmExiting: aBlock [
+        ExitWatchers isNil ifTrue: [ ExitWatchers := OrderedCollection new ].
+        ExitWatchers add: aBlock.
+        ^self
+    ]
+
     Worker class >> onAnyWorkerDied: aBlock [
         "ServiceWorker's OWN death seam (docs/otp_workers_design.md §3.4/§4.2):
          unlike DiedHandler (SupervisorRegistry's, populated only once a tree
@@ -434,6 +452,25 @@ Object subclass: Worker [
             DiedHandler isNil ifFalse: [
                 DiedHandler value: (msg payload at: 2).
                 ^self ] ].
+        msg isVmExiting ifTrue: [
+            "A DEPARTING VM'S OWN WORD, and it gets its own watchers rather
+             than borrowing the death ones: an exit is a decision and a death
+             is an accident, and a registry that reports them in the same
+             sentence is lying about one of them. The runtime's #workerDied
+             follows a moment later, as it does for every ending; a watcher
+             that already retired the app on this message simply finds nothing
+             left to report, which is how one ending stays one line.
+             NOT CONSUMED, and that is `isWorkerDied`'s rule too: the display
+             is a SHAPE-ROUTED VM whose whole handler is the reply hook, so a
+             control message that returns here never reaches it — consuming
+             this one stopped every app window from ever closing, which is how
+             the rule got learned twice."
+            ExitWatchers isNil ifFalse: [
+                ExitWatchers do: [ :w |
+                    w value: (msg payload at: 2)
+                      value: (msg payload size >= 3
+                                ifTrue: [ msg payload at: 3 ]
+                                ifFalse: [ #done ]) ] ] ].
         msg isTick ifTrue: [ ^self dispatchTick ].
         msg isUiReq ifTrue: [ ^self serveUiReq: msg payload ].
         msg isSnapshot ifTrue: [
@@ -670,11 +707,56 @@ Object subclass: Worker [
         ^self primSelfId
     ]
 
+    "── a VM ends itself, and says so on the way out ────────────────────
+     The author's rule: *a vm should exit itself and send a vm_exiting message
+     as it does so*. Every other ending we had was somebody ELSE's decision
+     arriving from outside — a poison envelope from the parent, a fatal error,
+     a reaped epoch — and each left the peers to INFER the death from a notice
+     the runtime sent afterwards. This is the other kind: the VM decides, tells
+     the people who care WHILE it is still able to, and then goes.
+
+     Order is the whole guarantee. `#vmExiting` is an ordinary message down an
+     ordinary link, sent BEFORE the exit is even requested, so it is queued
+     ahead of the death by construction — a peer always hears the VM's own
+     goodbye before the runtime's report. And the exit itself is a message to
+     this VM: the work in flight finishes first, `ensure:` blocks run, and the
+     loop ends at the top, where every ending has always been handled.
+
+     `aReason` rides along so a listener can tell a close from a finished job
+     from a self-diagnosed failure; #closed is the display's."
+    Worker class >> exit: aReason <Object> [
+        self announceExiting: aReason.
+        ^self primExitSelf
+    ]
+
+    Worker class >> exit [ ^self exit: #done ]
+
+    "Told to everyone this VM can reach: the display (which owns a window that
+     must not outlive us) and the parent (which owns the fleet entry). Both are
+     sends that may fail on a link already gone — an exit must never be
+     stopped by an audience that left first."
+    Worker class >> announceExiting: aReason <Object> [
+        | bytes |
+        bytes := self pickle: (Array with: #vmExiting with: self selfId with: aReason).
+        self hasUi ifTrue: [
+            self primSendQuiet: self uiPeer corr: 0 bytes: bytes ].
+        self primSendQuiet: 0 corr: 0 bytes: bytes.
+        ^self
+    ]
+
     "── the numbered primitives (docs/multi-smalltalk-worker.md §5) ──"
     Worker class >> pickle: x [ <primitive: 227> ^self error: 'unpicklable (blocks/contexts/classes/aliens cannot cross a VM boundary)' ]
     Worker class >> unpickle: b [ <primitive: 228> ^self error: 'bad pickle bytes' ]
     Worker class >> primSpawn: initString [ <primitive: 220> ^nil ]
     Worker class >> primSend: i corr: c bytes: b [ <primitive: 221> ^self error: 'cannot send (unknown or dead worker)' ]
+    "THE SAME SEND, MINUS THE RAISE — for the one caller that must not be
+     stoppable by its audience. `announceExiting:` runs on the way out, below
+     the world's exception classes (Error is defined in 78_exceptions.mst, this
+     file is 47), so it can neither catch a failed send nor afford one: a peer
+     that left first would otherwise abort the exit and leave the VM running
+     forever, which is the exact bug the exit protocol exists to kill. Answers
+     false where the raising twin would signal."
+    Worker class >> primSendQuiet: i corr: c bytes: b [ <primitive: 221> ^false ]
     Worker class >> primPoll [ <primitive: 222> ^nil ]
     Worker class >> primAwaitInbox: ms [ <primitive: 223> ^nil ]
     Worker class >> primTerminate: i [ <primitive: 224> ^self ]
@@ -682,4 +764,5 @@ Object subclass: Worker [
     Worker class >> primSelfId [ <primitive: 226> ^0 ]
     Worker class >> primUiPeer [ <primitive: 229> ^0 ]
     Worker class >> primTickEvery: ms [ <primitive: 277> ^false ]
+    Worker class >> primExitSelf [ <primitive: 278> ^false ]
 ]

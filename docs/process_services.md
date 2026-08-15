@@ -129,6 +129,57 @@ The holes this record closes:
 4. **Timers, peers, registries clean on death.** Timers: S1's liveness check.
    Peer links: already dropped on failed send. App registries: S2's watcher.
 
+### A VM ends itself — S5, the author's rule
+
+*"A vm should exit itself and send a vm_exiting message as it does so."*
+
+Every ending the ladder above describes is somebody ELSE's decision arriving
+from outside: a poison envelope from the parent, a fatal error, a reaped
+epoch. Each leaves the peers to INFER the death from a runtime notice sent
+afterwards — which is fine for an accident and wrong for a decision. A window
+closes, a job finishes, an app concludes it is done: those are the VM's own
+call, and the VM should make it, announce it, and go.
+
+- `Worker exit: aReason` — announces `{#vmExiting. selfId. reason}` to the
+  display and the parent, THEN requests the exit. Order is the guarantee: the
+  goodbye is queued ahead of the death by construction, so a peer always hears
+  the VM's own word before the runtime's report.
+- The announcement uses `primSendQuiet:` (the same prim 221, with a
+  non-raising fallback) because it runs below the world's exception classes
+  and must never be stoppable by an audience that left first.
+- The exit itself is prim 278 → `workers::exit_self`, which posts the SAME
+  poison envelope an external terminate posts, to this VM's own inbox. The
+  work in flight finishes — a VM does one thing at a time, and an exit is not
+  an exception to that — then the loop's existing terminate arm runs. **One
+  exit path, reached two ways.**
+- Listeners: `Worker alsoOnVmExiting: [:id :why | …]`, separate from the death
+  watchers. An exit is a decision and a death is an accident; a registry that
+  reports them in one sentence is lying about one of them. Whoever retires the
+  entry on the exit leaves the following `#workerDied` nothing to say, so one
+  ending stays one line.
+- Routing law learned twice: a control message must NOT be consumed in
+  `dispatchOne:`. The display is a shape-routed VM whose whole handler is the
+  reply hook, so anything that returns early there never reaches it.
+
+**The first consumer — a window close ends its app (`world/93_appvm.mst`).**
+`AppToolWindow`'s default is still "close is hide, never die", which is right
+for an in-process tool whose state is class-side in this image. A VM-backed
+window sets a close HOOK instead, because hiding one leaves a thread, an
+inbox and a ticking timer publishing frames at glass nobody can see. The hook
+does only what is safe inside AppKit's own `windowShouldClose:` — hide, forget
+the bookkeeping, and SEND — because `teardown` clears the window's delegate
+and destroys its views, and doing that while AppKit is mid-call on that very
+delegate is the hazard this codebase refuses everywhere else. The app's
+`#vmExiting` comes back through the door and destroys the window in a drain.
+In-flight frames from the retired VM are judged BY PEER, not by id, so a
+relaunch under the same name — a new VM, a new generation — registers a fresh
+window while a ghost cannot resurrect the old one.
+
+Consequence for S4b: a spawn-granted VM can now also READ liveness for its
+grant's epoch (`workers::alive`). Authority to spawn into a fleet and
+visibility of what you spawned are the same grant; without it the display
+could not tell a live app from a corpse behind the same window.
+
 ## 4. Exit — the sequence that does not exist today
 
 Today ⌘Q kills detached VM threads mid-instruction; the CLI end drops the

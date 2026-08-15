@@ -232,6 +232,22 @@ Object subclass: AppToolWindow [
         ^tool open
     ]
 
+    "FORGET ONE WINDOW — natives destroyed, registration dropped. The window
+     of an app VM that has been retired must NOT survive its VM: a registration
+     that outlives what was behind it is a shell that fronts on the next launch
+     (`launchApp:` fronts a registered window rather than starting anything),
+     showing a last frame whose clicks reach nobody. Unregistering is what makes
+     relaunch mean START AGAIN."
+    AppToolWindow class >> unregister: anId <Symbol> ^ <Object> [
+        | tool |
+        tool := self windows at: anId ifAbsent: [ nil ].
+        tool isNil ifTrue: [ ^self ].
+        [ tool teardown ] on: Error do: [ :e | nil ].
+        self windows removeKey: anId ifAbsent: [ nil ].
+        self order remove: anId ifAbsent: [ nil ].
+        ^self
+    ]
+
     "For tests and for a fresh environment: forget every registration."
     AppToolWindow class >> reset [
         Windows := nil. Order := nil.
@@ -352,7 +368,7 @@ Object subclass: AppToolWindow [
 
     "── an instance ─────────────────────────────────────────────────────"
 
-    | id title width height renderBlock handlerBlock paintBlock realizer lastSpec damage |
+    | id title width height renderBlock handlerBlock paintBlock realizer lastSpec damage closeBlock |
 
     setId: anId <Symbol> title: aTitle <String> width: w <Integer> height: h <Integer>
     render: r <Object> handler: hh <Object> paint: pp <Object> ^ <AppToolWindow> [
@@ -394,10 +410,22 @@ Object subclass: AppToolWindow [
         ^self rerender
     ]
 
-    "CLOSE IS HIDE, NEVER DIE, and it is bound here so that no tool can forget
-     it. The state is the tool's own and outlives the window, so reopening is
-     instant and loses nothing."
+    "CLOSE IS HIDE, NEVER DIE — for an IN-PROCESS tool, whose state is class-side
+     in this very image: it outlives the window, so reopening is instant and
+     loses nothing. That is the default and it is bound here so no tool can
+     forget it.
+
+     A WINDOW BACKED BY ANOTHER VM IS THE OTHER CASE, and hiding it is wrong:
+     the state is not here, it is a live VM with a thread, a timer and an inbox,
+     and hiding leaves it publishing frames at a window nobody can see, forever.
+     So close is a HOOK. Whoever owns what is behind the window says what close
+     means — AppVmDisplay retires the app (docs/process_services.md's rule that
+     every lifecycle transition has exactly one owner); a tool that sets no hook
+     gets hide, exactly as before."
+    onClose: aBlock <Object> [ closeBlock := aBlock. ^self ]
+
     closeRequested ^ <Object> [
+        closeBlock isNil ifFalse: [ ^closeBlock value ].
         self realizer hide.
         ^self
     ]

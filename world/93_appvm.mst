@@ -137,6 +137,18 @@ Object subclass: AppVmClient [
     ]
 
     AppVmClient class >> handle: payload <Object> [
+        "THE WINDOW CLOSED, SO THIS VM IS DONE. The display does not kill us
+         and the primary is not consulted: we are asked, and we end ourselves
+         — the tool's window torn down here, its `ensure:` blocks run, the
+         goodbye sent, and only then the exit (`Worker exit:`). An app that
+         wanted to refuse, save first, or ask something would do it right
+         here; that choice belongs to the app, which is the point of it having
+         a VM at all."
+        ((payload isKindOf: Array) and: [ (payload at: 1) == #appExit ])
+            ifTrue: [
+                [ self localWindow ifNotNil: [ :w | w teardown ] ]
+                    on: Error do: [ :e | nil ].
+                ^Worker exit: #closed ].
         ((payload isKindOf: Array) and: [ (payload at: 1) == #appEvent ])
             ifFalse: [ ^self ].
         "THE HANDLER RUNS HERE — in this VM, on this thread. Whatever it costs,
@@ -202,14 +214,35 @@ Object subclass: AppVmHost [
         Watching == true ifTrue: [ ^self ].
         Watching := true.
         Worker alsoOnWorkerDied: [ :deadId | AppVmHost noteDeath: deadId ].
+        "AN EXIT IS NOT A DEATH. A closed window ends its app deliberately, and
+         the app says so on the way out; reporting that as `died` would make
+         every ordinary close look like a crash in the one place a reader goes
+         to find crashes. Retiring the entry HERE also means the #workerDied
+         that follows finds nothing left and stays quiet — one ending, one
+         line."
+        Worker alsoOnVmExiting: [ :goneId :why | AppVmHost noteExit: goneId why: why ].
         ^self
+    ]
+
+    AppVmHost class >> noteExit: goneId <Integer> why: aReason <Object> [
+        | gone |
+        gone := self appNamed: goneId.
+        gone isNil ifTrue: [ ^self ].
+        self apps removeKey: gone ifAbsent: [ nil ].
+        Transcript showCr: 'app ' , gone printString , ' exited (' , aReason printString , ')'.
+        ^self
+    ]
+
+    AppVmHost class >> appNamed: aWorkerId <Integer> ^ <Object> [
+        self apps keysAndValuesDo: [ :k :w | w id = aWorkerId ifTrue: [ ^k ] ].
+        ^nil
     ]
 
     AppVmHost class >> noteDeath: deadId <Integer> [
         | gone |
-        gone := nil.
-        self apps keysAndValuesDo: [ :k :w |
-            w id = deadId ifTrue: [ gone := k ] ].
+        gone := self appNamed: deadId.
+        "Nothing left to report means the app already announced its own exit
+         and was retired there — the deliberate ending owns the line."
         gone isNil ifTrue: [ ^self ].
         self apps removeKey: gone ifAbsent: [ nil ].
         Transcript showCr: 'app ' , gone printString , ' died — its window keeps its last frame'.
@@ -254,7 +287,7 @@ Object subclass: AppVmHost [
 "────────────────────────────────────────────────────────────────────────
  ON THE UI WORKER — the display server."
 Object subclass: AppVmDisplay [
-    <classVars: Frames Peers Previous Installed>
+    <classVars: Frames Peers Previous Installed Retired>
 
     "The last frame each app sent, and the link to answer it on."
     AppVmDisplay class >> frames ^ <Dictionary> [
@@ -292,6 +325,14 @@ Object subclass: AppVmDisplay [
          raised, the drain logged it to stderr, and the display showed
          nothing. The frame path worked the whole time; this guard was eating
          the frames."
+        "A VM'S OWN GOODBYE outranks everything else it could be saying: after
+         this there are no more frames, and the window it was driving has to
+         go. Matched before the frame arm because it is the rarer, terminal
+         shape — and because a retired app must not fall through to passOn:
+         and reach somebody who would treat it as a reply."
+        ((payload isKindOf: Array)
+            and: [ payload size >= 1 and: [ (payload at: 1) == #vmExiting ] ])
+                ifTrue: [ ^self vmExiting: payload from: m from ].
         ((payload isKindOf: Array)
             and: [ payload size >= 3 and: [ (payload at: 1) == #appFrame ] ])
                 ifFalse: [ ^self passOn: m ].
@@ -317,6 +358,14 @@ Object subclass: AppVmDisplay [
     AppVmDisplay class >> frame: aSpec <Object> for: anId <Object> from: aPeer <Integer> blits: someBlits <Object> [
         | key win |
         key := anId asString asSymbol.
+        "A FRAME FROM A VM WE RETIRED IS A GHOST. Its window is gone and its
+         VM is on its way out, but messages it had already sent are still in
+         flight — and the arm below would happily register a NEW window for
+         them. Judged by peer, not by id: a relaunch under the same name is a
+         different VM with a different generation, and must go straight
+         through."
+        (self retired at: key ifAbsent: [ nil ]) = aPeer ifTrue: [ ^self ].
+        self retired removeKey: key ifAbsent: [ nil ].
         self frames at: key put: aSpec.
         self peers at: key put: aPeer.
         win := AppToolWindow named: key.
@@ -361,7 +410,89 @@ Object subclass: AppVmDisplay [
             height: ((aSpec at: #height) ifNil: [ 640 ]) rounded
             render: [ AppVmDisplay frameFor: anId ]
             handler: [ :event :value | AppVmDisplay send: event value: value to: anId ].
+        "CLOSING THIS WINDOW ENDS THE APP. Without the hook the framework's
+         in-process default applies — hide — and an app VM whose window is
+         hidden goes on living: a thread, an inbox, a timer still ticking, and
+         frames published at glass nobody can see. Nothing would ever have
+         stopped it."
+        (AppToolWindow named: anId) ifNotNil: [ :w |
+            w onClose: [ AppVmDisplay retire: anId ] ].
         ^self
+    ]
+
+    "── retirement: the window's close, the app's end ───────────────────
+     WHAT IS SAFE HERE IS THE WHOLE DESIGN. This runs inside AppKit's own
+     `windowShouldClose:` (through the C6 door), so it does only what a
+     callback may do: hide the glass, forget the bookkeeping, and SEND. It
+     does NOT tear the window down — `teardown` clears the window's delegate
+     and destroys its views, and doing that while AppKit is mid-call on that
+     very delegate is the hazard this codebase already refuses everywhere
+     else. The teardown comes back through the door instead, as #appRetired,
+     once the owner has actually stopped the VM."
+    AppVmDisplay class >> retired ^ <Dictionary> [
+        Retired isNil ifTrue: [ Retired := Dictionary new ].
+        ^Retired
+    ]
+
+    AppVmDisplay class >> retire: anId <Symbol> [
+        | key peer |
+        key := anId asString asSymbol.
+        peer := self peers at: key ifAbsent: [ nil ].
+        "REMEMBER WHICH VM, not merely that one was retired: frames already in
+         flight from the dying app must not resurrect the window, while a
+         RELAUNCH — a new VM, and so a new (id, generation) handle — must be
+         free to register a fresh one. The generational handles exist for
+         exactly this kind of question."
+        peer isNil ifFalse: [ self retired at: key put: peer ].
+        self frames removeKey: key ifAbsent: [ nil ].
+        (AppToolWindow named: key) ifNotNil: [ :w |
+            [ w realizer hide ] on: Error do: [ :e | nil ] ].
+        "ASK THE APP TO END ITSELF — straight down the link its frames came up,
+         with no primary in the path (the display talks to app VMs; that is
+         what the peer links are for). A VM ends itself and announces it: the
+         `#vmExiting` that comes back is what destroys this window, in a drain,
+         which is the only place it is safe to destroy one."
+        peer isNil
+            ifTrue: [ AppToolWindow unregister: key ]
+            ifFalse: [ self requestExit: peer for: key ].
+        ^self
+    ]
+
+    "NOT an #appEvent. Events are the window's, and the app routes them into
+     its widgets; this is addressed to the VM itself, so it travels as its own
+     shape — the first thing `handle:` looks for."
+    AppVmDisplay class >> requestExit: aPeer <Object> for: anId <Symbol> [
+        ^[ (Worker new setId: aPeer) send: (Array with: #appExit with: #closed).
+           true ]
+            on: Error do: [ :e |
+                "The VM is already gone, so nothing will announce anything:
+                 destroy the window here rather than wait for a goodbye that
+                 can never come."
+                AppToolWindow unregister: anId.
+                false ]
+    ]
+
+    "THE APP'S OWN GOODBYE (`Worker exit:` announces it before it goes), which
+     is the display's authority to destroy the window: the VM behind it has
+     said it is leaving, so the glass has nothing left to show. Arrives as an
+     ordinary message in an ordinary drain — never inside a window callback."
+    AppVmDisplay class >> vmExiting: anId <Object> from: aPeer <Object> [
+        | key |
+        key := self idForPeer: aPeer.
+        key isNil ifTrue: [ ^self ].
+        self retired at: key put: aPeer.
+        self frames removeKey: key ifAbsent: [ nil ].
+        self peers removeKey: key ifAbsent: [ nil ].
+        AppToolWindow unregister: key.
+        ^self
+    ]
+
+    "Which app a peer id belongs to — the reverse of `peers`, walked because
+     the table is a handful of entries and a second index would be a second
+     thing to keep true."
+    AppVmDisplay class >> idForPeer: aPeer <Object> ^ <Object> [
+        self peers keysAndValuesDo: [ :k :p | p = aPeer ifTrue: [ ^k ] ].
+        ^nil
     ]
 
     "AN EVENT GOES STRAIGHT BACK to the app's VM, on the link its frame

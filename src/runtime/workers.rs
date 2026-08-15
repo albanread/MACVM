@@ -949,6 +949,37 @@ pub fn send(vm: &mut VmState, id: u32, corr: u64, bytes: Vec<u8>) -> bool {
     }
 }
 
+/// A VM ENDS ITSELF (prim 278). The author's rule: *"a vm should exit itself
+/// and send a vm_exiting message as it does so"* — so the last word about a
+/// VM's life belongs to that VM, not to whoever wanted it gone. A close
+/// gesture, a finished job, an app that decides it is done: all of them now
+/// have the same ending, and the announcement is the guest's own (`Worker
+/// exit:` sends `{#vmExiting. …}` to its peers BEFORE calling this), which
+/// means it is ordered before the death exactly like any other message it
+/// ever sent.
+///
+/// The mechanism is deliberately not a new one: this posts the SAME poison
+/// envelope an external terminate posts, to this worker's own inbox. The
+/// dispatch in flight finishes (a VM does one thing at a time — an exit is
+/// not an exception to that), then the loop's existing terminate arm runs:
+/// dead in the monitor, liveness flag flipped, the death notice sent, the
+/// heap unmapped by the ordinary drop. One exit path, reached two ways.
+///
+/// Answers false in a VM with no worker role — a primary's ending is its
+/// host's business (`orderly_shutdown`), not a message to itself.
+pub fn exit_self(vm: &mut VmState) -> bool {
+    let Some(ws) = vm.workers.as_ref() else {
+        return false;
+    };
+    let WorkerState::Worker { self_inbox, .. } = &**ws else {
+        return false;
+    };
+    let Some(inbox) = self_inbox.as_ref() else {
+        return false;
+    };
+    inbox.send(terminate_envelope()).is_ok()
+}
+
 /// Terminate worker `id` (prim 224): drop its channel — its thread exits on
 /// the next `recv()` — and mark it dead. Idempotent.
 pub fn terminate(vm: &mut VmState, id: u32) -> bool {
@@ -974,15 +1005,25 @@ pub fn alive(vm: &VmState, id: u32) -> bool {
     let Some(ws) = vm.workers.as_ref() else {
         return false;
     };
-    let WorkerState::Primary { epoch, .. } = &**ws else {
-        return false;
+    // WHICH FLEET THIS VM MAY ASK ABOUT. A primary asks about its own epoch.
+    // A SPAWN-GRANTED worker — the display (S4b) — asks about the epoch it was
+    // granted: it spawns app VMs through the kernel, so it must be able to see
+    // whether what it spawned still lives. Without this every such handle read
+    // `false` forever, and the display could not tell a live app from a corpse
+    // behind the same window. Authority and visibility are the same grant.
+    let epoch = match &**ws {
+        WorkerState::Primary { epoch, .. } => *epoch,
+        WorkerState::Worker { spawn_grant, .. } => match spawn_grant {
+            Some(e) => *e,
+            None => return false,
+        },
     };
-    // Scoped by OUR epoch: handles repeat across primaries (each generation's
-    // first worker is w1 gen1), so the row must be this primary's own.
-    if let Some(a) = worker_table_alive_arc_scoped(*epoch, id) {
+    // Scoped by that epoch: handles repeat across primaries (each generation's
+    // first worker is w1 gen1), so the row must be the right fleet's.
+    if let Some(a) = worker_table_alive_arc_scoped(epoch, id) {
         return a.load(Ordering::Acquire);
     }
-    crate::runtime::fleet::link_alive(*epoch, id)
+    crate::runtime::fleet::link_alive(epoch, id)
 }
 
 /// The registration a `tickEvery:` needs, per role (`docs/process_services.md`

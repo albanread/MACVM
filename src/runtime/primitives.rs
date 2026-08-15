@@ -1589,6 +1589,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 278,
+        name: "Worker class>>primExitSelf",
+        f: prim_worker_exit_self,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -2506,6 +2514,19 @@ fn prim_worker_tick_every(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     };
     crate::runtime::timer_service::set_tick(key, ms, target, alive);
     PrimResult::Ok(vm.universe.true_obj)
+}
+
+/// `Worker class>>primExitSelf` (278): this VM ends itself — see
+/// [`crate::runtime::workers::exit_self`]. Answers false in a VM with no
+/// worker role, so guest code can say so rather than silently not exiting.
+fn prim_worker_exit_self(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let _ = args;
+    let ok = crate::runtime::workers::exit_self(vm);
+    PrimResult::Ok(if ok {
+        vm.universe.true_obj
+    } else {
+        vm.universe.false_obj
+    })
 }
 
 /// `Worker class>>primUiPeer` (229): the handle this VM knows as the display,
@@ -5676,6 +5697,7 @@ mod tests {
             (275, "GamePane>>paletteMemory"),
             (276, "GamePane>>paletteGlobalBase"),
             (277, "Worker class>>primTickEvery:"),
+            (278, "Worker class>>primExitSelf"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

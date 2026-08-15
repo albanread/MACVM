@@ -437,3 +437,59 @@ fn a_pane_tools_pixels_cross_to_the_displays_surface() {
         ) == "'true'"
     });
 }
+
+/// CLOSING THE WINDOW ENDS THE APP — and the app is what ends it. The
+/// author's rule: *"a vm should exit itself and send a vm_exiting message as
+/// it does so"*. So the display asks (down the peer link, no primary in the
+/// path), the app VM tears its window down, announces `#vmExiting`, and only
+/// then exits; the announcement — not a timeout, not a death notice — is what
+/// destroys the window. Proven by all three: the VM is dead, the window is
+/// unregistered, and a relaunch under the same id builds a NEW one.
+#[test]
+fn closing_the_window_makes_the_app_vm_exit_itself() {
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    primary.set_worker_boot(Arc::new(|| VmHandle::boot(opts(), Path::new("world"))));
+    let epoch = primary.primary_epoch().expect("epoch");
+    let (ui_id, ui_inbox, to_primary) = primary
+        .register_hosted_worker(Arc::new(|| {}))
+        .expect("register the display");
+    assert!(primary.set_ui_peer(ui_id));
+    let mut ui = VmHandle::boot(opts(), Path::new("world")).expect("display boots");
+    ui.install_worker_role(ui_id, to_primary);
+    ui.set_spawn_grant(epoch);
+    ui.exec("AppVmDisplay install.").expect("display listens");
+    ui.exec("App := Worker spawn: 'AppVmClient serve: ''AppDemoPane'' as: #panedemo.'.")
+        .expect("spawn the app's VM");
+    drain_until(&mut ui, &ui_inbox, "waiting for the app's window", |ui| {
+        eval(ui, "((AppToolWindow named: #panedemo) isNil not) printString") == "'true'"
+    });
+    assert_eq!(eval(&mut ui, "App isAlive printString"), "'true'");
+
+    // The close gesture, exactly as AppKit delivers it: the window's own
+    // `closeRequested`, which for a VM-backed window is the retire hook.
+    ui.exec("(AppToolWindow named: #panedemo) closeRequested.")
+        .expect("the close gesture");
+
+    // The app's goodbye comes back and takes the window with it.
+    drain_until(&mut ui, &ui_inbox, "waiting for the app to exit itself", |ui| {
+        eval(ui, "(AppToolWindow named: #panedemo) isNil printString") == "'true'"
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while eval(&mut ui, "App isAlive printString") != "'false'" {
+        assert!(Instant::now() < deadline, "the app VM never exited");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // RELAUNCH IS A FRESH START, not a fronted corpse: a new VM under the same
+    // id registers its own window, which the retired-peer guard must let past.
+    ui.exec("App2 := Worker spawn: 'AppVmClient serve: ''AppDemoPane'' as: #panedemo.'.")
+        .expect("relaunch");
+    drain_until(&mut ui, &ui_inbox, "waiting for the relaunched window", |ui| {
+        eval(ui, "((AppToolWindow named: #panedemo) isNil not) printString") == "'true'"
+    });
+    assert_eq!(
+        eval(&mut ui, "App2 isAlive printString"),
+        "'true'",
+        "the relaunched app is live behind its new window"
+    );
+}
