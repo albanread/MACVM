@@ -2498,12 +2498,14 @@ fn prim_worker_tick_every(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         return PrimResult::Fail;
     };
     let ms = ms.value().max(0) as u64;
-    let ok = crate::runtime::workers::set_tick_ms(vm, ms);
-    PrimResult::Ok(if ok {
-        vm.universe.true_obj
-    } else {
-        vm.universe.false_obj
-    })
+    // The PROCESS timer service (docs/process_services.md S1): the tick
+    // arrives back as an ordinary `{#tick}` envelope down this VM's own
+    // inbox — any VM with an inbox can tick, a primary included.
+    let Some((key, target, alive)) = crate::runtime::workers::tick_registration(vm) else {
+        return PrimResult::Ok(vm.universe.false_obj);
+    };
+    crate::runtime::timer_service::set_tick(key, ms, target, alive);
+    PrimResult::Ok(vm.universe.true_obj)
 }
 
 /// `Worker class>>primUiPeer` (229): the handle this VM knows as the display,

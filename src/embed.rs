@@ -1812,13 +1812,6 @@ impl VmHandle {
     /// `GameStep` pattern): the host loop calls this, then execs
     /// `Worker dispatchPending.`, whose `primPoll` takes it. Rust bytes only
     /// — nothing here is visible to the GC.
-    /// This VM's frame-tick interval in milliseconds (0 = none) — the worker
-    /// thread reads it every time round its loop, so the guest can start,
-    /// change or stop its own tick at any point.
-    pub fn worker_tick_ms(&self) -> u64 {
-        crate::runtime::workers::tick_ms(&self.vm)
-    }
-
     /// Tell this PRIMARY which of its registered workers is the UI — the
     /// display every app VM it later spawns is introduced to, and which is
     /// introduced to them (`docs/worker_peer_links.md` §3). Call once, right

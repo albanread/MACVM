@@ -50,6 +50,12 @@ Object subclass: WorkerMessage [
         "Is this a forwarded worker transcript line ({#workerTranscript. id. text})?"
         ^(payload isKindOf: Array) and: [ (payload size = 3) and: [ (payload at: 1) == #workerTranscript ] ]
     ]
+    isTick [
+        "A wake from the process timer service ({#tick} — docs/
+         process_services.md S1): delivered down the ordinary inbox so it
+         dispatches top-level like any message, whichever VM asked."
+        ^(payload isKindOf: Array) and: [ (payload size >= 1) and: [ (payload at: 1) == #tick ] ]
+    ]
     isUiReq [
         "Is this a UI worker → primary request ({#uiReq. corr. verb. ...} —
          Cocoa GUI CG4, cocoa_gui_design.md §7.3)? Matched by SHAPE before any
@@ -180,15 +186,16 @@ Object subclass: Worker [
         ^h isNil ifTrue: [ nil ] ifFalse: [ self new setId: h ]
     ]
 
-    "── the frame tick (a VM service) ────────────────────────────────────
-     A worker is otherwise purely message-driven: it sleeps in its inbox and
-     wakes when somebody writes to it. That is exactly right for a tool and
-     useless for a GAME, which must advance whether or not anyone is talking
-     to it. So the VM will wake us on a cadence WE ask for — no timer thread,
-     no busy loop: the inbox wait the worker is already sitting in is simply
-     shortened to the next deadline, and the tick arrives through the same
-     door as a message, under the same rule (one thing at a time, top-level,
-     never nested).
+    "── the frame tick (a PROCESS service — docs/process_services.md S1) ──
+     A VM is otherwise purely message-driven: it sleeps in its inbox and
+     wakes when somebody writes to it. Right for a tool, useless for a GAME,
+     which must advance whether or not anyone is talking to it. So the
+     process timer service wakes us on a cadence WE ask for — one service
+     thread, one wheel, and each wake arrives as an ordinary {#tick} message
+     through the same door as everything else, under the same rule (one
+     thing at a time, top-level, never nested). ANY VM with an inbox can
+     tick — a worker, the primary — and a dead VM's timer cancels itself:
+     the service checks the liveness flag before every fire.
 
      `Worker tickEvery: 16` is 60 Hz; 33 is 30 Hz; 0 stops it. A tick that
      raises retires the worker like any other guest fatal, and a tick block
@@ -225,6 +232,8 @@ Object subclass: Worker [
          payload is served directly — a worker booted with only the shared
          world answers RPCs with no onMessage: handler installed. Any other
          payload goes to the user handler as before."
+        ((payload isKindOf: Array) and: [ (payload size >= 1) and: [ (payload at: 1) == #tick ] ])
+            ifTrue: [ ^self dispatchTick ].
         (self isRpcRequest: payload) ifTrue: [ ^self serveRpc: payload ].
         Handler isNil ifFalse: [
             Handler value: (WorkerMessage from: (env at: 1) payload: payload) ]
@@ -412,6 +421,7 @@ Object subclass: Worker [
             DiedHandler isNil ifFalse: [
                 DiedHandler value: (msg payload at: 2).
                 ^self ] ].
+        msg isTick ifTrue: [ ^self dispatchTick ].
         msg isUiReq ifTrue: [ ^self serveUiReq: msg payload ].
         msg isSnapshot ifTrue: [
             SnapshotHandler isNil ifFalse: [ SnapshotHandler value: msg payload ].

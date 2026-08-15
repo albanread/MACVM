@@ -237,6 +237,22 @@ pub(crate) fn encode_worker_died(id: i64) -> Vec<u8> {
 /// of `{#workerTranscript. id. text}` — a worker's `Transcript show:` (and
 /// its error traces, which also write through `vm.out`) delivered to the
 /// primary through the ordinary inbox and shown on ITS transcript.
+/// A timer tick from the process timer service (`docs/process_services.md`
+/// S1): the payload `{#tick}`, delivered down a VM's ordinary inbox so the
+/// tick dispatches top-level like any other message. Rust-side encoder for
+/// the same reason the transcript's is: the service thread has no VM to
+/// pickle with.
+pub fn encode_tick() -> Vec<u8> {
+    let mut out = MAGIC.to_vec();
+    out.push(TAG_ARRAY);
+    write_varint(&mut out, 1);
+    let name = b"tick";
+    out.push(TAG_SYMBOL);
+    write_varint(&mut out, name.len() as u64);
+    out.extend_from_slice(name);
+    out
+}
+
 pub fn encode_worker_transcript(id: i64, text: &str) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     out.push(TAG_ARRAY);

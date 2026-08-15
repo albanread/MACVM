@@ -237,3 +237,44 @@ fn the_vm_ticks_a_worker_at_the_rate_it_asked_for() {
     // count kept moving, i.e. the timer is periodic rather than one-shot.
     assert!(after > 0, "the tick is periodic, not a one-shot");
 }
+
+/// S1's other gate (`docs/process_services.md`): ANY VM with an inbox can
+/// tick — the primary included, which the piggybacked v1 timer could never
+/// do (its wait belongs to the host loop, not to a worker's recv). The tick
+/// arrives as an ordinary `{#tick}` envelope down the primary's own inbox
+/// and dispatches through `dispatchInbox` like any other message.
+#[test]
+fn a_primary_can_tick_too() {
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    primary.set_worker_boot(Arc::new(|| VmHandle::boot(opts(), Path::new("world"))));
+    primary.exec("TickN := 0.").expect("scoreboard");
+    primary
+        .exec("Worker onTick: [ TickN := TickN + 1 ].")
+        .expect("handler");
+    assert_eq!(
+        primary
+            .eval("(Worker tickEvery: 20) printString")
+            .expect("register")
+            .trim(),
+        "'true'",
+        "a primary has an inbox, so the service must accept it"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut n = 0i64;
+    while Instant::now() < deadline {
+        primary.exec("Worker dispatchInbox.").expect("pump own inbox");
+        std::thread::sleep(Duration::from_millis(10));
+        n = primary
+            .eval("TickN printString")
+            .expect("read")
+            .trim()
+            .trim_matches('\'')
+            .parse()
+            .unwrap_or(0);
+        if n >= 5 {
+            break;
+        }
+    }
+    assert!(n >= 5, "the primary never ticked (TickN = {n})");
+    primary.exec("Worker stopTick.").expect("and it stops");
+}

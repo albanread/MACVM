@@ -24,6 +24,7 @@ pub mod objc_delegate; // Cocoa bridge C6 — reverse dispatch: delegates as top
 pub mod osr;
 pub mod primitives;
 pub mod probe;
+pub mod timer_service; // the process timer service — one thread, ticks as envelopes (docs/process_services.md S1)
 pub mod transcript_service; // the transcript as a VM service — every VM writes, the UI just displays
 pub mod recompile;
 pub mod simd_kernels; // SIMD level 2: explicit hand-written NEON bulk kernels (docs/SIMD.md Part E)
