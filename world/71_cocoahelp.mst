@@ -74,6 +74,8 @@ Object subclass: CocoaHelp [
         s add: (self section: 'The Language' articles: (OrderedCollection new
             add: (Array with: 'The Smalltalk Language' with: #languageText);
             add: (Array with: 'The Strongtalk World'   with: #worldText);
+            add: (Array with: 'Exceptions'             with: #exceptionsText);
+            add: (Array with: 'Strings and Text'       with: #stringsText);
             yourself)).
         s add: (self section: 'The Environment' articles: (OrderedCollection new
             add: (Array with: 'The Environment'       with: #environmentText);
@@ -82,6 +84,7 @@ Object subclass: CocoaHelp [
         s add: (self section: 'Guides' articles: (OrderedCollection new
             add: (Array with: 'Build an App'   with: #appGuideText);
             add: (Array with: 'Build a Game'   with: #gameGuideText);
+            add: (Array with: 'Edit Sprites and Sounds' with: #assetEditorsText);
             add: (Array with: 'Test Your Code' with: #testGuideText);
             add: (Array with: 'Automation'     with: #automationText);
             yourself)).
@@ -1598,6 +1601,140 @@ Source files are the truth, but edits made in the browsers persist to a versione
 > Read the world the way you would read a good book: start at `01_object.mst` and just keep going. There is no magic underneath — it is Smalltalk all the way down until you hit the VM.
 ' ]
 
+    CocoaHelp class >> exceptionsText [ ^'# Exceptions
+
+Errors in macVM are **objects**. When something goes wrong, a signal travels outward through the running code until a handler takes it — and if nothing does, the error prints and the program stops, exactly as it always did. Catching is opt-in: code that never mentions exceptions behaves as before.
+
+## Signal and handle
+
+```ref
+[ 1/0 ] on: ZeroDivide do: [ :e | Transcript show: e messageText. 0 ]
+```
+
+The first block is the **protected block**; the second is the **handler**, and its argument `e` is the exception itself. If the protected block finishes, its value is the answer and the handler never runs. If it signals, the handler''s value is the answer instead — here `0`, after printing *division by zero*.
+
+Raising your own is one message:
+
+```ref
+Error signal: ''the cupboard is bare''
+```
+
+`Object>>error:` funnels through the same machinery, so every library failure — a missing dictionary key, `first` on an empty collection — is catchable the same way.
+
+## Catch by kind
+
+Exceptions form a hierarchy, and a handler catches its class **and everything below it**:
+
+- `Exception` — the root; a handler for it catches everything
+- `Error` — anything that stops the computation
+- `ZeroDivide` — division by zero
+- `MessageNotUnderstood` — a message the receiver has no method for
+- `IndexOutOfBounds` — an index outside the collection
+- `Warning` — resumable; see below
+
+So `on: Error do:` takes all four error kinds, while `on: ZeroDivide do:` lets a `MessageNotUnderstood` sail past to some outer handler. The VM''s own failures raise these same classes: `1/0`, `3 fooBar` and `#(1 2) at: 9` are all ordinary, catchable signals.
+
+Each kind carries its evidence. Every exception answers `messageText`; a `MessageNotUnderstood` also answers `receiver` and `message selector`; an `IndexOutOfBounds` answers `index`.
+
+## The verbs
+
+Inside a handler, `e` understands four ways out:
+
+- `e return: x` — answer `x` from the whole `on:do:`; the rest of the handler is abandoned
+- `e retry` — run the protected block **again**, with a fresh handler armed
+- `e pass` — decline: hand the exception to the next handler outward
+- `e resume: x` — *resumable signals only*: go back and continue, with `x` as the value of `signal`
+
+`retry` is a loop, not recursion — a handler that retries five thousand times grows no stack. `pass` searches strictly **outward**: an exception can never re-enter the handler that passed it.
+
+## Warnings resume
+
+An `Error` is not resumable — once raised, the computation below is abandoned. A `Warning` is: the signalling code is still there, waiting, and `resume:` continues it.
+
+```ref
+[ Transcript show: (Warning signal: ''low on tea'') printString ]
+    on: Warning do: [ :w | w resume: #noted ]
+```
+
+Unhandled, a Warning prints its message and **carries on**, answering `nil` — a warning nobody is listening for should not kill the computation.
+
+## ensure: always runs
+
+```ref
+[ self openValve. self pump ] ensure: [ self closeValve ]
+```
+
+The `ensure:` block runs however the protected block exits — normal return, an exception caught three levels out, even a handler''s `retry` (the abandoned attempt is cleaned up before the next begins). The order on a signal is the classic one: body, then handler, then the ensure blocks between them.
+
+## Your own kinds
+
+Subclass where it reads best, and give the class its default words:
+
+```ref
+Error subclass: OvenTooCold [
+    description [ ^''the oven is not hot enough'' ]
+]
+
+[ self bake ] on: OvenTooCold do: [ :e | self preheat. e retry ]
+```
+
+The tests that pin all of this down are `world/tests/50`, `54` and `55` — worth a read; they are short and they show every verb in motion.
+' ]
+
+    CocoaHelp class >> stringsText [ ^'# Strings and Text
+
+A macVM `String` is a **byte vector**: a sequence of bytes, one `Character` (0–255) per slot, and `size` counts the bytes. That is fast, simple, and exactly right — until text stops being ASCII. Then you have two honest tools: the UTF-8 helpers on String itself, and `CocoaString`, a second species that counts what Cocoa counts. Nothing guesses; each answers the question it is actually asked.
+
+## The everyday verbs
+
+```ref
+| parts |
+parts := ''1959,Mini,Issigonis'' splitOn: '',''.
+Transcript show: ('' | '' join: parts); cr.
+Transcript show: (''{2} designed the {1}'' format: (Array with: (parts at: 2) with: (parts at: 3))); cr
+```
+
+- `splitOn:` **keeps empty fields** — `''a,,b''` gives three pieces — which is what makes it right for records. `subStrings:` is the other convention: runs collapse, empties drop.
+- `join:` is on the **separator**, and prints non-Strings for you: `'' + '' join: #(1 2 3)`.
+- `format:` fills `{1}`, `{2}`… from an Array; `{{` and `}}` are literal braces; a slot with no argument is left visible rather than raising.
+- `padLeftTo:` / `padRightTo:` (optionally `with: $0`) align and **never truncate**.
+- `occurrencesOfString:` counts without overlap; `indexOfSubstring:startingAt:` walks matches; `startsWith:` / `endsWith:` / `beginsWith:` say what they mean.
+
+## Bytes are not characters
+
+```ref
+''café'' size.          "5 — bytes"
+''café'' utf8Size.      "4 — characters"
+(''café'' codePointAt: 4). "233 — é"
+''café'' codePoints asArray. "(99 97 102 233)"
+```
+
+`utf8Size`, `codePointAt:` and `codePoints` read the bytes **as UTF-8**. Malformed input answers `nil` — a byte-String legitimately may not be UTF-8, and a nil beats a guess. Ask `isValidUtf8` first when it matters, and take `asByteArray` when you really do want the bytes.
+
+## CocoaString
+
+`aString asCocoaString` wraps a real `NSString`. It speaks ordinary String protocol — `at:`, `copyFrom:to:`, `,`, comparison, `asUppercase` — but its unit is the **UTF-16 unit**, because that is NSString''s unit and AppKit''s:
+
+```ref
+''café'' asCocoaString size.            "4"
+(''café'' asCocoaString at: 4).         "$é — the character, not half its bytes"
+(''abcd'' asCocoaString rangeOf: ''bc''). "#(1 2) — 0-based, UTF-16, ready for AppKit"
+''CAFÉ'' asCocoaString asLowercase.     "café — case beyond ASCII"
+```
+
+`characterCount` counts characters even where one character needs two UTF-16 units (the astral planes — emoji live there). `rangeOf:` answers `nil` for an absent substring — NSString''s NSNotFound is too big for a SmallInteger, so the honest miss is nil, not a sentinel. `CocoaString mutable:` gives an appendable one; `append:` grows it.
+
+Conversion is where encoding questions belong, and it is **loud**: a String whose bytes are not valid UTF-8 raises at `asCocoaString` instead of being silently rewritten. `asString` comes back the other way, and either species is accepted anywhere the other is.
+
+## Which to reach for
+
+- protocol text, file bytes, speed — `String`
+- counting characters, slicing user text — `String` plus the UTF-8 helpers
+- anything headed into Cocoa: ranges, case, AppKit APIs — `CocoaString`
+
+The pinned truth lives in `world/tests/56` and `57`: every number above is asserted there, from both sides of the disagreement.
+' ]
+
     CocoaHelp class >> appGuideText [ ^'# Guide: Build an App
 
 We are going to add a **temperature converter** to this window — drag a slider, read Celsius, Fahrenheit and Kelvin at once — while the system runs. Every block with a play button is a **complete program**; nothing carries over between presses, so each step shows the whole thing again.
@@ -2022,6 +2159,40 @@ Each is one readable class, in the Browser:
 > Whole numbers are your friend: they behave predictably *and* run on the VM''s fastest path. Breakout''s physics is nothing but integer addition.
 ' ]
 
+    CocoaHelp class >> assetEditorsText [ ^'# Guide: Edit Sprites and Sounds
+
+The games in the **Demos** menu draw 16-colour sprites and play parametric sound effects — and both kinds of asset are **classes in the image**, editable like everything else. You could write them by hand. The two editors under **Tools** exist so you do not have to.
+
+## The Sprite Editor
+
+**Tools ▸ Sprite Editor…** opens a utility window: a big paint grid, the 16-colour palette with RGB sliders, and a frame strip.
+
+- **Paint** by clicking and dragging on the grid. **Fill** floods a region; **Pick** lifts a colour off the grid into the palette selection. Colour 0 is transparent.
+- **Frames** make animation: `<` and `>` step, **Add**/**Dup**/**Del** manage the strip, and the play switch runs the animation at the FPS you set — right in the editor.
+- **Resize** changes the grid; the name field names the sprite.
+
+**Preview** relaunches the current demo with your sheet in place, so you judge the sprite where it will actually live — at game scale, on the engine, in motion.
+
+**Save** compiles your work into the image as a **sheet class** — a small class whose methods are the hex rows of each frame, marked `isSpriteSheet`. **Sheets** lists every sheet in the image; **Load** brings one back to the grid. **Copy Code** puts the class source on the clipboard instead, ready to paste into a world file.
+
+## The Sound Editor
+
+**Tools ▸ Sound Editor…** is an instrument panel over the engine''s parametric synth — the sfxr idea, wired to the real thing.
+
+- Twelve **recipe sliders** shape the effect: envelope, pitch and sweep, and friends. The picture above them draws the envelope and sweep you have dialled.
+- **Osc +** adds up to four oscillator rows — wave, frequency, level per row.
+- **Play** auditions through the engine itself — the very synth the games use, so what you hear is what ships.
+- **Preset** cycles the classic starting points; **Random** rolls a fresh effect; **Mutate** nudges the current one. Roll, listen, keep.
+
+**Save**, **Load** and **Copy Code** work exactly as in the sprite editor — sound sheets are classes marked `isSoundSheet`.
+
+## Where assets live
+
+A sheet class is ordinary source **in the image**: it shows up in the Browser, survives with your world, and a demo uses it by name. That is the whole pipeline — no asset folders, no export step, no formats. Draw, save, and the class is already wherever the image goes.
+
+> Both editors keep their state when closed — the window hides rather than dies, so reopening is instant and your work-in-progress is still on the grid.
+' ]
+
     CocoaHelp class >> testGuideText [ ^'# Guide: Test Your Code
 
 Smalltalk invented unit testing. Kent Beck wrote **SUnit** for Smalltalk-80, and when the idea was carried to Java in 1997 it became JUnit — every *Unit since descends from that original. macVM ships the real thing, so if you have written a test in Pharo or Squeak, you already know this.
@@ -2063,14 +2234,12 @@ PointTest run
 
 ## What to assert
 
-| | |
-|---|---|
-| `assert: aBoolean` | fails unless true |
-| `deny: aBoolean` | fails unless false |
-| `assert: actual equals: expected` | **prefer this one** |
-| `assert: actual closeTo: expected` | floats |
-| `should: aBlock raise: Error` | the block must raise |
-| `shouldnt: aBlock raise: Error` | the block must not |
+- `assert: aBoolean` — fails unless true
+- `deny: aBoolean` — fails unless false
+- `assert: actual equals: expected` — **prefer this one**
+- `assert: actual closeTo: expected` — floats
+- `should: aBlock raise: Error` — the block must raise
+- `shouldnt: aBlock raise: Error` — the block must not
 
 Any of them takes a `description:` as a final keyword if you want to say why in your own words.
 
@@ -2113,7 +2282,7 @@ Otherwise the command line will show your new suite and the Tests tab will not �
 
 ## What ships
 
-**572 tests across 65 suites**, green. Most of them test the library you are standing on: collections, streams, numbers, exceptions, the FFI, sockets, supervision. `SUnitTest` is SUnit testing itself — it runs deliberately-broken cases through a nested runner and checks the framework reports them correctly, because a test framework that mis-reports a failure is worse than none.
+**666 tests across 73 suites**, green. Most of them test the library you are standing on: collections, streams, numbers, exceptions, the FFI, sockets, supervision. `SUnitTest` is SUnit testing itself — it runs deliberately-broken cases through a nested runner and checks the framework reports them correctly, because a test framework that mis-reports a failure is worse than none.
 ' ]
 
     CocoaHelp class >> automationText [ ^'# Automation
