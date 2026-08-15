@@ -35,7 +35,7 @@
  build-your-own guides — are written in me as methods, so the system
  documents itself wherever it runs. I run in the UI worker VM."
 Object subclass: CocoaHelp [
-    <classVars: Topics CodeBlocks Container Sidebar SidebarScroll SidebarFace SidebarDelegate
+    <classVars: Topics Sections SidebarHandles SidebarHandleList CodeBlocks Container Sidebar SidebarScroll SidebarFace SidebarDelegate
                 DocView DocScroll FindField RunButton RunButtons RunDelegates ActionDelegates
                 PendingUiSrc UiRunDelegate
                 CurrentTopic DocText FindTerm Matches MatchCursor
@@ -54,28 +54,82 @@ Object subclass: CocoaHelp [
     ]
 
     "── the topic registry: (title, content selector) pairs, sidebar order ──"
+    "── the documentation TREE ────────────────────────────────────────────
+     Sections, each holding articles. The sidebar is an NSOutlineView over
+     this, so a section can grow to a dozen articles without the flat list
+     becoming a wall of titles — which is the point: there is a great deal
+     still to write and it needs somewhere to go.
+
+     Built with add:, NOT `Array with:...` — that family tops out at four
+     arguments in this world, and the fifth silently becomes a DNU."
+    CocoaHelp class >> sections [
+        | s |
+        Sections isNil ifFalse: [ ^Sections ].
+        s := OrderedCollection new.
+        s add: (self section: 'Getting Started' articles: (OrderedCollection new
+            add: (Array with: 'Welcome'             with: #welcomeText);
+            add: (Array with: 'The Manifesto'       with: #manifestoText);
+            add: (Array with: 'History and Credits' with: #historyText);
+            yourself)).
+        s add: (self section: 'The Language' articles: (OrderedCollection new
+            add: (Array with: 'The Smalltalk Language' with: #languageText);
+            add: (Array with: 'The Strongtalk World'   with: #worldText);
+            yourself)).
+        s add: (self section: 'The Environment' articles: (OrderedCollection new
+            add: (Array with: 'The Environment'       with: #environmentText);
+            add: (Array with: 'Caring for Your World' with: #worldCareText);
+            yourself)).
+        s add: (self section: 'Guides' articles: (OrderedCollection new
+            add: (Array with: 'Build an App'   with: #appGuideText);
+            add: (Array with: 'Build a Game'   with: #gameGuideText);
+            add: (Array with: 'Test Your Code' with: #testGuideText);
+            add: (Array with: 'Automation'     with: #automationText);
+            yourself)).
+        s add: (self section: 'Reference' articles: (OrderedCollection new
+            add: (Array with: 'Under the Hood' with: #internalsText);
+            yourself)).
+        Sections := s asArray.
+        ^Sections
+    ]
+    CocoaHelp class >> section: title articles: anOrderedCollection [
+        ^Array with: title with: anOrderedCollection asArray
+    ]
+    CocoaHelp class >> sidebarView [ "scripting/tests" ^Sidebar ]
+    CocoaHelp class >> sectionCount [ ^self sections size ]
+    CocoaHelp class >> sectionTitleAt: i [ ^(self sections at: i) at: 1 ]
+    CocoaHelp class >> articlesOfSection: i [ ^(self sections at: i) at: 2 ]
+
+    "The FLAT spine, DERIVED from the tree. showTopic:, the find bar and the
+     Run buttons all address articles by a single index and keep doing so —
+     the tree changed how the sidebar PRESENTS articles, not how the rest of
+     the class addresses them."
     CocoaHelp class >> topics [
-        "Built with add:, NOT `Array with:...` — that family tops out at four
-         arguments in this world, and the fifth silently becomes a DNU. Cached
-         in a class var: this is asked once per table-callback row."
         | t |
         Topics isNil ifFalse: [ ^Topics ].
         t := OrderedCollection new.
-        t add: (Array with: 'Welcome'                with: #welcomeText).
-        t add: (Array with: 'The Manifesto'          with: #manifestoText).
-        t add: (Array with: 'History and Credits'    with: #historyText).
-        t add: (Array with: 'The Smalltalk Language' with: #languageText).
-        t add: (Array with: 'The Environment'        with: #environmentText).
-        t add: (Array with: 'The Strongtalk World'   with: #worldText).
-        t add: (Array with: 'Guide: Build an App'    with: #appGuideText).
-        t add: (Array with: 'Guide: Build a Game'    with: #gameGuideText).
-        t add: (Array with: 'Guide: Test Your Code'  with: #testGuideText).
-        t add: (Array with: 'Automation'             with: #automationText).
-        t add: (Array with: 'Caring for Your World'  with: #worldCareText).
-        t add: (Array with: 'Under the Hood'         with: #internalsText).
+        self sections do: [ :sec | (sec at: 2) do: [ :art | t add: art ] ].
         Topics := t asArray.
         ^Topics
     ]
+
+    "The two directions the outline needs to talk to the flat spine."
+    CocoaHelp class >> flatIndexOfSection: si article: ai [
+        | n |
+        n := 0.
+        1 to: si - 1 do: [ :k | n := n + (self articlesOfSection: k) size ].
+        ^n + ai
+    ]
+    CocoaHelp class >> sectionAndArticleOfFlat: flat [
+        | n |
+        n := 0.
+        1 to: self sectionCount do: [ :si |
+            | count |
+            count := (self articlesOfSection: si) size.
+            flat <= (n + count) ifTrue: [ ^Array with: si with: flat - n ].
+            n := n + count ].
+        ^Array with: 1 with: 1
+    ]
+
     CocoaHelp class >> topicCount [ ^self topics size ]
     CocoaHelp class >> nl [ ^String with: Character nl ]
     CocoaHelp class >> topicTitleAt: i [ ^(self topics at: i) at: 1 ]
@@ -96,7 +150,7 @@ Object subclass: CocoaHelp [
         self buildFindField: w height: h.
         self buildDocView: w height: h.
         self showTopic: 1.
-        self selectSidebarRow: 0.
+        self selectSidebarArticle: 1.
     ]
 
     CocoaHelp class >> buildSidebar: h [
@@ -106,12 +160,20 @@ Object subclass: CocoaHelp [
         SidebarScroll onMain setHasVerticalScroller: true.
         SidebarScroll onMain setAutoresizingMask: CocoaUI maskHeightSizable.
         SidebarScroll onMain setBorderType: 0.
-        Sidebar := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
+        "An OUTLINE, not a table: the index is a tree of sections now, and
+         NSOutlineView is the widget that already knows how to disclose one.
+         Everything else about the sidebar — source-list style, adaptive
+         fill, row height — is unchanged."
+        Sidebar := ((Cocoa classNamed: 'NSOutlineView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: self sidebarWidth with: h).
         col := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain
             initWithIdentifier: 'topic'.
         col onMain setWidth: 600.0.
         Sidebar onMain addTableColumn: col.
+        "An outline needs to be TOLD which column carries the disclosure
+         triangle; without this it renders as a flat list with no way to
+         expand anything."
+        Sidebar onMain setOutlineTableColumn: col.
         col release.
         Sidebar onMain setHeaderView: nil.
         Sidebar onMain setRowHeight: 28.0.
@@ -125,12 +187,13 @@ Object subclass: CocoaHelp [
             ((Cocoa classNamed: 'NSColor') onMain underPageBackgroundColor).
         SidebarScroll onMain setDrawsBackground: false.
         SidebarFace := (Worker classNamed: #CocoaHelpTopicFace) new.
-        SidebarDelegate := MacvmDelegate tableSourceOn: SidebarFace.
+        SidebarDelegate := MacvmDelegate outlineSourceOn: SidebarFace.
         Sidebar onMain setDataSource: SidebarDelegate.
         Sidebar onMain setDelegate: SidebarDelegate.
         SidebarScroll onMain setDocumentView: Sidebar.
         Container onMain addSubview: SidebarScroll.
         self deferReload: Sidebar.
+        self expandAllSections.
     ]
 
     CocoaHelp class >> buildFindField: w height: h [
@@ -385,6 +448,88 @@ Object subclass: CocoaHelp [
     ]
 
     "── sidebar plumbing ─────────────────────────────────────────────────"
+    "── outline handles ──────────────────────────────────────────────────
+     NSOutlineView hands items back as opaque ids, so each node is an
+     INTERNED NSString carrying its path: 's' for section s, 's.a' for its
+     article a. Interning matters — the outline compares items by identity
+     when it tracks expansion, so minting a fresh NSString per callback
+     would make every section forget it was open. Same discipline as
+     CocoaOutliner's handleFor:."
+    CocoaHelp class >> handleFor: path [
+        | k h |
+        SidebarHandles isNil ifTrue: [
+            SidebarHandles := Dictionary new. SidebarHandleList := OrderedCollection new ].
+        k := path asSymbol.
+        h := SidebarHandles at: k ifAbsent: [ nil ].
+        h isNil ifTrue: [
+            h := Cocoa nsString: path.
+            SidebarHandles at: k put: h.
+            SidebarHandleList add: h ].
+        ^h
+    ]
+    CocoaHelp class >> pathOf: item [
+        ^item isNil ifTrue: [ '' ] ifFalse: [ item sendString: 'description' ]
+    ]
+    CocoaHelp class >> releaseSidebarHandles [
+        SidebarHandleList isNil ifTrue: [ ^self ].
+        SidebarHandleList do: [ :h | h isValid ifTrue: [ h release ] ].
+        SidebarHandles := nil. SidebarHandleList := nil.
+    ]
+
+    "── the outline data source ──────────────────────────────────────────"
+
+    CocoaHelp class >> outlineChildCountOf: item [
+        | path parts |
+        path := self pathOf: item.
+        path isEmpty ifTrue: [ ^self sectionCount ].
+        parts := path splitOn: $..
+        "a section has articles; an article has none"
+        parts size = 1 ifTrue: [ ^(self articlesOfSection: (parts at: 1) asInteger) size ].
+        ^0
+    ]
+    CocoaHelp class >> outlineChild: i of: item [
+        | path |
+        path := self pathOf: item.
+        path isEmpty ifTrue: [ ^self handleFor: (i + 1) printString ].
+        ^self handleFor: path , '.' , (i + 1) printString
+    ]
+    CocoaHelp class >> outlineTitleOf: item [
+        | path parts |
+        path := self pathOf: item.
+        path isEmpty ifTrue: [ ^'' ].
+        parts := path splitOn: $..
+        parts size = 1 ifTrue: [ ^self sectionTitleAt: (parts at: 1) asInteger ].
+        ^((self articlesOfSection: (parts at: 1) asInteger)
+              at: (parts at: 2) asInteger) at: 1
+    ]
+    "The flat article index for a selected row, or 0 for a section header —
+     which is what lets the selection handler ignore section clicks."
+    CocoaHelp class >> flatIndexOf: item [
+        | path parts |
+        path := self pathOf: item.
+        path isEmpty ifTrue: [ ^0 ].
+        parts := path splitOn: $..
+        parts size = 1 ifTrue: [ ^0 ].
+        ^self flatIndexOfSection: (parts at: 1) asInteger
+              article: (parts at: 2) asInteger
+    ]
+
+    "Open every section. Done by expanding each section ITEM rather than the
+     nil-item 'expand everything' form, because that one needs
+     expandItem:expandChildren: (two arguments, so it cannot ride
+     performSelector:withObject:) and, more importantly, an outline answers
+     its data source on demand — expanding a known item works without
+     waiting for a reload to have populated any rows.
+
+     Sections start OPEN: a tree whose sections are all shut hides the whole
+     index behind five triangles, which is worse than the flat list it
+     replaced. Collapsing is the user's to choose."
+    CocoaHelp class >> expandAllSections [
+        Sidebar isNil ifTrue: [ ^self ].
+        1 to: self sectionCount do: [ :i |
+            Sidebar onMain expandItem: (self handleFor: i printString) ]
+    ]
+
     CocoaHelp class >> deferReload: aView [
         "Never reload a table synchronously from a callback (the CocoaBrowser
          rule): post it for the next run-loop turn."
@@ -402,23 +547,43 @@ Object subclass: CocoaHelp [
         Container isNil ifTrue: [ ^self ].
         CurrentTopic isNil ifTrue: [ self showTopic: 1 ].
         self deferReload: Sidebar.
-        self selectSidebarRow: CurrentTopic - 1.
+        self expandAllSections.
+        self selectSidebarArticle: CurrentTopic.
     ]
 
-    CocoaHelp class >> selectSidebarRow: zeroBased [
+    "Select the row showing a FLAT article index. A row is no longer the
+     article's own number — section headers occupy rows too — so the article
+     is turned back into its tree item and the outline asked where that item
+     currently sits. Expanding first matters: rowForItem: answers -1 for an
+     item inside a collapsed section."
+    CocoaHelp class >> selectSidebarArticle: flat [
+        | sa item row |
         Sidebar isNil ifTrue: [ ^self ].
+        (flat isNil or: [ flat < 1 ]) ifTrue: [ ^self ].
+        self expandAllSections.
+        sa := self sectionAndArticleOfFlat: flat.
+        item := self handleFor: (sa at: 1) printString , '.' , (sa at: 2) printString.
+        row := Sidebar send: 'rowForItem:' args: (Array with: item) ret: #i64.
+        row < 0 ifTrue: [ ^self ].
         Sidebar onMain selectRowIndexes: ((Cocoa classNamed: 'NSIndexSet') onMain
-                                              indexSetWithIndex: zeroBased)
+                                              indexSetWithIndex: row)
                 byExtendingSelection: false
     ]
 
     CocoaHelp class >> topicSelected [
-        | row |
+        "A row is now either a section header or an article. Selecting a
+         header selects no article — it just toggles the disclosure — so a
+         flat index of 0 means 'nothing to show', not 'show the first'."
+        | row item flat |
         Sidebar isNil ifTrue: [ ^self ].
         row := Sidebar onMain selectedRow.
-        (row >= 0 and: [ row < self topicCount ]) ifTrue: [
-            (CurrentTopic isNil or: [ CurrentTopic ~= (row + 1) ])
-                ifTrue: [ self showTopic: row + 1 ] ]
+        row < 0 ifTrue: [ ^self ].
+        item := Sidebar onMain itemAtRow: row.
+        item isNil ifTrue: [ ^self ].
+        flat := self flatIndexOf: item.
+        flat = 0 ifTrue: [ ^self ].
+        (CurrentTopic isNil or: [ CurrentTopic ~= flat ])
+            ifTrue: [ self showTopic: flat ]
     ]
 
     "── text scaling (real point sizes; the A- / A+ toolbar buttons reach here)
@@ -558,7 +723,9 @@ Object subclass: CocoaHelp [
         DocView onMain performSelector: 'scrollToBeginningOfDocument:'
                 withObject: nil afterDelay: 0.0.
         self placeRunButtons.
-        self selectSidebarRow: i - 1.
+        "`i` is the FLAT article index, not a row — the outline turns it back
+         into a row itself (selectSidebarArticle:)."
+        self selectSidebarArticle: i.
     ]
 
     "A block is (tag, text): #h1/#h2/#h3 (heading text), #code (verbatim
@@ -1120,6 +1287,11 @@ Object subclass: CocoaHelp [
 
     "── teardown (CG9 rebuild; CocoaUI class >> teardown calls by name) ──"
     CocoaHelp class >> teardown [
+        "The interned outline handles are NSStrings this class owns; a UI
+         rebuild must let them go or every teardown leaks one per node.
+         Sections/Topics are dropped too, so a reopened Help rebuilds the
+         tree rather than serving handles that point into a released outline."
+        self releaseSidebarHandles.
         DocView isNil ifFalse: [ DocView isValid ifTrue: [ DocView release ] ].
         DocScroll isNil ifFalse: [ DocScroll isValid ifTrue: [ DocScroll release ] ].
         Sidebar isNil ifFalse: [ Sidebar isValid ifTrue: [ Sidebar release ] ].
@@ -1132,6 +1304,7 @@ Object subclass: CocoaHelp [
         ActionDelegates := nil. CurrentTopic := nil. DocText := nil.
         RunButton := nil. CodeBlocks := nil.
         RunButtons := nil. RunDelegates := nil.
+        Sections := nil. Topics := nil.
         PendingUiSrc := nil. UiRunDelegate := nil.
         FindTerm := nil. Matches := nil. MatchCursor := 0.
     ]
@@ -1139,11 +1312,15 @@ Object subclass: CocoaHelp [
 
 "The sidebar's table data source / delegate receiver — the CocoaTableFace
  pattern: AppKit asks the minted MacvmDelegate, which performs these here."
+"The sidebar's data source. An OUTLINE face now: the index is a tree of
+ sections, and each of these five selectors is what NSOutlineView asks."
 Object subclass: CocoaHelpTopicFace [
-    numberOfRowsInTableView: aTable [ ^CocoaHelp topicCount ]
-    tableView: aTable objectValueForTableColumn: aCol row: aRow [
-        ^CocoaHelp topicTitleAt: aRow + 1 ]
-    tableViewSelectionDidChange: aNote [ CocoaHelp topicSelected ]
+    outlineView: ov numberOfChildrenOfItem: item [ ^CocoaHelp outlineChildCountOf: item ]
+    outlineView: ov isItemExpandable: item [ ^(CocoaHelp outlineChildCountOf: item) > 0 ]
+    outlineView: ov child: i ofItem: item [ ^CocoaHelp outlineChild: i of: item ]
+    outlineView: ov objectValueForTableColumn: col byItem: item [
+        ^CocoaHelp outlineTitleOf: item ]
+    outlineViewSelectionDidChange: aNote [ CocoaHelp topicSelected ]
 ]
 
 "── the documentation itself ──────────────────────────────────────────────
