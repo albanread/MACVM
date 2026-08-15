@@ -278,7 +278,17 @@ fn primary_thread_main(
     // primary spawn compute workers later (CG8). A spawned compute worker boots
     // the same world.
     let boot_world = world_dir.clone();
-    primary.set_worker_boot(Arc::new(move || VmHandle::boot(vm_options(), &boot_world)));
+    // A GAME SINK HERE TOO, so this wiring gate matches production. THE LIVE
+    // one is `main.rs`'s `world_boot` (this fn is the test-only seam — see the
+    // doc comment above): S6 put the sink here FIRST, and a demo VM then ran
+    // `Life launch` flawlessly and drew nothing, because without a sink every
+    // GamePane prim no-ops cleanly. If you are adding something every VM must
+    // have, add it there and mirror it here — never the other way round.
+    primary.set_worker_boot(Arc::new(move || {
+        let mut h = VmHandle::boot(vm_options(), &boot_world)?;
+        h.set_game_sink(Box::new(crate::game::PrimaryGameSink));
+        Ok(h)
+    }));
 
     // (design §3 step 3) Register the UI worker as an externally-hosted peer
     // (CG1) — no `thread::spawn`; its thread is main. `wake` fires whenever the

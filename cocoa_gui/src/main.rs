@@ -459,6 +459,16 @@ fn main() {
             boot::WORLD_DOITS,
         )
         .map_err(|msg| macvm::runtime::VmError { msg })?;
+        // EVERY VM FROM THIS CLOSURE GETS A GAME SINK — the primary (each
+        // generation re-installs its own, harmlessly) and, decisively, every
+        // WORKER, because THIS closure is what `set_worker_boot` hands the
+        // live supervisor primary. A demo VM without one is undiagnosable by
+        // design: every GamePane prim no-ops cleanly (the headless posture),
+        // so `Life launch` in a worker runs perfectly and shows nothing.
+        // S6 found this the hard way — the sink was first added to the
+        // HANDSHAKE path's closure (`boot.rs`), which the GUI's real primary
+        // never uses ("the live primary is supervisor.rs's, per-generation").
+        vm.set_game_sink(Box::new(crate::game::PrimaryGameSink));
         Ok(vm)
     });
 

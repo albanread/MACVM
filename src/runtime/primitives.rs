@@ -1597,6 +1597,22 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 279,
+        name: "GamePane class>>primInputState",
+        f: prim_game_input_state,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 280,
+        name: "Worker class>>primSpawnGranted:",
+        f: prim_worker_spawn_granted,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -2402,6 +2418,31 @@ fn prim_worker_spawn(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
+/// `Worker class>>primSpawnGranted:` (280): spawn a worker that MAY ITSELF
+/// SPAWN into the same fleet (`docs/process_services.md` S6).
+///
+/// Ordinary workers cannot spawn, and that absence is the policy that keeps a
+/// fleet a tree. A DEMO VM is the deliberate exception: demos like
+/// ParallelMandel fan work across the machine's cores, which is the whole
+/// reason this system runs many VMs, and the primary starting one from its own
+/// menu has already decided to trust it. Granted per VM, at the spawner's
+/// explicit request — never blanket, and never inherited by the grandchildren
+/// (they are spawned with the ordinary prim).
+fn prim_worker_spawn_granted(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let init = if args[1].raw() == vm.universe.nil_obj.raw() {
+        None
+    } else {
+        match string_arg(vm, args[1]) {
+            Some(s) => Some(s),
+            None => return PrimResult::Fail,
+        }
+    };
+    match crate::runtime::workers::spawn_granted(vm, init, true) {
+        Some(id) => PrimResult::Ok(SmallInt::new(i64::from(id)).oop()),
+        None => PrimResult::Fail,
+    }
+}
+
 /// `primSend:corr:bytes:` (221): enqueue a MOP ByteArray on worker `id`'s
 /// channel (or, from a worker, `id` 0 = the primary — echoing `corr` routes
 /// the reply to its continuation). The send fires the coalesced inbox wake
@@ -2514,6 +2555,30 @@ fn prim_worker_tick_every(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     };
     crate::runtime::timer_service::set_tick(key, ms, target, alive);
     PrimResult::Ok(vm.universe.true_obj)
+}
+
+/// `GamePane class>>primInputState` (279): this instant's input, as
+/// `{keys. mouseX. mouseY. buttons}` — the read that lets a demo in a VM of
+/// its own ASK what the keyboard is doing (`docs/process_services.md` S6).
+///
+/// Before this, input reached a demo only as numbers formatted into a doit
+/// string by the host and exec'd on the PRIMARY, which is what pinned every
+/// game to the primary's thread. All four values come from one snapshot: a
+/// frame that mixed this tick's keys with last tick's mouse would be a bug
+/// nobody would ever find.
+///
+/// All four are always smis (a mask, two pane-pixel coordinates, a button
+/// mask), so no range check is needed — the values are set by the host's own
+/// frame tick, not by anything a guest can grow.
+fn prim_game_input_state(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let _ = args;
+    let s = crate::runtime::game_input::snapshot();
+    let a = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 4);
+    a.at_put(0, SmallInt::new(s.keys).oop());
+    a.at_put(1, SmallInt::new(s.mouse_x).oop());
+    a.at_put(2, SmallInt::new(s.mouse_y).oop());
+    a.at_put(3, SmallInt::new(s.buttons).oop());
+    PrimResult::Ok(a.oop())
 }
 
 /// `Worker class>>primExitSelf` (278): this VM ends itself — see
@@ -5698,6 +5763,8 @@ mod tests {
             (276, "GamePane>>paletteGlobalBase"),
             (277, "Worker class>>primTickEvery:"),
             (278, "Worker class>>primExitSelf"),
+            (279, "GamePane class>>primInputState"),
+            (280, "Worker class>>primSpawnGranted:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

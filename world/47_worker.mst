@@ -115,6 +115,20 @@ Object subclass: Worker [
         ^self new setId: i
     ]
     Worker class >> spawn [ ^self spawn: nil ]
+
+    "SPAWN A VM THAT MAY ITSELF SPAWN (docs/process_services.md S6). Ordinary
+     workers cannot — the absence is the policy that keeps a fleet a tree, and
+     it stays the default. This is the deliberate exception, asked for by name:
+     a demo VM whose game fans compute across the machine's cores
+     (ParallelMandel) needs it, and the primary launching a demo from its own
+     menu has already decided to trust it. The grant does not descend — the
+     children it spawns are ordinary workers."
+    Worker class >> spawnGranted: initSource [
+        | i |
+        i := self primSpawnGranted: initSource.
+        i isNil ifTrue: [ ^self error: 'cannot spawn a worker (no boot registered, or at the cap)' ].
+        ^self new setId: i
+    ]
     setId: anId [ id := anId. ^self ]
     id [ ^id ]
 
@@ -765,4 +779,5 @@ Object subclass: Worker [
     Worker class >> primUiPeer [ <primitive: 229> ^0 ]
     Worker class >> primTickEvery: ms [ <primitive: 277> ^false ]
     Worker class >> primExitSelf [ <primitive: 278> ^false ]
+    Worker class >> primSpawnGranted: initString [ <primitive: 280> ^nil ]
 ]

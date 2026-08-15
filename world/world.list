@@ -285,6 +285,10 @@
 # wire format. The UI worker keeps only what AppKit requires: window,
 # controls, reconcile. Loads after the tools it can host.
 93_appvm.mst
+# A DEMO IN A VM OF ITS OWN (docs/process_services.md S6): DemoVmClient gives a
+# demo its own 60Hz heartbeat from the timer service and ends itself when the
+# pane is dismissed; DemoVmHost spawns and remembers, one at a time (one pane).
+94_demovm.mst
 # SUnit (docs/sunit_design.md): tests for the world, written in the world.
 # TestCase/TestFailure/TestResult/TestRunner. Loads last in the world list so
 # a test file in tests.list can subclass TestCase.

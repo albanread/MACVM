@@ -1,0 +1,177 @@
+"94_demovm.mst — A DEMO IN A VM OF ITS OWN (docs/process_services.md S6).
+
+ The last thing the primary was still pumping. Every other VM in this system
+ got its own thread and its own reasons to wake; a demo did not, because its
+ 60 Hz step ran as a string the host formatted and the primary's supervisor
+ loop exec'd — `GamePane stepWithKeys: 4 mouseX: 100 y: 200 buttons: 1`,
+ numbers baked into source, sixty times a second, on the user's LANGUAGE
+ thread. A demo that hung hung the primary; a demo that crashed took the
+ primary's world with it; and the supervisor loop was a frame pump wearing a
+ supervisor's name.
+
+ THREE THINGS HAD TO EXIST FIRST, and now all three do:
+   * the frame clock — the process timer service (`Worker tickEvery:`), which
+     wakes any VM at 60 Hz with no pump and no poll;
+   * the pixels — the game command queue was ALWAYS process-global and
+     main-drained, so a worker's GamePane commands reach the same Metal pane
+     the primary's did. Nothing had to move; only the sink had to be installed
+     in the demo's VM (`cocoa_gui/src/boot.rs`);
+   * the input — `GamePane inputState` (prim 279), the read that replaced the
+     formatted string, so a demo ASKS what the keyboard is doing instead of
+     being told by whoever ran it.
+
+ WHAT A DEMO STILL SHARES: one Metal pane, one at a time. That is a property
+ of the pane (a single main-thread surface), not of the VM, and it is the
+ reason this file has a `stopAll` rather than a fleet. Several demos at once
+ is a pane question, not a threading one.
+
+ THE SHAPE MIRRORS `93_appvm.mst` deliberately — a host on the primary that
+ spawns and remembers, a client in the demo's VM that serves and ends itself.
+ An app's frames cross as specs and blits; a demo's cross as GamePane commands
+ through a queue that was already there. Same lifecycle, different payload."
+
+"────────────────────────────────────────────────────────────────────────
+ IN THE DEMO'S OWN VM."
+Object subclass: DemoVmClient [
+    <classVars: Fps>
+
+    "Installed by the init source `DemoVmHost` ships, AFTER the demo's own
+     entry doit has run (so `GamePane onStep:` is already registered). From
+     here the VM has exactly one job: step on the beat, and end when asked."
+    DemoVmClient class >> serve [ ^self serveAt: 60 ]
+
+    "TAKES NO ENTRY DOIT, on purpose. The obvious version passed the demo's
+     launch source along so the client could report what it was running — and
+     that meant embedding that source as a STRING LITERAL inside the init
+     source, so any entry containing a quote (`Transcript showCr: ''hi''` —
+     hardly exotic) produced malformed code in a fresh VM, where the failure is
+     a worker that dies at birth. The entry runs before this and needs no
+     second copy; introspection is not worth a quoting hazard."
+    DemoVmClient class >> serveAt: n <Integer> [
+        Fps := n max: 1.
+        Worker onMessage: [ :m | DemoVmClient handle: m payload ].
+        "THE FRAME CLOCK IS THE VM'S OWN. No supervisor, no host loop, no
+         sleep: the timer service wakes this VM, the tick dispatches top-level
+         like any other message, and the step runs one thing at a time exactly
+         as everything else in this VM does."
+        Worker onTick: [ DemoVmClient tick ].
+        Worker tickEvery: 1000 // Fps.
+        ^self
+    ]
+
+    "ONE FRAME. Errors are reported and swallowed rather than allowed to kill
+     the VM: a demo that throws on frame 900 should say so and stop stepping,
+     not vanish mid-animation leaving a frozen pane and no explanation. The
+     tick is cancelled on the way out, because a broken step repeated sixty
+     times a second is sixty identical traces a second."
+    DemoVmClient class >> tick [
+        ^[ GamePane stepFromInput ]
+            on: Error do: [ :e |
+                Worker tickEvery: 0.
+                Transcript showCr: 'demo step failed: ' , e messageText.
+                nil ]
+    ]
+
+    DemoVmClient class >> handle: payload <Object> [
+        (payload isKindOf: Array) ifFalse: [ ^self ].
+        (payload at: 1) == #demoExit ifTrue: [ ^self shutdown ].
+        ^self
+    ]
+
+    "THE DEMO ENDS ITSELF (docs/process_services.md S5): stop the clock, let
+     the demo drop its step block and its objects, announce, go. Called when
+     the pane is dismissed — Escape, the close button, or another demo taking
+     the screen."
+    DemoVmClient class >> shutdown [
+        Worker tickEvery: 0.
+        "CLOSE THE PANE WE OPENED. The VM that emitted StartLoop emits the
+         StopLoop — anything else leaves an orphan window when a demo is
+         stopped by any route other than Escape (whose host-side handler
+         closes the window itself, and where this second close is a harmless
+         no-op: the pane is already taken). `stop` is instance-side and needs
+         no pane state; it is a command, not a query."
+        [ GamePane new stop ] on: Error do: [ :e | nil ].
+        [ GamePane reset ] on: Error do: [ :e | nil ].
+        ^Worker exit: #stopped
+    ]
+
+    DemoVmClient class >> fps ^ <Object> [ ^Fps ]
+]
+
+"────────────────────────────────────────────────────────────────────────
+ ON THE PRIMARY — spawn, remember, and stop."
+Object subclass: DemoVmHost [
+    <classVars: Vms Watching>
+
+    DemoVmHost class >> vms ^ <OrderedCollection> [
+        Vms isNil ifTrue: [ Vms := OrderedCollection new ].
+        ^Vms
+    ]
+
+    "Start `anEntry` (a demo's launch doit, e.g. 'Breakout launch') in a VM of
+     its own. ONE AT A TIME, because one Metal pane: any demo already running
+     is asked to end first, and its own exit tears the pane down."
+    DemoVmHost class >> start: anEntry <String> ^ <Object> [
+        | w |
+        self watchExits.
+        self stopAll.
+        "GRANTED (S6): a demo may spawn its own compute workers —
+         ParallelMandel is a shipped demo that does exactly that, and a demo
+         that cannot use the machine's cores would be a downgrade from the
+         in-process path it replaces."
+        w := [ Worker spawnGranted: (self initSourceFor: anEntry) ]
+            on: Error do: [ :e |
+                Transcript showCr: 'demo: ' , e messageText.
+                nil ].
+        w isNil ifTrue: [ ^nil ].
+        self vms add: w.
+        "SAY SO. A demo that fails to appear with a silent transcript is
+         undiagnosable from the user's chair — and S6's first live run was
+         exactly that (a missing sink, every command a clean no-op). One line
+         on launch means silence now has a meaning: launched-but-blank points
+         at the pane, no line points at the spawn."
+        Transcript showCr: 'demo: ' , anEntry , ' -> own VM'.
+        ^w
+    ]
+
+    "Runs ONCE in the fresh VM: the demo's own entry doit exactly as the
+     in-process path would run it, then the client that gives it a heartbeat.
+     The entry is baked in rather than sent, so the demo is painting before
+     anything else can arrive."
+    DemoVmHost class >> initSourceFor: anEntry <String> ^ <String> [
+        ^'[ ' , anEntry , '. DemoVmClient serve. ] value.'
+    ]
+
+    "Ask every demo VM to end. A message, not a kill: the demo stops its clock,
+     resets the pane and announces its exit, which is what retires it here."
+    DemoVmHost class >> stopAll [
+        self vms do: [ :w |
+            [ w send: (Array with: #demoExit) ] on: Error do: [ :e | nil ] ].
+        ^self
+    ]
+
+    DemoVmHost class >> liveCount ^ <Integer> [
+        | n |
+        n := 0.
+        self vms do: [ :w | w isAlive ifTrue: [ n := n + 1 ] ].
+        ^n
+    ]
+
+    "A demo's own goodbye retires it (S5). The runtime's #workerDied arrives
+     right after and finds nothing left, so one ending stays one line."
+    DemoVmHost class >> watchExits [
+        Watching == true ifTrue: [ ^self ].
+        Watching := true.
+        Worker alsoOnVmExiting: [ :goneId :why | DemoVmHost note: goneId ].
+        Worker alsoOnWorkerDied: [ :deadId | DemoVmHost note: deadId ].
+        ^self
+    ]
+
+    DemoVmHost class >> note: anId <Integer> [
+        self vms copy do: [ :w |
+            w id = anId ifTrue: [
+                self vms remove: w ifAbsent: [ nil ].
+                Transcript showCr: 'demo: stopped' ] ].
+        ^self
+    ]
+]

@@ -14,7 +14,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use macvm::embed::{GameCommand, GameSink, VmHandle};
 use macvm::runtime::{JitMode, VmOptions};
@@ -171,4 +171,95 @@ fn orderly_shutdown_stops_every_ticking_worker() {
         presents_in(&captured),
         "frames after shutdown — a timer or a worker outlived the sequence"
     );
+}
+
+/// S6: AN EXISTING DEMO — Life, unedited — RUNS IN A VM OF ITS OWN. The last
+/// thing the primary still pumped was the 60 Hz step, formatted as a STRING
+/// (`GamePane stepWithKeys: 4 mouseX: …`) and exec'd on the language thread.
+/// Here `DemoVmHost start: 'Life launch'` — the Demos menu's own entry — gets
+/// its beat from the timer service and reads the input itself: the test sets
+/// keys on the process service and then asks the DEMO VM (an RPC to the
+/// class-side `GamePane inputState`, the exact read its every step makes)
+/// what it sees. Frames flow the whole time, and `stopAll` ends the VM by its
+/// own exit.
+#[test]
+fn an_existing_demo_runs_in_a_vm_of_its_own() {
+    let _x = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+    macvm::runtime::game_input::reset();
+    macvm::runtime::transcript_service::activate();
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    let captured: Arc<Mutex<Vec<GameCommand>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    // Exactly what the GUI's boot closure does now: every worker gets the same
+    // game sink the primary has, so its commands reach the same pane. (S6's
+    // live failure was precisely this line missing from the REAL closure:
+    // Life ran perfectly in its VM and every command no-op'd, silently.)
+    primary.set_worker_boot(Arc::new(move || {
+        let mut h = VmHandle::boot(opts(), Path::new("world"))?;
+        h.set_game_sink(Box::new(CapSink(cap.clone())));
+        Ok(h)
+    }));
+
+    primary
+        .exec("DemoVmHost start: 'Life launch'.")
+        .expect("spawn the demo VM");
+    std::thread::sleep(Duration::from_millis(500));
+    let frames_early = presents_in(&captured);
+    let (_, said) = macvm::runtime::transcript_service::drain_since(0);
+    assert!(
+        frames_early > 0,
+        "Life never presented a frame from its own VM; it said: {said:?}"
+    );
+
+    // THE INPUT CROSSES. Set the process service (as the GUI's frame tick
+    // does), then ask the DEMO VM what its next read answers — the same
+    // class-side `GamePane inputState` its every step goes through.
+    macvm::runtime::game_input::set_keys(0b1010);
+    macvm::runtime::game_input::set_mouse(77, 55, 1);
+    primary.exec("DemoSaw := nil.").expect("scoreboard");
+    primary
+        .exec(
+            "(DemoVmHost vms at: 1) call: #inputState on: #GamePane args: #()              onReply: [ :r | DemoSaw := r ].",
+        )
+        .expect("ask the demo VM for its own input read");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        primary.exec("Worker dispatchInbox.").expect("pump replies");
+        let got = primary.eval("DemoSaw printString").unwrap_or_default();
+        if got.contains("10") && got.contains("77") && got.contains("55") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the demo VM's own input read never showed the keys (got {got})"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Still stepping, on its own clock, while all of that happened.
+    assert!(
+        presents_in(&captured) > frames_early,
+        "Life stopped presenting"
+    );
+
+    // The stop path the GUI uses (Escape / close / relaunch): ask every demo
+    // VM to end. Life's VM stops its clock, resets the pane, announces, goes.
+    primary.exec("DemoVmHost stopAll.").expect("stop");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        primary.exec("Worker dispatchInbox.").expect("pump");
+        if primary
+            .eval("DemoVmHost liveCount printString")
+            .unwrap_or_default()
+            .trim()
+            == "'0'"
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the demo VM never exited");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let after = presents_in(&captured);
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(after, presents_in(&captured), "a stopped demo kept stepping");
 }

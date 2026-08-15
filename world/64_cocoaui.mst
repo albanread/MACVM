@@ -73,7 +73,6 @@ Object subclass: CocoaToolbarAction [
 Object subclass: CocoaUI [
     <classVars: Win ContentHost Transcript TranscriptScroll ActTarget
                 ToolsMenu ToolMenuIds LaunchInOwnVm LaunchVmMenuItem
-                DemoVmNoteShown
                 TranscriptText Views ActiveView ToolbarDelegates
                 MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
                 WorkspaceTextDelegate TabItems TabIndexes
@@ -1443,25 +1442,29 @@ Object subclass: CocoaUI [
      (AppVmDisplay>>applyBlit:to:, proven by pixel in tests/it_appvm.rs). So
      the in-process exception this method used to carve out is gone: the
      sprite editor in its own VM draws."
-    "A DEMO RUNS ON THE PRIMARY, and Debug > 'Launch in own VM' does not move
-     it — the honest answer rather than a checkbox that quietly means nothing.
-     A demo is a 60 Hz frame loop, and the pump that drives it is the
-     PRIMARY's supervisor loop (`poll_primary_step` → `GamePane
-     stepWithKeys:`, top-level, never nested). The ENABLER for moving them
-     now exists — the VM timer service (`Worker tickEvery:`/`onTick:`, prim
-     277) wakes a worker at frame rate, proven at ~60 Hz in
-     tests/it_appvm.rs — but a demo needs more than a tick: its step loop,
-     key/mouse state and command sink all ride the primary's pump today, and
-     rerouting them is its own migration. ParallelMandel additionally spawns
-     compute workers, which only a primary can do.
+    "A DEMO RUNS IN A VM OF ITS OWN when Debug > 'Launch in own VM' is on
+     (docs/process_services.md S6) — the last thing the primary was still
+     pumping. Its 60 Hz step used to be a STRING the host formatted
+     (`GamePane stepWithKeys: 4 mouseX: 100 y: 200 buttons: 1`) and the
+     supervisor exec'd on the user's LANGUAGE thread; now the demo's own VM
+     beats itself off the timer service and READS the input
+     (`GamePane stepFromInput`, prim 279) instead of being told it. A demo
+     that hangs no longer hangs the primary, and one that crashes takes only
+     its own VM.
 
-     Said once, on the first launch that would have been affected, so the
-     setting never silently lies."
+     The pane is still ONE (a single main-thread Metal surface), so demos
+     remain one at a time — `DemoVmHost start:` ends any predecessor first.
+     Off, the original host path runs unchanged: same demo, same pane, stepped
+     by the supervisor.
+
+     Entries are plain launch doits ('Breakout launch'); they are embedded in
+     a Smalltalk string literal here, so an entry containing a quote would
+     need escaping that this deliberately does not do."
     CocoaUI class >> launchDemo: entry [
-        (self launchInOwnVm and: [ DemoVmNoteShown ~~ true ]) ifTrue: [
-            DemoVmNoteShown := true.
-            self appendTranscript:
-                'demos run on the primary — their 60 Hz step pump is its supervisor loop' ].
+        self launchInOwnVm ifTrue: [
+            ^Worker uiRequest: #doitq
+                args: (Array with: 'DemoVmHost start: ''' , entry , '''')
+                onReply: [ :x | nil ] ].
         ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
             onMain launchDemo: entry.
     ]

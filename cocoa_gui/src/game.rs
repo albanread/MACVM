@@ -61,18 +61,15 @@ static SESSION_OPEN: AtomicBool = AtomicBool::new(false);
 static STEP_DUE: AtomicBool = AtomicBool::new(false);
 /// Escape / close-button — request the primary stop the loop.
 static STOP_DUE: AtomicBool = AtomicBool::new(false);
-/// This tick's held-key bitmask (bit 0=Left…5=B), read on the tick, sent with
-/// the step.
-static GAME_KEY_MASK: AtomicI64 = AtomicI64::new(0);
-/// This tick's mouse, sent with the step alongside the keys. Position is in
-/// PANE PIXELS (not view points and not the engine's normalized fraction):
-/// the tick is the one place that knows both the fraction and this session's
-/// pane size, so it converts once and Smalltalk gets coordinates in the same
-/// space as every drawing method. `-1` means "no pane, nothing sensible to
-/// report". Buttons are a bitmask: bit 0 = left, bit 1 = right.
-static GAME_MOUSE_X: AtomicI64 = AtomicI64::new(-1);
-static GAME_MOUSE_Y: AtomicI64 = AtomicI64::new(-1);
-static GAME_MOUSE_BUTTONS: AtomicI64 = AtomicI64::new(0);
+// THIS TICK'S INPUT LIVES IN THE VM NOW (`macvm::runtime::game_input`, process
+// services S6). It used to be four atomics here, which meant only code that
+// could see THIS crate could read them — so a demo learned what the keyboard
+// was doing only because the supervisor formatted the numbers into a doit
+// string and exec'd it on the primary. Moved into the VM, any VM's own tick
+// can ask, which is what lets a demo run in a VM of its own. The frame tick
+// still WRITES here (it alone knows this session's pane size, so it alone can
+// convert the pointer into pane pixels); only the ownership of the state moved.
+use macvm::runtime::game_input;
 /// A demo entry doit to launch, run TOP-LEVEL on the primary's supervisor loop
 /// (never a nested `uiReq`/`primEvalDoit` — that corrupts the interp-regs-mirror
 /// root and the next frame's compile-GC scavenge double-copies). One demo at a
@@ -309,9 +306,7 @@ fn close_window() {
     macvm::embed::clear_palette_memory();
     // Forget where the mouse was; the next demo's first frame should not see a
     // pointer position left behind by this one.
-    GAME_MOUSE_X.store(-1, Ordering::Release);
-    GAME_MOUSE_Y.store(-1, Ordering::Release);
-    GAME_MOUSE_BUTTONS.store(0, Ordering::Release);
+    game_input::clear_mouse();
     GAME.with(|cell| {
         if let Some(g) = cell.borrow_mut().take() {
             objc::send0(g.timer, objc::sel("invalidate"));
@@ -857,7 +852,14 @@ pub fn poll_primary_step() -> Option<String> {
     // A host-side stop already closed the window; reset the demo's step block
     // (class-side, valid — unlike `GamePane stop`, which is instance-side).
     if RESET_DUE.swap(false, Ordering::AcqRel) {
-        return Some("GamePane reset".to_string());
+        // BOTH DEMO HOMES, in one statement, because the host does not know
+        // which one this demo used. `GamePane reset` clears an IN-PROCESS
+        // demo's step block on the primary (as it always did); `DemoVmHost
+        // stopAll` asks any demo running in a VM OF ITS OWN to end itself —
+        // it stops its clock, resets its own pane and announces its exit
+        // (docs/process_services.md S5/S6). With no demo VMs it is a no-op,
+        // so the in-process path is unchanged.
+        return Some("GamePane reset. DemoVmHost stopAll".to_string());
     }
     // Launch only when no game is active — i.e. the prior demo was torn down,
     // so one runs at a time. Opening the session here (before the demo paints
@@ -872,10 +874,12 @@ pub fn poll_primary_step() -> Option<String> {
     if !STEP_DUE.swap(false, Ordering::AcqRel) {
         return None;
     }
-    let mask = GAME_KEY_MASK.load(Ordering::Relaxed);
-    let mx = GAME_MOUSE_X.load(Ordering::Relaxed);
-    let my = GAME_MOUSE_Y.load(Ordering::Relaxed);
-    let mb = GAME_MOUSE_BUTTONS.load(Ordering::Relaxed);
+    // The IN-PROCESS demo path, unchanged: the host formats the step and the
+    // supervisor execs it on the primary. A demo in a VM of its own never
+    // comes through here — it reads the same snapshot itself, on its own
+    // thread, from its own tick (`GamePane stepFromInput`).
+    let s = game_input::snapshot();
+    let (mask, mx, my, mb) = (s.keys, s.mouse_x, s.mouse_y, s.buttons);
     Some(format!(
         "GamePane stepWithKeys: {mask} mouseX: {mx} y: {my} buttons: {mb}"
     ))
@@ -900,7 +904,7 @@ extern "C" fn game_tick(_this: objc::Id, _cmd: objc::Sel, _timer: objc::Id) {
             mask |= 1 << bit;
         }
     }
-    GAME_KEY_MASK.store(mask, Ordering::Relaxed);
+    game_input::set_keys(mask);
     read_mouse_into_pane_pixels();
     STEP_DUE.store(true, Ordering::Release);
     objc::wake_main_runloop();
@@ -924,9 +928,7 @@ fn read_mouse_into_pane_pixels() {
         ),
         None => (-1, -1),
     });
-    GAME_MOUSE_X.store(px, Ordering::Relaxed);
-    GAME_MOUSE_Y.store(py, Ordering::Relaxed);
-    GAME_MOUSE_BUTTONS.store(i64::from(left) | (i64::from(right) << 1), Ordering::Relaxed);
+    game_input::set_mouse(px, py, i64::from(left) | (i64::from(right) << 1));
 }
 
 /// Register a `MacvmGameTimer` class with the `gameTick:` method once, and

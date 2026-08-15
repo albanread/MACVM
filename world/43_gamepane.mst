@@ -731,6 +731,34 @@ Object subclass: GamePane [
         self frame keys: mask mouseX: mx y: my buttons: mb.
         ^self runStep
     ]
+    "── input a VM can ASK for (process services S6) ─────────────────────
+     Until now a demo learned what the keyboard was doing only because the HOST
+     told it: the main-thread frame tick stored a mask, the supervisor loop read
+     it, formatted `stepWithKeys: 4 mouseX: 100 y: 200 buttons: 1` as source,
+     and exec'd that string on the primary. The numbers were baked into a doit,
+     and that string-exec — not the frame clock, not the pixels — was the whole
+     reason a game had to live on the primary's thread.
+
+     `primInputState` answers this instant as {keys. mouseX. mouseY. buttons},
+     read coherently, from ANY VM. So a demo in a VM of its own asks instead of
+     being told, and its whole frame loop is `Worker onTick: [ GamePane
+     stepFromInput ]`."
+    GamePane class >> inputState ^ <Array> [
+        <primitive: 279>
+        "No host writing input (a CLI run, a test): rest, not an error — a
+         demo stepped headlessly should behave like nobody is touching it."
+        ^Array with: 0 with: -1 with: -1 with: 0
+    ]
+
+    GamePane class >> stepFromInput [
+        "One frame, driven by whatever the host last reported. The tick a demo
+         VM installs; identical in effect to the step the supervisor formats
+         for an in-process demo, minus the string."
+        | s |
+        s := self inputState.
+        ^self stepWithKeys: (s at: 1) mouseX: (s at: 2) y: (s at: 3) buttons: (s at: 4)
+    ]
+
     GamePane class >> runStep [
         "Run the registered step block, handing it this frame's parameters if
          it takes an argument. Both shapes are first-class: `onStep: [ ... ]`

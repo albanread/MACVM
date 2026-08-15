@@ -16,6 +16,7 @@ pub mod deps;
 pub mod error;
 pub mod ffi;
 pub mod fleet; // the fleet registry — process services S4 (docs/process_services.md §5)
+pub mod game_input; // game input as a process service — any VM's tick can read it (docs/process_services.md S6)
 pub mod frames;
 pub mod globals;
 pub mod lookup;

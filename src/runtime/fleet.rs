@@ -85,7 +85,7 @@ fn with_epoch<R>(epoch: u64, f: impl FnOnce(&mut EpochFleet) -> R) -> Option<R> 
 /// no longer matters: the primary's own thread, the display's, a test's.
 /// Slot reclaim + generation bump + the display introduction all happen
 /// here, exactly as they did inside the primary.
-pub fn spawn(epoch: u64, init: Option<String>) -> Option<u32> {
+pub fn spawn(epoch: u64, init: Option<String>, grant_spawn: bool) -> Option<u32> {
     // Registry mutation under the lock; thread creation after.
     let (id, rx, self_inbox, to_primary, boot, ui_link) = {
         let mut g = fleet().lock().unwrap_or_else(|e| e.into_inner());
@@ -137,7 +137,9 @@ pub fn spawn(epoch: u64, init: Option<String>) -> Option<u32> {
             ui_link,
         )
     };
-    spawn_worker_thread(id, epoch, rx, self_inbox, to_primary, boot, ui_link, init);
+    spawn_worker_thread(
+        id, epoch, rx, self_inbox, to_primary, boot, ui_link, init, grant_spawn,
+    );
     Some(id)
 }
 

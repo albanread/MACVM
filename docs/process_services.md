@@ -90,6 +90,52 @@ The Smalltalk face (`Worker tickEvery:`, `onTick:`, `dispatchTick`) does not
 change; the gate for S1 is that the existing tick and game tests pass
 untouched.
 
+### Game input — S6, and the demos that follow it
+
+The census below marked the game queue and input atomics "annexed later".
+S6 is that annexation, and it is what finally moved the DEMOS off the primary.
+
+The frame clock was never the real coupling — S1's timer service could beat
+any VM at 60 Hz, and `it_gametick.rs` proved a game running in a worker before
+this sprint existed. Nor were the pixels: the game command queue was always
+process-global and main-drained, so a worker's `GamePane` commands reach the
+same Metal pane. **The coupling was the input.** It lived in `cocoa_gui`,
+where no VM could see it, so a demo learned what the keyboard was doing only
+because the main thread stored a mask, the supervisor read it, formatted
+`GamePane stepWithKeys: 4 mouseX: 100 y: 200 buttons: 1` as SOURCE, and
+exec'd that string on the primary. Sixty times a second, on the user's
+language thread.
+
+- `runtime::game_input` holds it now: one snapshot under one lock, because a
+  frame mixing this tick's keys with last tick's mouse is a bug nobody would
+  find. The GUI still WRITES (it alone knows the pane size, so it alone can
+  convert the pointer to pane pixels); only ownership moved.
+- `GamePane inputState` (prim 279) is the read; `GamePane stepFromInput` is
+  the whole of a demo's tick. A demo ASKS instead of being told.
+- `world/94_demovm.mst` mirrors `93_appvm.mst`: `DemoVmHost start:` on the
+  primary, `DemoVmClient` in the demo's own VM — beat from the timer service,
+  end by S5's self-exit (stop the clock, emit StopLoop to close the pane it
+  opened, announce, go).
+- Demo VMs are spawned GRANTED (prim 280): a demo may spawn its own compute
+  workers, because ParallelMandel does and a demo that cannot use the
+  machine's cores would be a downgrade. Per VM, at the spawner's request —
+  the no-spawn default stays the policy for everything else.
+
+**What is still shared: one Metal pane, so one demo at a time.** That is a
+property of the surface, not of the VMs, and it is why `DemoVmHost` has a
+`stopAll` rather than a fleet.
+
+**The bug this sprint should be remembered for.** The first live run launched
+a demo VM that ran `Life launch` perfectly and showed *nothing*: no window, no
+error, an alive VM and a silent transcript. The sink had been installed in
+`boot.rs`'s handshake closure — which the GUI's real primary never uses; the
+live primary is `supervisor.rs`'s, per generation, built from `main.rs`'s
+`world_boot`. Without a sink every `GamePane` prim no-ops *cleanly* (the
+headless posture that makes panes testable), so the failure had no symptom at
+all. Two lessons, both now enforced in code: the game sink belongs in the ONE
+closure that makes every VM, and `DemoVmHost` says `demo: <entry> -> own VM`
+on launch — so silence has a meaning.
+
 ### Monitor and game state — annexed later
 
 Both already behave like services (global, main-drained). They adopt the
@@ -228,3 +274,5 @@ through the kernel with the primary uninvolved.
 | **S2** | `primAlive:` reads the table; death watcher wired to `AppVmHost`; live/history split stated | `isAlive` false immediately after terminate, unpumped; a dead app is reported |
 | **S3** | `terminate_all` + the exit sequence in CLI and GUI | quit leaves no ticking threads; monitor rows reach DEAD |
 | **S4** | fleet registry into process services | suite unchanged; UI spawns an app VM with the primary uninvolved |
+| **S5** | a VM exits itself and announces it (`Worker exit:`) | closing a window ends its app VM; relaunch is a fresh one |
+| **S6** | game input into the process layer; demos in their own VMs | an UNEDITED demo (Life) runs in a VM of its own, reads input, stops by its own exit |

@@ -684,6 +684,7 @@ pub(crate) fn spawn_worker_thread(
     boot: WorkerBootFn,
     ui_link: Option<(u32, InboxSender)>,
     init: Option<String>,
+    grant_spawn: bool,
 ) {
     let alive = Arc::new(AtomicBool::new(true));
     worker_table_register(id, epoch, alive.clone());
@@ -698,6 +699,7 @@ pub(crate) fn spawn_worker_thread(
             self_inbox,
             ui_link,
             init.as_deref(),
+            grant_spawn,
         )
     });
 }
@@ -707,6 +709,12 @@ pub(crate) fn spawn_worker_thread(
 /// fresh worker before its dispatch loop — how a worker gets its
 /// `Worker onMessage:` handler installed.
 pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
+    spawn_granted(vm, init, false)
+}
+
+/// `spawn`, with the child granted the right to spawn into the same fleet
+/// (prim 280 — demo VMs, `docs/process_services.md` S6).
+pub fn spawn_granted(vm: &mut VmState, init: Option<String>, grant: bool) -> Option<u32> {
     // The registry half lives in the fleet now (S4): this VM contributes only
     // its epoch — the authorization — and the fleet does the rest.
     let ws = vm.workers.as_ref()?;
@@ -720,7 +728,7 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
         } => *e,
         _ => return None,
     };
-    crate::runtime::fleet::spawn(epoch, init)
+    crate::runtime::fleet::spawn(epoch, init, grant)
 }
 
 /// Register an *externally-hosted* worker on an EXISTING thread — no
@@ -771,6 +779,7 @@ fn worker_main(
     self_inbox: InboxSender,
     ui_link: Option<(u32, InboxSender)>,
     init: Option<&str>,
+    grant_spawn: bool,
 ) {
     let Ok(mut handle) = boot() else {
         alive.store(false, Ordering::Relaxed);
@@ -782,6 +791,16 @@ fn worker_main(
     // than through the primary (`docs/worker_peer_links.md`).
     handle.set_self_inbox(self_inbox);
     handle.set_worker_liveness(alive.clone());
+    // MAY THIS ONE SPAWN? Normally no — "workers still don't spawn" is policy,
+    // and its absence is what keeps a fleet a tree rather than a free-for-all.
+    // A DEMO VM is the deliberate exception (`docs/process_services.md` S6):
+    // demos like ParallelMandel fan work out across the machine's cores, which
+    // is the entire reason this system has many VMs, and the primary starting
+    // one has already decided to trust it. Granted per VM, at the spawner's
+    // explicit request — never blanket.
+    if grant_spawn {
+        handle.set_spawn_grant(epoch);
+    }
     // And the display's link, installed BEFORE the init doit runs so a worker
     // whose very first act is to draw something already has somewhere to send
     // it. Introductions happen on this thread because the peer list lives in
