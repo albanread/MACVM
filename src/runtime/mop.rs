@@ -237,7 +237,7 @@ pub(crate) fn encode_worker_died(id: i64) -> Vec<u8> {
 /// of `{#workerTranscript. id. text}` — a worker's `Transcript show:` (and
 /// its error traces, which also write through `vm.out`) delivered to the
 /// primary through the ordinary inbox and shown on ITS transcript.
-pub(crate) fn encode_worker_transcript(id: i64, text: &str) -> Vec<u8> {
+pub fn encode_worker_transcript(id: i64, text: &str) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     out.push(TAG_ARRAY);
     write_varint(&mut out, 3);

@@ -6208,7 +6208,7 @@ mod tests {
             .expect("run the loop a few beats");
         let lines = captured.lock().unwrap();
         assert!(
-            lines.iter().any(|l| l.contains("[w1] hello from the worker")),
+            lines.iter().any(|l| l.contains("[w1:0001] hello from the worker")),
             "the worker's transcript line must arrive tagged on the primary's transcript, got {lines:?}"
         );
     }

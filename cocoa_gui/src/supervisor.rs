@@ -382,9 +382,14 @@ fn primary_generation_main(
         return;
     }
 
-    // The primary's own transcript now forwards to the UI worker's Transcript
-    // view (§7.4), re-aimed at THIS generation's link.
-    primary.forward_transcript_to_ui(id);
+    // The primary's own transcript goes to the TRANSCRIPT SERVICE — the
+    // author's design ("the UI just displays the transcript"): every VM
+    // writes there directly, the drain renders it, and the primary stops
+    // being a relay for anyone's words including its own. Re-installed per
+    // generation like every other sink on this handle.
+    primary.set_transcript(Box::new(
+        macvm::runtime::transcript_service::ServiceTranscript::tagged(""),
+    ));
 
     // Register the death signal: the instant before a GENUINE fatal (heap/stack
     // exhaustion, or a Die-policy error) `pthread_exit`s THIS thread, post `Died`

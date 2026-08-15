@@ -533,6 +533,25 @@ impl WorkerState {
 
 /// A `#workerDied` control envelope (§8): death is delivered through the
 /// same inbox as every ordinary message — one mechanism, no special cases.
+/// The terminate order, as an envelope — because a worker that holds a clone
+/// of its own inbox sender (`self_inbox`, the peer-links reply offer) can no
+/// longer be killed by dead-ending the primary's copy: the channel simply
+/// never disconnects. Found by a test's last assertion — a terminated game VM
+/// kept presenting frames on its tick, forever. `corr == u64::MAX` with an
+/// empty payload can be produced by no ordinary send (`nextCorr` counts up
+/// from 1; the boot nudge and peer introductions use corr 0), so the loop can
+/// treat it as what it is: an order, not a message.
+const TERMINATE_CORR: u64 = u64::MAX;
+
+fn terminate_envelope() -> Envelope {
+    Envelope {
+        from: 0,
+        corr: TERMINATE_CORR,
+        bytes: Vec::new(),
+        reply_to: None,
+    }
+}
+
 fn died_envelope(id: u32) -> Envelope {
     Envelope {
         from: id,
@@ -594,7 +613,7 @@ impl crate::embed::TranscriptSink for ForwardTranscript {
             // THE SLOT, not the handle: `[w1]` is what a reader means by
             // "the first worker"; the handle carries a generation too and
             // renders as a five-digit token that means nothing in a log.
-            let tag = format!("[w{}] ", handle_slot(self.id));
+            let tag = format!("[w{}:{:04}] ", handle_slot(self.id), handle_generation(self.id));
             let mut out = String::with_capacity(text.len() + tag.len());
             for piece in text.split_inclusive('\n') {
                 if self.at_line_start {
@@ -827,11 +846,34 @@ fn worker_main(
     let mon = crate::embed::monitor_register(format!("worker {}", handle_slot(id)), "worker");
     mon.publish(handle.metrics());
     // From here on, everything the worker prints (Transcript, error traces)
-    // reaches the primary's transcript instead of a stray stdout (M2).
-    handle.set_transcript(Box::new(ForwardTranscript::to(id, to_primary.clone())));
+    // is RECORDED, not routed. With the transcript service active (the GUI,
+    // any test that turns it on) the words go straight to the process-wide
+    // service — no hop through the primary, no pump to miss, nothing lost if
+    // the parent is busy or dead. Inactive (the CLI), the M2 forwarding to
+    // the parent's stdout stands unchanged.
+    if crate::runtime::transcript_service::is_active() {
+        // `[w<slot>:<gen>]` (the author's format): two incarnations of one
+        // slot must not sign with the same name — the generation is zero-
+        // padded so columns line up down a transcript.
+        handle.set_transcript(Box::new(
+            crate::runtime::transcript_service::ServiceTranscript::tagged(&format!(
+                "[w{}:{:04}] ",
+                handle_slot(id),
+                handle_generation(id)
+            )),
+        ));
+    } else {
+        handle.set_transcript(Box::new(ForwardTranscript::to(id, to_primary.clone())));
+    }
     if let Some(src) = init {
+        if std::env::var_os("MACVM_SPAWN_DEBUG").is_some() {
+            eprintln!("[spawndbg] w{} init = {src:?}", handle_slot(id));
+        }
         mon.set_busy(true);
         let ok = handle.exec(src).is_ok();
+        if std::env::var_os("MACVM_SPAWN_DEBUG").is_some() {
+            eprintln!("[spawndbg] w{} init ok={ok}", handle_slot(id));
+        }
         mon.set_busy(false);
         mon.publish(handle.metrics());
         if !ok {
@@ -845,6 +887,7 @@ fn worker_main(
     // the interval last asked for (read back from the VM after every entry,
     // since the guest can change or stop it at any point).
     let mut next_tick = std::time::Instant::now();
+    let mut last_pulse = std::time::Instant::now();
     loop {
         // Sleep until the sooner of the pulse check and this worker's next
         // frame tick — no extra thread, no busy poll: the deadline the loop
@@ -862,6 +905,15 @@ fn worker_main(
         };
         match rx.recv_timeout(wait) {
             Ok(env) => {
+                if env.corr == TERMINATE_CORR && env.bytes.is_empty() {
+                    // The terminate order. Exit exactly as a guest fatal
+                    // does — dead in the monitor, a death notice to the
+                    // parent, the heap unmapped by the normal drop.
+                    mon.mark_dead();
+                    alive.store(false, Ordering::Relaxed);
+                    let _ = to_primary.send(died_envelope(id));
+                    return;
+                }
                 handle.stage_pending(env);
                 // A guest error mid-dispatch (error:, DNU, even a native
                 // fault — S21's recovery surfaces all of them as Err)
@@ -901,8 +953,16 @@ fn worker_main(
                         let _ = to_primary.send(died_envelope(id));
                         return;
                     }
-                    continue;
+                    // A 60 Hz tick makes EVERY wait end in a tick, which
+                    // would starve the pulse check below forever — and the
+                    // pulse is the supervision of last resort (a fatal
+                    // primary's orphans reap themselves there). Fall through
+                    // to it on its own schedule; continue otherwise.
+                    if last_pulse.elapsed() < EPOCH_CHECK_INTERVAL {
+                        continue;
+                    }
                 }
+                last_pulse = std::time::Instant::now();
                 // The pulse check — supervision of last resort. A FATAL
                 // primary death runs no Drop glue: our channel sender leaks
                 // inside the dead VM's links and a plain `recv()` would park
@@ -1029,9 +1089,12 @@ pub fn terminate(vm: &mut VmState, id: u32) -> bool {
         return false;
     };
     link.alive = false;
-    // Replace the sender with a dead-ended one so the worker's receiver
-    // disconnects (there is no Option-dance: a fresh channel's tx dropped
-    // immediately leaves our field valid but the old channel closed).
+    // THE ORDER GOES FIRST, down the still-live channel: since peer links,
+    // the worker holds a clone of its own sender, so the disconnect below no
+    // longer reaches a worker on its own (see `terminate_envelope`). Then
+    // dead-end OUR sender as before — the disconnect still serves the
+    // pre-peer-links case and stops any further primary-side sends.
+    let _ = link.inbox.send(terminate_envelope());
     let (dead_tx, _) = channel::<Envelope>();
     link.inbox = InboxSender::detached(dead_tx);
     true

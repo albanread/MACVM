@@ -133,6 +133,12 @@ pub fn boot_ui_worker(
             msg: format!("UI worker DB-boot failed: {msg}"),
         })?;
     ui.install_worker_role(id, to_primary);
+    // The UI worker's OWN words go to the transcript service like every other
+    // VM's — it is a WRITER like the rest of them; its only special role is
+    // that the drain hands it the merged view to display.
+    ui.set_transcript(Box::new(
+        macvm::runtime::transcript_service::ServiceTranscript::tagged("[ui] "),
+    ));
     Ok(ui)
 }
 

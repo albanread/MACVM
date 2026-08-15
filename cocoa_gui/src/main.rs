@@ -47,6 +47,9 @@ use supervisor::{PrimaryLink, PrimarySupervisor};
 /// never a concurrent access.
 struct DrainState {
     ui: VmHandle,
+    /// The transcript view's cursor into the process-wide transcript service
+    /// — this drain IS the view ("the UI just displays the transcript").
+    transcript_cursor: u64,
     inbox: HostedInbox,
     supervisor: PrimarySupervisor,
     /// Monitor tab: the UI worker's row in the process-wide VM roster,
@@ -301,6 +304,33 @@ extern "C" fn drain_perform(info: *mut c_void) {
             eprintln!("macvm-cocoa: UI worker drain error: {e}");
         }
     }
+    // THE TRANSCRIPT VIEW ("the UI just displays the transcript"): render
+    // whatever the service accumulated since our cursor — every VM's words,
+    // already tagged and ordered at the write, with no VM in the delivery
+    // path at all. One envelope per drain pass however many lines arrived;
+    // it rides the SAME shape the view has always rendered
+    // (`{#workerTranscript. id. text}` -> TranscriptLineHandler), so the
+    // Smalltalk side is unchanged.
+    {
+        let (cursor, lines) =
+            macvm::runtime::transcript_service::drain_since(st.transcript_cursor);
+        st.transcript_cursor = cursor;
+        if !lines.is_empty() {
+            let mut chunk = String::new();
+            for l in &lines {
+                chunk.push_str(l);
+                chunk.push('\n');
+            }
+            let env = macvm::runtime::workers::Envelope::plain(
+                0,
+                0,
+                macvm::runtime::mop::encode_worker_transcript(0, &chunk),
+            );
+            if let Err(e) = st.ui.dispatch_hosted_envelope(env) {
+                eprintln!("macvm-cocoa: transcript view error: {e}");
+            }
+        }
+    }
     if let Some(rx) = &st.ctl {
         control::serve(rx, &mut st.ui);
     }
@@ -378,6 +408,11 @@ fn main() {
     // tree. MUST be first — it sets cwd and env every later default reads, and
     // it must run while the process is still single-threaded.
     macvm::bundle::bootstrap_payload("cocoa");
+    // THE TRANSCRIPT IS A VM SERVICE (the author's design): activate it before
+    // any VM boots, so every VM's words — primary, UI, every worker — land in
+    // the process-wide, serialized, lossless buffer, and the drain below is
+    // just its VIEW. A line's arrival pokes the run loop like any envelope.
+    macvm::runtime::transcript_service::activate();
     // (design §3 step 1) AppKit init MUST be on main, before anything AppKit.
     objc::bootstrap();
     // An explicit autorelease pool around ALL pre-`[NSApp run]` work: before the
@@ -464,8 +499,12 @@ fn main() {
 
     // Own the UI worker + supervisor + current inbox in one heap box, whose stable
     // address is the drain source's `info`.
+    macvm::runtime::transcript_service::register_wake(std::sync::Arc::new(|| {
+        objc::wake_main_runloop();
+    }));
     let mut drain = Box::new(DrainState {
         ui,
+        transcript_cursor: 0,
         inbox: link.hosted_inbox,
         supervisor: sup,
         ui_mon: macvm::embed::monitor_register("ui".into(), "ui"),
