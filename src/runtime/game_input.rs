@@ -37,6 +37,14 @@ pub struct InputState {
     pub mouse_x: i64,
     pub mouse_y: i64,
     pub buttons: i64,
+    /// THE USER ASKED THIS DEMO TO STOP — Escape, or the pane's close button.
+    /// It rides with the input because that is what it IS: a key the user
+    /// pressed, read by the demo's own tick like every other key. A demo in a
+    /// VM of its own then ENDS ITSELF (`DemoVmClient`: stop the clock, close
+    /// the pane, announce, exit) instead of being killed from outside, which
+    /// is the whole difference between a program that quits and one that is
+    /// shot. Sticky until `reset` — a demo that reads it late still sees it.
+    pub exit_requested: bool,
 }
 
 static STATE: Mutex<InputState> = Mutex::new(InputState {
@@ -44,6 +52,7 @@ static STATE: Mutex<InputState> = Mutex::new(InputState {
     mouse_x: -1,
     mouse_y: -1,
     buttons: 0,
+    exit_requested: false,
 });
 
 fn with<R>(f: impl FnOnce(&mut InputState) -> R) -> R {
@@ -65,6 +74,12 @@ pub fn set_mouse(x: i64, y: i64, buttons: i64) {
     });
 }
 
+/// The user asked the running demo to stop (Escape, the close button). Read
+/// by the demo itself; cleared when the next session resets.
+pub fn request_exit() {
+    with(|s| s.exit_requested = true);
+}
+
 /// No pane, no pointer — what a closed session reports.
 pub fn clear_mouse() {
     set_mouse(-1, -1, 0);
@@ -78,6 +93,7 @@ pub fn reset() {
         mouse_x: -1,
         mouse_y: -1,
         buttons: 0,
+        exit_requested: false,
     });
 }
 
@@ -104,12 +120,17 @@ mod tests {
                 keys: 0b101,
                 mouse_x: 120,
                 mouse_y: 64,
-                buttons: 1
+                buttons: 1,
+                exit_requested: false
             }
         );
         reset();
         let s = snapshot();
         assert_eq!(s.keys, 0, "a new session inherits no held keys");
         assert_eq!(s.mouse_x, -1, "no pane means no pointer");
+        request_exit();
+        assert!(snapshot().exit_requested, "the stop key is readable");
+        reset();
+        assert!(!snapshot().exit_requested, "a new session starts unasked");
     }
 }

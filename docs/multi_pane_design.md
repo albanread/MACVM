@@ -85,11 +85,17 @@ rewrites of two host files, (e) is deletion. **(c) is the only part with a
 genuine design decision in it**, and it is a decision about focus semantics
 rather than about VMs.
 
-The risk worth naming: every pane is a Metal layer with its own drawable, so
-N demos at 60 Hz is N times the GPU work and N times the presents. Three or
-four is comfortable; a dozen is a different conversation about frame
-budgeting, and the frame timer should probably tick a pane only while its
-window is visible.
+**Cost, corrected** (the author's own reading, and the right one): these are
+LOW-RESOLUTION game panes — 320×240 of palette indices, one small texture
+upload and one composite each. A pane is not a retina-sized surface with a
+deep layer tree; it costs almost nothing to have several of them ticking. So
+"how many panes can we afford" is not the constraint this design has to be
+shaped around, and multiple ticking panes should simply work.
+
+What is still worth doing, cheaply: tick a pane only while its window is
+visible — not because the GPU could not take it, but because a minimised demo
+computing frames nobody sees is wasted CPU, and it costs one `isVisible`
+check per pane per tick to avoid.
 
 ## 5. Recommendation
 

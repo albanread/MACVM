@@ -2573,11 +2573,22 @@ fn prim_worker_tick_every(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 fn prim_game_input_state(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let _ = args;
     let s = crate::runtime::game_input::snapshot();
-    let a = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 4);
+    let a = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 5);
     a.at_put(0, SmallInt::new(s.keys).oop());
     a.at_put(1, SmallInt::new(s.mouse_x).oop());
     a.at_put(2, SmallInt::new(s.mouse_y).oop());
     a.at_put(3, SmallInt::new(s.buttons).oop());
+    // The fifth is the user asking this demo to stop (Escape, the close
+    // button) — an input like any other, so a demo in a VM of its own can end
+    // ITSELF rather than be killed from outside.
+    a.at_put(
+        4,
+        if s.exit_requested {
+            vm.universe.true_obj
+        } else {
+            vm.universe.false_obj
+        },
+    );
     PrimResult::Ok(a.oop())
 }
 

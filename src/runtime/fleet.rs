@@ -87,7 +87,7 @@ fn with_epoch<R>(epoch: u64, f: impl FnOnce(&mut EpochFleet) -> R) -> Option<R> 
 /// here, exactly as they did inside the primary.
 pub fn spawn(epoch: u64, init: Option<String>, grant_spawn: bool) -> Option<u32> {
     // Registry mutation under the lock; thread creation after.
-    let (id, rx, self_inbox, to_primary, boot, ui_link) = {
+    let (id, rx, self_inbox, to_primary, boot, ui_link, intro_inbox) = {
         let mut g = fleet().lock().unwrap_or_else(|e| e.into_inner());
         let (_, ef) = g.iter_mut().find(|(e, _)| *e == epoch)?;
         let reuse_idx = ef.links.iter().position(|l| !l.alive);
@@ -109,16 +109,10 @@ pub fn spawn(epoch: u64, init: Option<String>, grant_spawn: bool) -> Option<u32>
                 .filter(|l| l.gen == handle_generation(h) && l.alive)
                 .map(|l| (h, l.inbox.clone()))
         });
-        if let Some((_, ui_inbox)) = &ui_link {
-            // The display learns the newcomer by the ordinary rule: an
-            // introduction envelope carrying the newborn's inbox.
-            let _ = ui_inbox.send(Envelope {
-                from: id,
-                corr: 0,
-                bytes: Vec::new(),
-                reply_to: Some(InboxSender::detached(tx.clone())),
-            });
-        }
+        // The newborn's own inbox, for the display's introduction envelope —
+        // which is SENT AFTER this lock is released (see below): it is a send,
+        // and a send wakes somebody.
+        let intro_inbox = InboxSender::detached(tx.clone());
         let link = FleetLink {
             inbox: InboxSender::detached(tx),
             alive: true,
@@ -135,8 +129,20 @@ pub fn spawn(epoch: u64, init: Option<String>, grant_spawn: bool) -> Option<u32>
             ef.parent_inbox.clone(),
             ef.boot.clone(),
             ui_link,
+            intro_inbox,
         )
     };
+    // The display learns the newcomer by the ordinary rule: an introduction
+    // envelope carrying the newborn's inbox — sent with the registry lock
+    // RELEASED, because the display's wake hook runs on this thread.
+    if let Some((_, ui_inbox)) = &ui_link {
+        let _ = ui_inbox.send(Envelope {
+            from: id,
+            corr: 0,
+            bytes: Vec::new(),
+            reply_to: Some(intro_inbox),
+        });
+    }
     spawn_worker_thread(
         id, epoch, rx, self_inbox, to_primary, boot, ui_link, init, grant_spawn,
     );
@@ -167,71 +173,95 @@ pub(crate) fn register_hosted(
 }
 
 /// Send from the parent's side: resolve `id` in `epoch`'s links.
+/// NOTHING IS SENT UNDER THE FLEET LOCK. `InboxSender::send` fires the
+/// receiver's wake hook — arbitrary code — and this mutex guards every fleet
+/// operation there is, so a hook that spawned, terminated or even asked who
+/// was alive would deadlock the whole registry. Every function below takes the
+/// same shape: resolve under the lock, clone what is needed, release, then
+/// send; re-acquire only to record what the send told us.
 pub(crate) fn send_to(epoch: u64, id: u32, corr: u64, bytes: Vec<u8>) -> bool {
-    with_epoch(epoch, |ef| {
+    let inbox = with_epoch(epoch, |ef| {
         let idx = handle_slot(id) as usize;
         if idx == 0 {
-            return false;
+            return None;
         }
-        let Some(link) = ef.links.get_mut(idx - 1) else {
-            return false;
-        };
+        let link = ef.links.get(idx - 1)?;
         if link.gen != handle_generation(id) || !link.alive {
-            return false;
+            return None;
         }
-        if link
-            .inbox
-            .send(Envelope {
-                from: 0,
-                corr,
-                bytes,
-                reply_to: None,
-            })
-            .is_err()
-        {
-            link.alive = false;
-            let _ = ef
-                .parent_inbox
-                .send(crate::runtime::workers::died_envelope(id));
-            return false;
-        }
-        true
+        Some(link.inbox.clone())
     })
-    .unwrap_or(false)
+    .flatten();
+    let Some(inbox) = inbox else {
+        return false;
+    };
+    if inbox
+        .send(Envelope {
+            from: 0,
+            corr,
+            bytes,
+            reply_to: None,
+        })
+        .is_ok()
+    {
+        return true;
+    }
+    // The far end is gone: mark it dead and tell the parent — the notice is
+    // itself a send, so it too happens outside the lock.
+    let parent = with_epoch(epoch, |ef| {
+        let idx = handle_slot(id) as usize;
+        if let Some(link) = ef.links.get_mut(idx - 1) {
+            if link.gen == handle_generation(id) {
+                link.alive = false;
+            }
+        }
+        ef.parent_inbox.clone()
+    });
+    if let Some(p) = parent {
+        let _ = p.send(crate::runtime::workers::died_envelope(id));
+    }
+    false
 }
 
 pub(crate) fn terminate(epoch: u64, id: u32) -> bool {
-    with_epoch(epoch, |ef| {
+    let inbox = with_epoch(epoch, |ef| {
         let idx = handle_slot(id) as usize;
         if idx == 0 {
-            return false;
+            return None;
         }
-        let Some(link) = ef.links.get_mut(idx - 1) else {
-            return false;
-        };
+        let link = ef.links.get_mut(idx - 1)?;
         if link.gen != handle_generation(id) {
-            return false;
+            return None;
         }
-        let _ = link.inbox.send(terminate_envelope());
         link.alive = false;
-        true
+        Some(link.inbox.clone())
     })
-    .unwrap_or(false)
+    .flatten();
+    match inbox {
+        Some(i) => {
+            let _ = i.send(terminate_envelope());
+            true
+        }
+        None => false,
+    }
 }
 
 pub(crate) fn terminate_all(epoch: u64) -> usize {
-    with_epoch(epoch, |ef| {
-        let mut n = 0;
+    let doomed = with_epoch(epoch, |ef| {
+        let mut out = Vec::new();
         for link in ef.links.iter_mut() {
             if link.alive {
-                let _ = link.inbox.send(terminate_envelope());
                 link.alive = false;
-                n += 1;
+                out.push(link.inbox.clone());
             }
         }
-        n
+        out
     })
-    .unwrap_or(0)
+    .unwrap_or_default();
+    for inbox in &doomed {
+        let _ = inbox.send(terminate_envelope());
+    }
+    doomed.len()
 }
 
 pub(crate) fn link_alive(epoch: u64, id: u32) -> bool {

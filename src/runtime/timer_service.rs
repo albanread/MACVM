@@ -90,13 +90,15 @@ fn run(s: &Service) {
             .unwrap_or_else(|e| e.into_inner());
         entries = guard;
         let now = Instant::now();
+        // PHASE 1, UNDER THE LOCK: decide. Purge the dead, pick what is due,
+        // advance its deadline, and take a CLONE of each target to send to.
+        //
+        // CANCEL-ON-DEATH runs for EVERY entry, not only the due ones. The
+        // deadline-first version let a dead VM's registration sit until its
+        // next tick would have been due — harmless at 16ms, an hour of
+        // pointless residency (holding an inbox clone) for a slow timer.
+        let mut due: Vec<(u64, InboxSender)> = Vec::new();
         entries.retain_mut(|e| {
-            // CANCEL-ON-DEATH FIRST, and for EVERY entry — not only the ones
-            // whose deadline has come. Checking after the deadline test let a
-            // dead VM's registration sit in the table until its next tick was
-            // due, holding a clone of its inbox: harmless at 16ms, a full hour
-            // of pointless residency for a slow timer. A dead target's entry
-            // now goes at the first wake after it dies, whoever woke us.
             if let Some(a) = &e.alive {
                 if !a.load(Ordering::Acquire) {
                     return false;
@@ -105,17 +107,31 @@ fn run(s: &Service) {
             if e.next > now {
                 return true;
             }
-            // Deliver the tick as a message; a closed inbox is a dead target.
-            if e
-                .target
+            e.next = now + e.interval;
+            due.push((e.key, e.target.clone()));
+            true
+        });
+        // PHASE 2, LOCK RELEASED: deliver. `InboxSender::send` fires the
+        // receiver's WAKE HOOK — arbitrary code, chosen by whoever registered
+        // the inbox (`objc::wake_main_runloop` today, anything tomorrow).
+        // Calling that while holding `entries` would deadlock this service the
+        // moment a hook so much as asked it a question, and a frozen timer
+        // thread has no symptom but stopped time. The transcript service
+        // already takes this discipline: decide under the lock, act outside it.
+        drop(entries);
+        let mut closed: Vec<u64> = Vec::new();
+        for (key, target) in due {
+            if target
                 .send(Envelope::plain(0, 0, crate::runtime::mop::encode_tick()))
                 .is_err()
             {
-                return false;
+                closed.push(key); // a closed inbox is a dead target
             }
-            e.next = Instant::now() + e.interval;
-            true
-        });
+        }
+        entries = s.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if !closed.is_empty() {
+            entries.retain(|e| !closed.contains(&e.key));
+        }
     }
 }
 

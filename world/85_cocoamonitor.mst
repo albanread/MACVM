@@ -27,7 +27,7 @@
 
 Object subclass: CocoaMonitor [
     <classVars: Container TablePane Table Cols Face Rows BridgeLabel
-                Popup Actions LastMs Period Prev PrevMs>
+                Popup Actions LastMs Period Prev PrevMs RowMenu>
 
     CocoaMonitor class >> barHeight [ ^34.0 ]
     CocoaMonitor class >> bridgeHeight [ ^50.0 ]
@@ -89,8 +89,68 @@ Object subclass: CocoaMonitor [
         label := f at: 1.
         allocs := (f at: 7) asNumber.
         rate := self rateFor: label allocs: allocs.
+        "The 12th element is the VM's HANDLE, carried but never shown: the
+         table resolves columns by identifier, so a trailing field is
+         invisible to it, and a row action needs a way to NAME the VM it was
+         invoked on (a label cannot — labels repeat and are for reading)."
         ^{ label. f at: 2. f at: 3. f at: 4. (f at: 5) , '%'. f at: 6.
-           rate. f at: 8. f at: 9. f at: 10. f at: 11 }
+           rate. f at: 8. f at: 9. f at: 10. f at: 11.
+           (f size >= 12 ifTrue: [ (f at: 12) asNumber ] ifFalse: [ 0 ]) }
+    ]
+
+    "── acting on a row, not just reading it ────────────────────────────
+     THE FIRST CONTEXT MENU IN THIS WORLD. A right-click on a VM offers to ASK
+     it to leave: `#exitPlease` is recognized by every worker's dispatch
+     (47_worker.mst), so it works on any row — a demo, an app, a plain compute
+     worker — and the VM ends ITSELF (`Worker exit:`: run its ensure: blocks,
+     announce, go) instead of being killed. `terminate` remains the kill, and
+     is deliberately NOT offered here: the menu is for asking."
+    CocoaMonitor class >> handleAtRow: aRow [
+        (Rows isNil or: [ aRow < 0 or: [ aRow >= Rows size ] ]) ifTrue: [ ^0 ].
+        ^(Rows at: aRow + 1) at: 12 ifAbsent: [ 0 ]
+    ]
+
+    CocoaMonitor class >> sendExitToClickedRow [
+        "The menu's own entry point: the row the user right-clicked."
+        ^self sendExitToRow: (Table onMain clickedRow)
+    ]
+
+    CocoaMonitor class >> sendExitToRow: aRow [
+        "Split from the menu action so the behaviour can be DRIVEN — by a
+         script, by a test — without a mouse. Right-clicking is how a person
+         reaches it; it must not be the only way anything can."
+        | h |
+        h := self handleAtRow: aRow.
+        h = 0 ifTrue: [
+            ^CocoaUI appendTranscript:
+                'monitor: that VM cannot be asked (the primary and the UI end with the app)' ].
+        "The primary owns the fleet, so the ask goes through it — the display
+         holds no handle for a worker it did not spawn."
+        Worker uiRequest: #doitq
+            args: (Array with: '(Worker new setId: ' , h printString ,
+                               ') send: (Array with: #exitPlease)')
+            onReply: [ :x | nil ].
+        CocoaUI appendTranscript: 'monitor: asked VM ' , h printString , ' to exit'
+    ]
+
+    CocoaMonitor class >> installRowMenu [
+        | menu item delegate holder |
+        Table isNil ifTrue: [ ^self ].
+        menu := ((Cocoa classNamed: 'NSMenu') onMain alloc) onMain initWithTitle: 'VM'.
+        item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Send exit' action: 'macvmAction:' keyEquivalent: ''.
+        holder := CocoaToolbarAction on: [ CocoaMonitor sendExitToClickedRow ].
+        delegate := MacvmDelegate actionTargetOn: holder.
+        item onMain setTarget: delegate.
+        menu onMain addItem: item.
+        Table onMain setMenu: menu.
+        "The action delegate is a Cocoa target — NSControl/NSMenuItem targets
+         are WEAK, so it must be retained here or it is collected and the menu
+         silently stops working (docs/appspec_cookbook.md's own trap)."
+        Actions isNil ifTrue: [ Actions := OrderedCollection new ].
+        Actions add: delegate.
+        RowMenu := menu.
+        ^self
     ]
 
     "bytes/sec from the raw running total: delta over the WALL-CLOCK ms since
@@ -163,6 +223,7 @@ Object subclass: CocoaMonitor [
         Table onMain setUsesAlternatingRowBackgroundColors: true.
         Table onMain setRowHeight: 22.0.
         Table onMain setAllowsColumnReordering: false.
+        self installRowMenu.
         Cols := OrderedCollection new.
         self addColumn: 'vm'     title: 'VM'        width: 96.0.
         self addColumn: 'kind'   title: 'KIND'      width: 70.0.

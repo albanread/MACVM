@@ -296,9 +296,10 @@ until the next envelope wakes it, never polls. The Demos menu's
 "Mandelbrot — parallel workers" computes every frame in bands across 4
 worker VMs this way.
 
-MACVM has no exception system — `self error:` stops the current
-computation outright, and scoped `catch` handling was deliberately
-rejected. The **supervision layer** answers the same problem the way
+MACVM's exception system is deliberately small — `on:do:` and `signal:`
+exist (`world/78_exceptions.mst`), scoped `catch` was rejected, and an
+UNHANDLED `self error:` still stops the computation outright. For a whole
+VM dying, the **supervision layer** answers the way
 Erlang/OTP does: a crashed worker is reported as an ordinary message
 (`#workerDied`), and a `WorkerSupervisor` restarts it by policy —
 `#oneForOne` (just the dead child), `#oneForAll` (every sibling),

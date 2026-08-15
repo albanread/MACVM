@@ -674,6 +674,8 @@ pub fn service_stop_on_main() {
 /// on the primary. One at a time — if a game is already running, tear it down
 /// first (the launch fires once it has). Waking the run loop is the caller's.
 pub fn request_launch(entry: String) {
+    // A fresh session must not inherit the last one's Escape.
+    game_input::reset();
     if GAME_ACTIVE.load(Ordering::Acquire) {
         STOP_DUE.store(true, Ordering::Release); // stop the current demo first
     }
@@ -686,6 +688,11 @@ pub fn request_launch(entry: String) {
 /// Request the running demo stop (Escape, the close button). The supervisor
 /// runs the stop top-level; its StopLoop closes the window.
 pub fn request_stop() {
+    // The demo READS this and ends itself (`GamePane exitRequested`,
+    // DemoVmClient's tick) — a demo in a VM of its own is asked to quit, not
+    // shot. The host-side close below still runs for the IN-PROCESS path,
+    // whose demo has no VM of its own to do the asking to.
+    game_input::request_exit();
     STOP_DUE.store(true, Ordering::Release);
     objc::wake_main_runloop();
 }

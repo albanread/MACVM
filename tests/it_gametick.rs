@@ -263,3 +263,73 @@ fn an_existing_demo_runs_in_a_vm_of_its_own() {
     std::thread::sleep(Duration::from_millis(250));
     assert_eq!(after, presents_in(&captured), "a stopped demo kept stepping");
 }
+
+/// ASKED FROM OUTSIDE, THE DEMO STILL TIDIES UP. `#exitPlease` — what the
+/// Monitor's `Send exit` sends, and what any worker answers — must not be a
+/// shortcut past the VM's own cleanup. It was, once: the first Send exit from
+/// the Monitor ended the demo VM and left its game pane on screen with nothing
+/// behind it, because the ask went straight to `Worker exit:` while the
+/// pane-closing lived in the demo client's own stop path. Cleanup now hangs on
+/// `Worker onExit:` and runs on EVERY route out, which is what this asserts:
+/// the StopLoop that closes the window is emitted even though nothing called
+/// `DemoVmClient shutdown`.
+#[test]
+fn an_exit_asked_from_outside_still_closes_the_pane() {
+    let _x = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+    macvm::runtime::game_input::reset();
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    let captured: Arc<Mutex<Vec<GameCommand>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    primary.set_worker_boot(Arc::new(move || {
+        let mut h = VmHandle::boot(opts(), Path::new("world"))?;
+        h.set_game_sink(Box::new(CapSink(cap.clone())));
+        Ok(h)
+    }));
+    primary
+        .exec("DemoVmHost start: 'Life launch'.")
+        .expect("spawn the demo VM");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while presents_in(&captured) == 0 {
+        assert!(Instant::now() < deadline, "the demo never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    captured.lock().unwrap().clear();
+
+    // The Monitor's gesture, exactly: address the VM by handle and ASK.
+    primary
+        .exec("(Worker new setId: (DemoVmHost vms at: 1) id) send: (Array with: #exitPlease).")
+        .expect("ask it to leave");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let stopped = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c, GameCommand::StopLoop));
+        if stopped {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the demo exited without closing its pane — an outside ask skipped \
+             the VM's own cleanup"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // And it really did leave.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        primary.exec("Worker dispatchInbox.").expect("pump");
+        if primary
+            .eval("DemoVmHost liveCount printString")
+            .unwrap_or_default()
+            .trim()
+            == "'0'"
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the demo VM never exited");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}

@@ -2065,9 +2065,25 @@ Compiled code speculates: it inlines the primitives the profile saw, fuses Small
 
 A generational collector: new objects are born in **eden** and scavenged copying-style through survivor space; the old generation is compacted by a mark-slide **full GC**. Compiled frames carry oop maps so the collector can walk native stacks precisely — an area guarded by some of the project''s most paranoid stress gates.
 
-## The worker model
+## Many VMs, one screen
 
-The UI runs a **supervisor beat** over worker VMs: your code runs in a worker, and if it dies mid-request the supervisor recovers the in-flight state and reports the error — the window never goes down with the experiment. Scripted evaluation through AppleScript rides the same rails, with explicit error replies instead of a hung caller.
+This is not one Smalltalk with threads bolted on. It is **many whole VMs** — each with its own heap, its own JIT, its own garbage collector, on its own OS thread — that share nothing and talk by passing deep copies of messages. `Worker spawn:` starts one from Smalltalk. Nothing is shared, so nothing needs a lock, and a VM that dies takes only itself.
+
+Four kinds are usually running while you work. The **primary** holds your persistent world — the classes you edit and the objects you keep. The **UI VM** is pinned to the main thread and owns the glass: every window, every pixel, and nothing else. **App VMs** run tools built with the declarative framework — the sprite editor computes its own pixels in its own VM and ships the finished bytes to the display. **Demo VMs** run the games, one apiece, each beating at 60 Hz off the VM''s own timer service and reading the keyboard itself.
+
+The point is felt rather than seen: a demo that hangs no longer hangs the environment, and a tool that crashes takes only its own VM. The window it left behind keeps its last frame instead of vanishing.
+
+VMs message each other **directly** — a link is *learned*, not registered: an envelope carries the sender''s own inbox, so anyone who has messaged you is someone you can answer. An app talks to the display without the primary in the middle.
+
+## How a VM ends
+
+**A VM exits itself, and says so on the way out.** Closing a tool''s window, pressing Escape in a demo, or choosing *Send exit* from the Monitor''s right-click menu are all the same thing: a polite ask. The VM runs its own cleanup — closes the pane it opened, tears down its window — announces `#vmExiting` to everyone who cares, and then goes. Nothing is killed mid-thought.
+
+Watch it happen in the **Monitor** tab: one row per VM, and a row that ends stays on screen as `dead` for a minute before it is swept, so you can see the transition rather than a row simply vanishing.
+
+## The supervisor beat
+
+Over all of that, the UI runs a **supervisor beat**: if a VM dies mid-request the supervisor recovers the in-flight state and reports the error — the window never goes down with the experiment. Scripted evaluation through AppleScript rides the same rails, with explicit error replies instead of a hung caller.
 
 ## The Cocoa bridge
 

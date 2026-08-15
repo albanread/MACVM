@@ -744,10 +744,19 @@ Object subclass: GamePane [
      being told, and its whole frame loop is `Worker onTick: [ GamePane
      stepFromInput ]`."
     GamePane class >> inputState ^ <Array> [
+        "{keys. mouseX. mouseY. buttons. exitRequested}"
         <primitive: 279>
         "No host writing input (a CLI run, a test): rest, not an error — a
          demo stepped headlessly should behave like nobody is touching it."
-        ^Array with: 0 with: -1 with: -1 with: 0
+        ^Array with: 0 with: -1 with: -1 with: 0 with: false
+    ]
+
+    "THE USER ASKED THIS DEMO TO STOP — Escape, or the pane's close button.
+     Read like any other input, because that is what it is; a demo running in
+     a VM of its own answers it by ending itself, which is the difference
+     between a program that quits and one that is shot."
+    GamePane class >> exitRequested ^ <Boolean> [
+        ^(self inputState at: 5) == true
     ]
 
     GamePane class >> stepFromInput [
@@ -791,7 +800,7 @@ Object subclass: GamePane [
     GamePane class >> reset [
         "Run and clear whatever cleanup a demo registered via `onReset:` FIRST
          (while its StepBlock closure is still intact to poke at), then the
-         frame-loop state itself. MACVM has no exception system (fail fast is
+         frame-loop state itself. Fail-fast is
          the house rule) — a broken teardown block surfaces normally, exactly
          like any other guest error."
         ResetBlock ifNotNil: [ ResetBlock value. ResetBlock := nil ].

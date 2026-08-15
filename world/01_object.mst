@@ -12,7 +12,8 @@
  (isString, isInteger, ...), printing (printString, printOn:,
  displayString, printNl, inspect), copying (shallowCopy, copy),
  reflective sends (perform:, perform:withArguments:), and Association
- building with -> . There is no exception system here: error: stops the
+ building with -> . Exceptions are deliberately small here (on:do:/signal:,
+ 78_exceptions.mst); an UNHANDLED error: stops the
  program with a message, and doesNotUnderstand: reports an unhandled
  message the same way. halt opens the debugger when one is armed and is
  otherwise a no-op."

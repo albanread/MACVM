@@ -102,7 +102,7 @@ Object subclass: WorkerMessage [
  harmless to load anywhere."
 Object subclass: Worker [
     | id |
-    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler AnyDiedHook DeadlineSweepHook InFlightPeer InFlightCorr TickHandler DeathWatchers ExitWatchers>
+    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler AnyDiedHook DeadlineSweepHook InFlightPeer InFlightCorr TickHandler DeathWatchers ExitWatchers ExitHook>
 
     "── spawning (primary side) ──"
     Worker class >> spawn: initSource [
@@ -255,6 +255,16 @@ Object subclass: Worker [
          payload goes to the user handler as before."
         ((payload isKindOf: Array) and: [ (payload size >= 1) and: [ (payload at: 1) == #tick ] ])
             ifTrue: [ ^self dispatchTick ].
+        "PLEASE STOP — recognized by EVERY worker, before any user handler.
+         `Worker exit:` is a VM ending ITSELF, so somebody outside needs a way
+         to ASK; without one the only outside verb was terminate, which is a
+         kill. Handled centrally because a plain compute worker has no handler
+         of its own to put it in, and the Monitor's `Send exit` must work on
+         any row rather than only on the VMs that happen to be apps or demos.
+         Those two keep their own richer arms (a window to tear down, a pane to
+         close) and reach here having already tidied up."
+        ((payload isKindOf: Array) and: [ (payload size >= 1) and: [ (payload at: 1) == #exitPlease ] ])
+            ifTrue: [ ^self exit: (payload size >= 2 ifTrue: [ payload at: 2 ] ifFalse: [ #asked ]) ].
         (self isRpcRequest: payload) ifTrue: [ ^self serveRpc: payload ].
         Handler isNil ifFalse: [
             Handler value: (WorkerMessage from: (env at: 1) payload: payload) ]
@@ -739,9 +749,24 @@ Object subclass: Worker [
      `aReason` rides along so a listener can tell a close from a finished job
      from a self-diagnosed failure; #closed is the display's."
     Worker class >> exit: aReason <Object> [
+        "WHATEVER ASKED, THIS VM TIDIES UP FIRST. An exit has more than one
+         route — the VM's own decision, the Monitor's `Send exit`, a window
+         closing — and the teardown must not belong to any ONE of them. It was
+         written into the demo client's own stop path first, and the very first
+         `Send exit` from the Monitor proved that wrong: the VM left, and its
+         game pane stayed on screen with nothing behind it, because the ask had
+         gone straight past the cleanup.
+         Nil'd BEFORE it runs, so an exit re-entered from inside the hook
+         cannot loop. The hook MUST NOT RAISE — this file loads below the
+         exception classes (78_exceptions.mst) and cannot catch for you; wrap
+         your own body, as `DemoVmClient` does."
+        ExitHook isNil ifFalse: [ | h | h := ExitHook. ExitHook := nil. h value ].
         self announceExiting: aReason.
         ^self primExitSelf
     ]
+
+    "What this VM must do before it goes, whoever asks it to go."
+    Worker class >> onExit: aBlock [ ExitHook := aBlock. ^self ]
 
     Worker class >> exit [ ^self exit: #done ]
 

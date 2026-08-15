@@ -54,6 +54,11 @@ Object subclass: DemoVmClient [
          sleep: the timer service wakes this VM, the tick dispatches top-level
          like any other message, and the step runs one thing at a time exactly
          as everything else in this VM does."
+        "OUR CLEANUP, ON EVERY EXIT ROUTE (Escape, the menu's Send exit, a
+         relaunch, our own decision): the VM that opened the pane closes it.
+         Wrapped here because `Worker exit:` cannot catch for us."
+        Worker onExit: [
+            [ GamePane new stop. GamePane reset ] on: Error do: [ :e | nil ] ].
         Worker onTick: [ DemoVmClient tick ].
         Worker tickEvery: 1000 // Fps.
         ^self
@@ -65,6 +70,12 @@ Object subclass: DemoVmClient [
      tick is cancelled on the way out, because a broken step repeated sixty
      times a second is sixty identical traces a second."
     DemoVmClient class >> tick [
+        "ESCAPE ENDS US, AND WE DO THE ENDING. The host does not kill a demo
+         that has a VM of its own — it records the request with the rest of the
+         input, and this notices on its very next beat and runs the same clean
+         shutdown a menu stop runs. Checked BEFORE the step so the frame the
+         user quit on is not drawn."
+        GamePane exitRequested ifTrue: [ ^self shutdown ].
         ^[ GamePane stepFromInput ]
             on: Error do: [ :e |
                 Worker tickEvery: 0.
@@ -83,15 +94,10 @@ Object subclass: DemoVmClient [
      the pane is dismissed — Escape, the close button, or another demo taking
      the screen."
     DemoVmClient class >> shutdown [
+        "The pane is closed by the EXIT HOOK (installed in `serveAt:`), not
+         here — so every route out does it, including the ones that never come
+         through this method."
         Worker tickEvery: 0.
-        "CLOSE THE PANE WE OPENED. The VM that emitted StartLoop emits the
-         StopLoop — anything else leaves an orphan window when a demo is
-         stopped by any route other than Escape (whose host-side handler
-         closes the window itself, and where this second close is a harmless
-         no-op: the pane is already taken). `stop` is instance-side and needs
-         no pane state; it is a command, not a query."
-        [ GamePane new stop ] on: Error do: [ :e | nil ].
-        [ GamePane reset ] on: Error do: [ :e | nil ].
         ^Worker exit: #stopped
     ]
 

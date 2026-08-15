@@ -775,6 +775,11 @@ pub struct VmMonitorSlot {
     /// guest code" — the busy signal for VMs whose pump blocks inside `exec`,
     /// where a busy flag around the exec would read permanently busy.
     last_publish: Mutex<Option<std::time::Instant>>,
+    /// The worker HANDLE this row is for (0 = not a spawned worker: the
+    /// primary, the UI, a bare VM). The Monitor shows rows; acting on one —
+    /// "send this worker the exit message" — needs a way to NAME the VM, and a
+    /// label cannot do it (labels repeat and are for reading).
+    handle: std::sync::atomic::AtomicU64,
     /// When this VM died. A dead row is KEPT — and shown as dead — for
     /// [`GRAVE`], because watching a VM's state change is how you learn it
     /// ended cleanly; after that it is swept, because a roster of corpses is
@@ -812,6 +817,12 @@ impl VmMonitorSlot {
     /// The VM is gone (worker retired, primary died awaiting respawn). The
     /// row stays — dead rows are information, not noise — until a same-label
     /// registration reuses it.
+    /// Name the VM behind this row (a spawned worker's handle).
+    pub fn set_handle(&self, handle: u32) {
+        self.handle
+            .store(u64::from(handle), std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn mark_dead(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         self.alive.store(false, Relaxed);
@@ -823,6 +834,8 @@ impl VmMonitorSlot {
 pub struct VmMonitorRow {
     pub label: String,
     pub kind: &'static str,
+    /// The worker handle this row names, or 0 — see `VmMonitorSlot::handle`.
+    pub handle: u64,
     pub alive: bool,
     pub busy: bool,
     /// Milliseconds since the owner last published (`None` = never).
@@ -894,6 +907,7 @@ pub fn monitor_register(label: String, kind: &'static str) -> std::sync::Arc<VmM
         busy: AtomicBool::new(false),
         metrics: Mutex::new(VmMetrics::default()),
         last_publish: Mutex::new(None),
+        handle: std::sync::atomic::AtomicU64::new(0),
         died_at: Mutex::new(None),
     });
     roster.push(slot.clone());
@@ -909,6 +923,7 @@ pub fn monitor_snapshot() -> Vec<VmMonitorRow> {
         .iter()
         .map(|s| VmMonitorRow {
             label: s.label.clone(),
+            handle: s.handle.load(Relaxed),
             kind: s.kind,
             alive: s.alive.load(Relaxed),
             busy: s.busy.load(Relaxed),

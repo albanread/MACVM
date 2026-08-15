@@ -1059,6 +1059,10 @@ extern "C" fn imp_monitor_rows(_this: *mut c_void, _cmd: *mut c_void) -> Id {
                 m.compilations.to_string(),
                 m.deopts.to_string(),
                 m.ic_misses.to_string(),
+                // The VM's handle (0 = not a spawned worker) — what the
+                // Monitor's row actions address. Last, so every existing
+                // field keeps its index.
+                r.handle.to_string(),
             ]
             .join(&sep)
         })

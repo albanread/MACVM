@@ -911,6 +911,9 @@ fn worker_main(
     // (post-boot, post-dispatch). An idle worker's numbers are frozen, which
     // is exactly right: nothing is running.
     let mon = crate::embed::monitor_register(format!("worker {}", handle_slot(id)), "worker");
+    // Name the VM behind the row, so the Monitor can ACT on it (Send exit)
+    // rather than only display it.
+    mon.set_handle(id);
     mon.publish(handle.metrics());
     // From here on, everything the worker prints (Transcript, error traces)
     // is RECORDED, not routed. With the transcript service active (the GUI,

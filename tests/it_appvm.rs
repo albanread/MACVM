@@ -584,3 +584,64 @@ fn an_exited_vm_leaves_no_process_level_residue() {
         "the row survived its grave period"
     );
 }
+
+/// NO CALLBACK RUNS UNDER A SERVICE LOCK. `InboxSender::send` fires the
+/// receiver's wake hook — arbitrary code chosen by whoever registered the
+/// inbox — and both the timer service and the fleet used to call it while
+/// holding their own mutex. A hook that so much as ASKED either a question
+/// would then deadlock it, and a frozen timer thread has no symptom except
+/// that time stops. This registers a display whose wake does exactly that,
+/// from the thread the service delivers on, and requires the system to keep
+/// running: with the old code it hangs, which the harness reports as a
+/// timeout rather than a failure — so the assertions below are the liveness
+/// proof, not the mechanism.
+#[test]
+fn a_wake_hook_may_reenter_the_services_it_is_woken_by() {
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    primary.set_worker_boot(Arc::new(|| VmHandle::boot(opts(), Path::new("world"))));
+    let epoch = primary.primary_epoch().expect("epoch");
+    let reentered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = reentered.clone();
+
+    // The hazardous hook: woken by a send, it turns straight back around and
+    // interrogates the very services whose locks the sender might be holding.
+    let (ui_id, ui_inbox, to_primary) = primary
+        .register_hosted_worker(Arc::new(move || {
+            macvm::runtime::timer_service::has_registration(u64::MAX);
+            macvm::runtime::workers::worker_table_snapshot();
+            macvm::embed::monitor_snapshot();
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }))
+        .expect("register the display");
+    assert!(primary.set_ui_peer(ui_id));
+    let mut ui = VmHandle::boot(opts(), Path::new("world")).expect("display boots");
+    ui.install_worker_role(ui_id, to_primary);
+    ui.set_spawn_grant(epoch);
+
+    // A spawn INTRODUCES the newcomer to the display — a send, from inside the
+    // fleet's own operation. Then a ticking worker makes the timer service
+    // deliver, which is a send from inside its wheel.
+    primary
+        .exec("Tick := Worker spawn: '[ Worker onTick: [ nil ]. Worker tickEvery: 20 ] value.'.")
+        .expect("spawn a ticking worker");
+    primary
+        .exec("Tick send: #(#hello).")
+        .expect("a send the display's introduction rides alongside");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while reentered.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the wake hook never ran — the services are wedged"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Everything still answers, from this thread, while the timer keeps firing.
+    assert!(!macvm::runtime::timer_service::has_registration(u64::MAX));
+    assert!(primary.eval("(1 + 1) printString").is_ok(), "the primary lives");
+    while let Some(env) = ui_inbox.poll() {
+        let _ = ui.dispatch_hosted_envelope(env);
+    }
+    primary.exec("Tick terminate.").expect("terminate under the same hook");
+}

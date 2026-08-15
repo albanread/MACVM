@@ -193,9 +193,16 @@ full measured record is [`docs/cog_bench.md`](docs/cog_bench.md).
   message passing** (the MOP pickle) — Erlang-style share-nothing, no shared
   state, no identity across heaps, consistent with the `become:` stance below.
   A primary can hold a pool of **up to 16 concurrent worker VMs**, each
-  independently addressable (`send:onReply:` per worker) — a star topology:
-  every worker talks only to the primary, and workers don't spawn sub-workers
-  (a v1 rule the registry design doesn't preclude lifting later).
+  independently addressable (`send:onReply:` per worker). It began as a star —
+  every worker talking only to the primary — and no longer is: a worker holds
+  **peer links** to VMs it has been introduced to (the link is *learned*, not
+  registered: an envelope carries the sender's own inbox, so anyone you have
+  been messaged by, you can answer directly). An app VM drives its window by
+  messaging the display **with the primary uninvolved**. Spawning is still
+  the primary's by default — the absence *is* the policy that keeps a fleet a
+  tree — with a per-VM **grant** for the cases that have earned it (the
+  display, so it can start an app; a demo VM, so `ParallelMandel` can still
+  fan its compute workers across the cores).
   Fully asynchronous: replies run as `send:onReply:` continuations and delivery
   is event-driven — the send itself wakes the sleeping receiver (a coalesced,
   never-lost wake), so **no one ever polls for a message** and a worker with
@@ -209,9 +216,23 @@ full measured record is [`docs/cog_bench.md`](docs/cog_bench.md).
   reported as an ordinary `#workerDied` message. `ParallelMandel` measures **~2.65 CPUs of sustained
   utilization with 4 workers** on the live zooming Mandelbrot — visibly faster
   than the single-VM dive ([`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md)).
+- **Apps and demos run in VMs of their own** — not just compute workers. A
+  tool built with the declarative app framework gets a VM per app: its logic,
+  its event handlers and its pixels are computed off the main thread, and its
+  frames (spec *and* pane bytes) are shipped to the display, which owns the
+  glass and nothing else. Demos are the same shape — each has its own VM, its
+  own 60 Hz beat from the **process timer service**, and reads the keyboard
+  itself rather than being handed a formatted step. A hung demo no longer
+  hangs the environment, and a crashed one takes only its own VM.
+  **A VM ends itself and says so on the way out**: `Worker exit:` announces
+  `#vmExiting` to its peers *before* it goes, so closing a window, pressing
+  Escape in a demo, or `Send exit` from the Monitor are all *asks* rather than
+  kills — the VM runs its cleanup, closes what it opened, and leaves
+  ([`docs/process_services.md`](docs/process_services.md)).
 - **OTP-style supervision** — a supervision layer over the worker fleet:
-  MACVM has no exception system (`self error:` stops the computation
-  outright, and scoped `catch` was deliberately rejected), so a crashed
+  MACVM's exception system is deliberately small (`on:do:`/`signal:` exist —
+  `world/78_exceptions.mst` — while scoped `catch` was rejected; `self error:`
+  still stops the computation when nobody handles it), so a crashed
   worker is answered Erlang/OTP-style instead — reported as the ordinary
   `#workerDied` message above, and a `WorkerSupervisor` restarts it by
   declared policy (`#oneForOne` / `#oneForAll` / `#restForOne`), with
@@ -492,6 +513,9 @@ for direct pointers and a fast JIT.
 | [`docs/ASM.md`](docs/ASM.md) / [`docs/CANVAS.md`](docs/CANVAS.md) | Side-track designs with working preview tools: hand-written native-AArch64 methods (`<asm:>`), and the GUI Canvas widget |
 | [`docs/gamepane_design.md`](docs/gamepane_design.md) | The native Metal game engine driven from Smalltalk (MacGamePane): the frame/threading architecture, drawing/sprite/audio command channel, and the milestone ladder |
 | [`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md) | Primary/worker VM parallelism (built, M0–M4): spawn worker VMs from Smalltalk, communicate by deep-copy message passing (the MOP pickle), no shared state — Erlang-style share-nothing across heaps; capstone = the 4-worker parallel Mandelbrot |
+| [`docs/process_services.md`](docs/process_services.md) | **The layer above the VMs** (built, S1–S6): timers, the transcript, the fleet registry and game input as *process* services rather than one VM's property — plus VM lifetimes: a VM that exits itself and announces it (`Worker exit:`), the dead-row grave, and the audit of what a VM leaves behind |
+| [`docs/appspec.md`](docs/appspec.md) / [`docs/appspec_cookbook.md`](docs/appspec_cookbook.md) | The declarative app framework (built, A0–A6): a portable spec tree, per-platform realizers, panes whose pixels cross a VM boundary — and the acceptance test that WINARMVM's sprite and sound editors run here byte-unedited |
+| [`docs/multi_pane_design.md`](docs/multi_pane_design.md) | What running several demos at once would take (discussion): the threading is done, the *surface* is what is single |
 | [`docs/otp_workers_design.md`](docs/otp_workers_design.md) | OTP-style supervision over the worker fleet (built, O0–O3): restart policies (`#oneForOne`/`#oneForAll`/`#restForOne`), supervisor trees + escalation, `ServiceWorker`'s deadline-bounded request/reply, `IoWorker` adopted as the first supervised service |
 | [`docs/IMAGE.md`](docs/IMAGE.md) / [`docs/managingtheworld.md`](docs/managingtheworld.md) | The versioned SQLite world image, and the practical world/image reseed workflow (`./reseed-world.sh`) |
 | [`docs/arm64.md`](docs/arm64.md) | Machine-level design: MAP_JIT/W^X, AAPCS64, PAC, relocs, oop maps, deopt glue |
