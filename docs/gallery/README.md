@@ -63,7 +63,7 @@ the Browser while it runs.
 | ![Galaxigans](13-demo-galaxigans.png) | **Galaxigans** — a full arcade game: sprite sheets, waves, score, HUD, attract mode. |
 | ![Worms](12-demo-worms.png) | **Worms** — sprite handling and swarm movement. |
 | ![Game of Life](20-demo-life.png) | **Game of Life** — Conway, with the generation and population counted on screen. SPACE pauses; the left button *draws* live cells and the right one erases, and because drawing reads the button's held state rather than a click, dragging paints a stroke. |
-| ![Minesweeper](21-demo-minesweeper.png) | **Minesweeper** — an 18×12 field with 32 mines. Left click reveals, right click flags, SPACE deals a new board. `Minesweeper launchWithSeed: 12345` deals the same board every time, which is how its tests are written. |
+| ![Minesweeper](21-demo-minesweeper.png) | **Minesweeper** — an 18×12 field with 32 mines, played here to a real (losing) finish: hitting a mine ends the game, opens the whole field and marks the fatal square in red, with the neighbour counts in the colours everyone expects. Left click reveals, right click flags, SPACE deals a new board. `Minesweeper launchWithSeed: 12345` deals the same board every time, which is how its tests are written. |
 | ![FreeCell](22-demo-freecell.png) | **FreeCell** — the card game, dealt to Microsoft's published deal specification, so deal numbers mean what they mean everywhere else: `FreeCell launchDeal: 617` is the famously hard one, and 11982 is the one deal of the original 32000 nobody can win. Drag with the mouse; right-click sends a card up. |
 
 ### Compute
