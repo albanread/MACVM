@@ -474,6 +474,13 @@ fn verb_gui(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
         }
         "ping" => gui_request(ctx, "ping").map(Value::new),
         "rebuild" => gui_request(ctx, "rebuild").map(Value::new),
+        // Generic passthrough: any control-channel command verbatim — covers
+        // verbs without a dedicated spelling here (snapgame, gamekey, …) and
+        // whatever the channel grows next, without touching this table.
+        "raw" => {
+            let cmd = arg.ok_or_else(|| TclError::runtime("usage: gui raw <ctl command>"))?;
+            gui_request(ctx, &cmd).map(Value::new)
+        }
         "game" => {
             let entry = arg.ok_or_else(|| TclError::runtime("usage: gui game <entry doit>"))?;
             gui_request(ctx, &format!("game {entry}")).map(Value::new)

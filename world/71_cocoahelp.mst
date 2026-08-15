@@ -87,6 +87,7 @@ Object subclass: CocoaHelp [
             add: (Array with: 'Build an App'   with: #appGuideText);
             add: (Array with: 'Build a Game'   with: #gameGuideText);
             add: (Array with: 'Edit Sprites and Sounds' with: #assetEditorsText);
+            add: (Array with: 'A Little Weather App' with: #weatherGuideText);
             add: (Array with: 'Test Your Code' with: #testGuideText);
             add: (Array with: 'Automation'     with: #automationText);
             yourself)).
@@ -1425,12 +1426,12 @@ Smalltalk fits on a postcard: **everything is an object, and all you can do is s
 ## Literals
 
 ```
-42  -17  3.14159          "numbers (integers of any size)"
-$a  $?                    "characters"
-''hello world''             "strings (double the quote to escape)"
-#name  #at:put:           "symbols — interned names"
-#(1 2 3)                  "a literal array"
-true  false  nil          "the usual suspects"
+42.  -17.  3.14159.       "numbers (integers of any size)"
+$a.  $?.                  "characters"
+''hello world''.            "strings (double the quote to escape)"
+#name.  #at:put:.         "symbols — interned names"
+#(1 2 3).                 "a literal array"
+true.  false.  nil        "the usual suspects"
 ```
 
 ## Three kinds of message
@@ -1438,25 +1439,28 @@ true  false  nil          "the usual suspects"
 **Unary** — just a name, tightest binding:
 
 ```
-5 factorial          "120"
-''macvm'' size          "5"
+5 factorial.         "120"
+''macvm'' size.        "5"
 3.7 rounded          "4"
 ```
 
 **Binary** — operator-shaped, middle binding:
 
 ```
-3 + 4 * 2            "14 — strictly left to right! (3+4)*2"
-10 // 3              "3, integer division"
+3 + 4 * 2.           "14 — strictly left to right! (3+4)*2"
+10 // 3.             "3, integer division"
 ''mac'' , ''vm''         ", concatenates: ''macvm''"
 ```
 
 **Keyword** — the colons carry the arguments, loosest binding:
 
 ```
+| d array |
+d := Dictionary new.
+array := #(10 20 30 40 50).
 d at: #speed put: 88.
 7 between: 1 and: 10.
-array copyFrom: 2 to: 5.
+array copyFrom: 2 to: 5
 ```
 
 So `d at: 1 + 2 put: 3 factorial` means `d at: 3 put: 6`. Parentheses do the rest.
@@ -1466,11 +1470,13 @@ So `d at: 1 + 2 put: 3 factorial` means `d at: 3 put: 6`. Parentheses do the res
 A block is a closure in square brackets. Blocks make Smalltalk''s control flow *library code*, not syntax:
 
 ```
+| count total n limit |
+count := 3. total := 0. n := 1. limit := 40.
 [ :x | x * x ] value: 9.                       "81"
 count > 0 ifTrue: [ Transcript showCr: ''go'' ].
 1 to: 5 do: [ :i | total := total + i ].
 [ n < limit ] whileTrue: [ n := n * 2 ].
-#(3 1 2) collect: [ :e | e * 10 ].             "(30 10 20)"
+#(3 1 2) collect: [ :e | e * 10 ]              "(30 10 20)"
 ```
 
 ## Cascades and statements
@@ -1502,12 +1508,12 @@ Object subclass: Counter [
 Full ANSI-style exceptions, implemented in the world itself:
 
 ```
+| n |
 [ 10 / 0 ] on: ZeroDivide do: [ :e | Transcript showCr: e messageText ].
-
-[ risky value ] ensure: [ file close ].
-
+[ 100 sqrt ] ensure: [ Transcript showCr: ''ensured — this always runs'' ].
+n := 0.
 [ n := n + 1. n < 3 ifTrue: [ Error signal ]. n ]
-    on: Error do: [ :e | e retry ].
+    on: Error do: [ :e | e retry ]
 ```
 
 Handlers can `return:`, `retry`, `pass`, and `resume:` — the whole protocol.
@@ -1613,7 +1619,7 @@ Errors in macVM are **objects**. When something goes wrong, a signal travels out
 
 ## Signal and handle
 
-```ref
+```
 [ 1/0 ] on: ZeroDivide do: [ :e | Transcript show: e messageText. 0 ]
 ```
 
@@ -1657,7 +1663,7 @@ Inside a handler, `e` understands four ways out:
 
 An `Error` is not resumable — once raised, the computation below is abandoned. A `Warning` is: the signalling code is still there, waiting, and `resume:` continues it.
 
-```ref
+```
 [ Transcript show: (Warning signal: ''low on tea'') printString ]
     on: Warning do: [ :w | w resume: #noted ]
 ```
@@ -1693,7 +1699,7 @@ A macVM `String` is a **byte vector**: a sequence of bytes, one `Character` (0�
 
 ## The everyday verbs
 
-```ref
+```
 | parts |
 parts := ''1959,Mini,Issigonis'' splitOn: '',''.
 Transcript show: ('' | '' join: parts); cr.
@@ -1708,7 +1714,7 @@ Transcript show: (''{2} designed the {1}'' format: (Array with: (parts at: 2) wi
 
 ## Bytes are not characters
 
-```ref
+```
 ''café'' size.          "5 — bytes"
 ''café'' utf8Size.      "4 — characters"
 (''café'' codePointAt: 4). "233 — é"
@@ -1721,7 +1727,7 @@ Transcript show: (''{2} designed the {1}'' format: (Array with: (parts at: 2) wi
 
 `aString asCocoaString` wraps a real `NSString`. It speaks ordinary String protocol — `at:`, `copyFrom:to:`, `,`, comparison, `asUppercase` — but its unit is the **UTF-16 unit**, because that is NSString''s unit and AppKit''s:
 
-```ref
+```
 ''café'' asCocoaString size.            "4"
 (''café'' asCocoaString at: 4).         "$é — the character, not half its bytes"
 (''abcd'' asCocoaString rangeOf: ''bc''). "#(1 2) — 0-based, UTF-16, ready for AppKit"
@@ -1802,7 +1808,7 @@ Right-click a row and **Send exit** asks that VM to end itself — the polite fo
 
     CocoaHelp class >> appGuideText [ ^'# Guide: Build an App
 
-We are going to build a **thermometer** — drag a slider, read Celsius and Fahrenheit — twice. First live in this window, then as a program running in a **VM of its own**. Both times the routine is the same, and it is the reactive one:
+We are going to build a **temperature explorer** — twelve landmarks from absolute zero to the surface of the sun, with the name, the numbers, and a colour bar all following a slider — twice. First live in this window, then as a program running in a **VM of its own**. Both times the routine is the same, and it is the reactive one:
 
 > STATE IN, WINDOW OUT. Your code holds some state and answers a description of the whole window — a spec. An event arrives, your handler changes the state, and the window is described again. You never touch a control: what is on screen is a function of the state, so the two cannot disagree. The differ is what makes this affordable — it compares the new spec to the old and patches only what changed.
 
@@ -1817,31 +1823,76 @@ A spec is a tree of typed nodes: containers (`stack:`, `row:`, `grid:columns:`, 
 
 ## 2. Open it live
 
-This block is a complete reactive app. The state is one variable; the render block reads it; the handler writes it and asks for a rerender:
+This block is a complete reactive app — twelve landmarks, a heading, the numbers in three scales, a painted colour bar, and a slider. The state is one index; the render block reads it; the handler writes it and asks for a rerender:
 
 ```ui
-| celsius |
-celsius := 21.
-AppToolWindow register: #thermo title: ''Thermometer''
-    width: 360 height: 240
-    render: [ AppSpec window: ''Thermometer'' id: #thermoWin body: (
-        AppSpec stack: (Array
-            with: (AppSpec heading: celsius printString , '' degrees C'' id: #big)
-            with: (AppSpec slider: ''Celsius'' value: celsius
-                           min: -30 max: 50 event: #set id: #dial)
-            with: (AppSpec text: ''Fahrenheit: '' ,
-                           (celsius * 9 / 5 + 32) asFloat printString id: #fahr))
-            id: #col) ]
-    handler: [ :event :value |
-        event == #set ifTrue: [ celsius := value rounded ].
-        (AppToolWindow named: #thermo) rerender ].
-AppToolWindow open: #thermo.
+| ix stops |
+stops := OrderedCollection new.
+stops add: (Array with: ''Absolute zero'' with: -273);
+      add: (Array with: ''Liquid nitrogen'' with: -196);
+      add: (Array with: ''Dry ice'' with: -78);
+      add: (Array with: ''Water freezes'' with: 0);
+      add: (Array with: ''A warm room'' with: 20);
+      add: (Array with: ''Your body'' with: 37);
+      add: (Array with: ''A hot bath'' with: 45);
+      add: (Array with: ''Water boils'' with: 100);
+      add: (Array with: ''A pizza oven'' with: 450);
+      add: (Array with: ''Flowing lava'' with: 1200);
+      add: (Array with: ''Steel melts'' with: 1500);
+      add: (Array with: ''Surface of the sun'' with: 5500).
+ix := 6.
+AppToolWindow register: #scale title: ''The Scale of Everything''
+    width: 600 height: 300
+    render: [ | s c |
+        s := stops at: ix. c := s at: 2.
+        AppSpec window: ''The Scale of Everything'' id: #scaleWin body: (
+            AppSpec stack: (Array
+                with: (AppSpec heading: (s at: 1) id: #name)
+                with: (AppSpec text: c printString , '' C     '' ,
+                        (c * 9 / 5 + 32) rounded printString , '' F     '' ,
+                        (c + 273) printString , '' K'' id: #cfk)
+                with: (AppSpec rgbaPane: #bar width: 552 height: 30)
+                with: (AppSpec slider: ''Colder to hotter'' value: ix
+                        min: 1 max: stops size event: #pick id: #dial))
+                id: #col) ]
+    handler: [ :e :v |
+        e == #pick ifTrue: [ ix := (v rounded max: 1) min: stops size ].
+        (AppToolWindow named: #scale) invalidatePane: #bar.
+        (AppToolWindow named: #scale) rerender ]
+    paint: [ :tool :paneId :region | | h w ph plane stride c r g b hot cold fill y x word |
+        h := tool paneHandle: #bar.
+        w := AppRender widthFor: h. ph := AppRender heightFor: h.
+        plane := AppPixels planeFor: h width: w height: ph.
+        plane isNil ifFalse: [
+            stride := AppPixels strideFor: h.
+            c := (stops at: ix) at: 2.
+            c < 0
+                ifTrue: [ r := 40. g := (90 + (c // 4)) max: 0. b := 255 ]
+                ifFalse: [ c < 100
+                    ifTrue: [ r := (60 + (c * 2)) min: 255. g := 170. b := 200 - c ]
+                    ifFalse: [ c < 1500
+                        ifTrue: [ r := 255. g := (60 + (c // 12)) min: 255. b := 40 ]
+                        ifFalse: [ r := 255. g := 220. b := (120 + (c // 60)) min: 255 ] ] ].
+            hot := AppPixels bgraR: r g: g b: b.
+            cold := AppPixels bgraR: 58 g: 58 b: 64.
+            fill := w * ix // stops size.
+            y := 0.
+            [ y < ph ] whileTrue: [
+                x := 0.
+                [ x < w ] whileTrue: [
+                    word := x < fill ifTrue: [ hot ] ifFalse: [ cold ].
+                    AppPixels at: plane x: x y: y stride: stride put: word.
+                    x := x + 1 ].
+                y := y + 1 ].
+            AppRender present: h ] ].
+AppToolWindow open: #scale.
 ```
 
-Drag the slider. The heading and the Fahrenheit line follow — that is the handler writing `celsius` and the rerender describing the window again. Two things worth noticing in the code:
+Drag the slider from absolute zero to the sun. The name, the three temperature scales and the bar all follow — cold is blue, a warm room is green, lava is red, the sun is white-hot. Things worth noticing:
 
-- The state lives in the **closure**. No class, no instance variables — for a window this size, a block''s own captured variable is enough.
-- `asFloat` is doing real work: `37 * 9 / 5` is Smalltalk arithmetic, so it is the *exact* fraction `333/5` until you ask for a Float. Leave it off and your thermometer reads `493/5` — precisely correct and no use to anybody.
+- The state is **one index in a closure**. No class, no instance variables — the whole window is a function of `ix`.
+- The controls patch; the **bar is painted**. A spec places an `rgbaPane` and the `paint:` block fills it with pixels — `planeFor:` hands you the surface, `bgraR:g:b:` makes a pixel, `present:` shows it. Controls are the framework''s; pixels are yours. The handler says `invalidatePane:` because only it knows the bar''s contents changed — a diff of the spec never could.
+- The Fahrenheit line says `rounded`, and it matters: `37 * 9 / 5 + 32` is *exact* Smalltalk arithmetic — the fraction `493/5` — until you decide how to show it. Landmarks read best as whole degrees.
 
 Run the block again and you get a fresh registration and a fresh window; close the spare — close **hides** a tool window, so your state survives it.
 
@@ -1852,7 +1903,7 @@ The framework counts its own work, and the counters are the proof of the id disc
 ```ui
 Transcript showCr: ''patches: '' , AppToolWindow patchCount printString ,
     ''  rebuilds: '' , AppToolWindow rebuildCount printString.
-(AppToolWindow named: #thermo) dispatch: #set value: 37.
+(AppToolWindow named: #scale) dispatch: #pick value: 12.
 Transcript showCr: ''patches: '' , AppToolWindow patchCount printString ,
     ''  rebuilds: '' , AppToolWindow rebuildCount printString.
 ```
@@ -1880,25 +1931,28 @@ Three VMs share the work, and each does one thing. The **primary** spawns the ap
 A tool that can be launched this way is just a class that answers `spec` and takes `handle:value:` — the same two messages as step 2, so **a tool does not know or care which side of a VM boundary it is on**:
 
 ```ref
-Object subclass: Thermometer [
-    <classVars: Celsius>
-    Thermometer class >> celsius [ ^Celsius isNil ifTrue: [ 21 ] ifFalse: [ Celsius ] ]
-    Thermometer class >> spec [
-        ^AppSpec window: ''Thermometer'' id: #thermoWin body: ( "...as step 2..." )
+Object subclass: TempScale [
+    <classVars: Ix>
+    TempScale class >> ix [ ^Ix isNil ifTrue: [ 6 ] ifFalse: [ Ix ] ]
+    TempScale class >> stops [ "...the twelve landmark Arrays from step 2..." ]
+    TempScale class >> spec [
+        ^AppSpec window: ''The Scale of Everything'' id: #scaleWin body: ( "...as step 2..." )
     ]
-    Thermometer class >> handle: event value: value [
-        event == #set ifTrue: [ Celsius := value rounded ]
+    TempScale class >> handle: event value: value [
+        event == #pick ifTrue: [ Ix := (value rounded max: 1) min: self stops size ]
     ]
-    Thermometer class >> install [
-        AppToolWindow register: #thermo title: ''Thermometer'' width: 360 height: 240
-            render: [ Thermometer spec ]
-            handler: [ :e :v | Thermometer handle: e value: v.
-                               (AppToolWindow named: #thermo) rerender ]
+    TempScale class >> install [
+        AppToolWindow register: #scale title: ''The Scale of Everything'' width: 600 height: 300
+            render: [ TempScale spec ]
+            handler: [ :e :v | TempScale handle: e value: v.
+                               (AppToolWindow named: #scale) invalidatePane: #bar.
+                               (AppToolWindow named: #scale) rerender ]
+            paint: [ :tool :paneId :region | "...the bar, as step 2..." ]
     ]
 ]
 ```
 
-One rule matters here: a spawned VM boots **the world**, not your Workspace — a class defined in a doit exists only in the VM that ran the doit. So a tool headed for its own VM lives in a world file: write it in the **Editor** tab and use **Add to World**, or drop the file in `world/` yourself, add it to `world.list`, and reseed (`./reseed-world.sh` — the app boots from the image, not from `.mst` files). Then `AppVmHost start: #thermo tool: ''Thermometer''` — or a Tools-menu entry — runs it in a VM of its own.
+One rule matters here: a spawned VM boots **the world**, not your Workspace — a class defined in a doit exists only in the VM that ran the doit. So a tool headed for its own VM lives in a world file: write it in the **Editor** tab and use **Add to World**, or drop the file in `world/` yourself, add it to `world.list`, and reseed (`./reseed-world.sh` — the app boots from the image, not from `.mst` files). Then `AppVmHost start: #scale tool: ''TempScale''` — or a Tools-menu entry — runs it in a VM of its own.
 
 ## 6. Pixels, and the escape hatch
 
@@ -2187,6 +2241,72 @@ The games in the **Demos** menu draw 16-colour sprites and play parametric sound
 A sheet class is ordinary source **in the image**: it shows up in the Browser, survives with your world, and a demo uses it by name. That is the whole pipeline — no asset folders, no export step, no formats. Draw, save, and the class is already wherever the image goes.
 
 > Both editors keep their state when closed — the window hides rather than dies, so reopening is instant and your work-in-progress is still on the grid.
+' ]
+
+    CocoaHelp class >> weatherGuideText [ ^'# Guide: A Little Weather App
+
+The Sockets page taught the wire and Build an App taught reactive windows. This guide joins them: a real internet program — city in, forecast out — in one runnable block. It talks plain HTTP to `wttr.in`, a weather service that answers a single friendly line.
+
+> This one needs the network. Without it, the app still opens and tells you honestly that the fetch failed.
+
+## The whole app
+
+```ui
+| city report fetch |
+city := ''London''.
+report := ''Press Fetch.''.
+fetch := [ :place |
+    | crlf addrs v4 s rc req all mark i |
+    crlf := (String with: (Character value: 13)) , (String with: (Character value: 10)).
+    addrs := Dns blockingResolve: ''wttr.in''.
+    v4 := addrs detect: [ :a | (a includesSubstring: '':'') not ] ifNone: [ nil ].
+    v4 isNil
+        ifTrue: [ ''no address — is the network up?'' ]
+        ifFalse: [
+            s := Socket domain: Posix afInet type: Posix sockStream protocol: 0.
+            rc := s connectTo: (InetAddress fromString: v4) port: 80.
+            rc < 0
+                ifTrue: [ s close. ''connect failed (errno '' , Posix errno printString , '')'' ]
+                ifFalse: [
+                    req := ''GET /'' , place , ''?format=3 HTTP/1.1'' , crlf ,
+                           ''Host: wttr.in'' , crlf , ''User-Agent: curl'' , crlf ,
+                           ''Connection: close'' , crlf , crlf.
+                    s send: req.
+                    all := ''''.
+                    [ | chunk | chunk := s receiveUpTo: 4096.
+                      (chunk isNil or: [ chunk isEmpty ])
+                          ifTrue: [ false ]
+                          ifFalse: [ all := all , chunk. true ] ] whileTrue.
+                    s close.
+                    mark := crlf , crlf.
+                    i := all indexOfSubstring: mark startingAt: 1.
+                    i = 0 ifTrue: [ all ] ifFalse: [
+                        (all copyFrom: i + 4 to: all size) trimSeparators ] ] ] ].
+AppToolWindow register: #weather title: ''Weather''
+    width: 460 height: 220
+    render: [ AppSpec window: ''Weather'' id: #weatherWin body: (
+        AppSpec stack: (Array
+            with: (AppSpec heading: ''A little weather app'' id: #head)
+            with: (AppSpec input: ''City'' value: city event: #city id: #where)
+            with: (AppSpec button: ''Fetch'' event: #go id: #fetchBtn)
+            with: (AppSpec text: report id: #out))
+            id: #col) ]
+    handler: [ :e :v |
+        e == #city ifTrue: [ city := v ].
+        e == #go ifTrue: [ report := fetch value: city ].
+        (AppToolWindow named: #weather) rerender ].
+AppToolWindow open: #weather.
+```
+
+Type a city, press **Fetch**, and the last line becomes something like `London: 🌤 +26°C` — pulled off the wire by the same `Socket`, `Dns` and `InetAddress` you met on the Sockets page, and put on screen by the same reactive loop you met in Build an App.
+
+## What to notice
+
+- **The whole HTTP client is visible.** Resolve the name, connect to port 80, write a request ending in a blank line, read until the connection closes, take what follows the header block. No library between you and the protocol — which is the point: when you can see the wire, you can speak anything over it.
+- **Two events, one loop.** Typing fires `#city` with the field''s text; the button fires `#go`. Both just change state and rerender — the reactive routine does not care whether an event came from a keystroke or a network round-trip.
+- **The fetch blocks, briefly.** This block runs in the interface VM, so the window holds its breath for the round-trip — fine for half a second. A grown-up version is exactly the Build an App step 5 move: put the tool in a class, run it in a VM of its own, and the interface never waits on the internet again.
+- **The forecast''s little cloud** arrives as UTF-8 bytes in an ordinary byte-String and renders fine — the boundary rules from Strings and Text at work.
+- It is plain HTTP on purpose: macVM speaks raw TCP, and `wttr.in` is one of the services that still answers it. TLS is a realizer-sized project for another day.
 ' ]
 
     CocoaHelp class >> testGuideText [ ^'# Guide: Test Your Code

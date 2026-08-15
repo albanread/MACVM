@@ -549,7 +549,9 @@ Object subclass: CocoaRealize [
         a key == #text ifTrue: [
             t == #button
                 ifTrue: [ ^view onMain setTitle: a value asString ]
-                ifFalse: [ ^view onMain setStringValue: a value asString ] ].
+                ifFalse: [
+                    view onMain setStringValue: a value asString.
+                    ^self widen: view toFit: a value asString ] ].
         a key == #value ifTrue: [
             t == #input ifTrue: [ ^view onMain setStringValue: a value asString ].
             t == #select ifTrue: [ ^self fill: view from: node ].
@@ -559,6 +561,28 @@ Object subclass: CocoaRealize [
         a key == #options ifTrue: [
             t == #select ifTrue: [ ^self fill: view from: node ].
             ^self ].
+        ^self
+    ]
+
+    "A PATCH MAY CARRY LONGER TEXT THAN THE CONTROL REALIZED AT — the layout
+     measured the spec of the moment, and a later state has no duty to stay
+     short (the Scale of Everything''s heading patched from ''Your body'' to
+     ''Surface of the sun'' and lost its sun). The differ cannot say ''and
+     now re-measure''; only this side knows glyph widths. So a text patch
+     keeps the frame when the new text fits and GROWS the frame when it does
+     not — never shrinks (a static has no stretch-to-fill, so erring wide is
+     free, and shrink-grow cycles would read as a tic). Height stays: growth
+     is horizontal, the direction a one-line static clips in."
+    widen: view <Object> toFit: aString <String> [
+        | cell size w frame |
+        cell := view onMain cell.
+        cell isNil ifTrue: [ ^self ].
+        size := cell onMain cellSize.
+        (size isKindOf: Array) ifFalse: [ ^self ].
+        w := (size at: 1) + 4.
+        frame := view onMain frame.
+        (frame at: 3) >= w ifTrue: [ ^self ].
+        view onMain setFrameSize: (Array with: w with: (frame at: 4)).
         ^self
     ]
 

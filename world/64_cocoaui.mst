@@ -81,7 +81,7 @@ Object subclass: CocoaUI [
                 TranscriptMenuItem TranscriptSplit TranscriptDock
                 JitOn JitMenuItem
                 WorkspaceContainer
-                HaltOn HaltMenuItem MetricViews
+                HaltOn HaltMenuItem MetricViews CtlResult
                 WinToolbar ToolbarDelegate ToolbarItems MetricsHost
                 ToolbarIdentArray ToolbarSpecs ViewItemSpecs
                 Theme ThemeMenuItems
@@ -2148,6 +2148,42 @@ Object subclass: CocoaUI [
     ]
 
     CocoaUI class >> window [ ^Win ]
+
+    "── ctl routing: run on the PRIMARY from the control channel ──────────
+     The ctl channel's own `doit`/`eval` reach only THIS (interface) VM.
+     These two are the primary road for scripts: `pdoit:` posts the source
+     through the same door the Workspace uses and parks the reply's
+     printString; `ctlTake` answers-and-clears it (#pending until the beat
+     delivers). Poll: gui eval {CocoaUI pdoit: '...'} … {CocoaUI ctlTake}."
+    CocoaUI class >> pdoit: aSource [
+        CtlResult := nil.
+        Worker uiDoit: aSource onReply: [ :r | CtlResult := r printString ].
+        ^'sent'
+    ]
+    CocoaUI class >> ctlTake [
+        | r |
+        r := CtlResult.
+        r isNil ifTrue: [ ^'#pending' ].
+        CtlResult := nil.
+        ^r
+    ]
+
+    "Window routing: snapshot any window by its TITLE — tool windows, app
+     windows, game panes — not just the main one. Answers true on a write."
+    CocoaUI class >> snapshotWindowTitled: aTitle to: aPath [
+        | app wins n found |
+        app := (Cocoa classNamed: 'NSApplication') onMain sharedApplication.
+        wins := app onMain windows.
+        n := wins sendI64: 'count'.
+        found := nil.
+        0 to: n - 1 do: [ :i | | w |
+            w := wins send: 'objectAtIndex:' with: i.
+            (found isNil and: [ (w sendString: 'title') = aTitle ])
+                ifTrue: [ found := w ] ].
+        found isNil ifTrue: [ ^false ].
+        self snapshotWindow: found to: aPath.
+        ^true
+    ]
     CocoaUI class >> transcriptView [ ^Transcript ]
     "Scripting hooks (rusttcl `gui`) — the toolbar item for an identifier,
      for a test that wants to assert on its state. The A-/A+ actions
