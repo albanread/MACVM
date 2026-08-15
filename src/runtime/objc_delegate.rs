@@ -123,6 +123,33 @@ enum RetShape {
 
 // ── the generic dispatcher: one top-level entry per callback ─────────────────
 
+/// The Bool-shaped selectors that are QUERIES — reads answered from world-side
+/// snapshots — and so belong on the pass side of the busy-door in [`dispatch`].
+/// The whole Bool surface is four selectors, and they split two and two:
+///
+///   `outlineView:isItemExpandable:` — a data-source read, delivered in the
+///   same synchronous reload batch as its Id/Int siblings. AppKit CACHES the
+///   answer per row, so a refusal is not deferred, it is WRONG: the outline
+///   builds with expandable=false and draws no disclosure triangles.
+///
+///   `application:delegateHandlesKey:` — the scripting-KVC capability probe
+///   (docs/applescript_design.md). A pure read of the world's key table;
+///   refusing it makes a property vanish mid-script, a spurious failure.
+///
+///   `windowShouldClose:` / `applicationShouldTerminateAfterLastWindowClosed:`
+///   — consents to user/app actions. NOT here: answering NO while busy is the
+///   deferral the door exists for — the user closes again at idle.
+///
+/// A new Bool-returning delegate method must be classified here on the day it
+/// is registered: leave it out and it is refused while the VM is busy, which
+/// for a cached read means permanently wrong UI, not a delay.
+fn is_bool_query(selector: &str) -> bool {
+    matches!(
+        selector,
+        "outlineView:isItemExpandable:" | "application:delegateHandlesKey:"
+    )
+}
+
 /// The shared body of every IMP: resolve the delegate, guard staleness, read the
 /// thread-local UI worker `VmHandle`, and run the handler as a **top-level entry**
 /// through the recovery door. Returns the marshaled native result, or the
@@ -153,8 +180,7 @@ fn dispatch(this: *mut c_void, selector: &str, args: &[ArgVal], ret: RetShape) -
     }
     // THE UI VM DOES ONE THING AT A TIME (the author's rule). While the
     // thread is inside ANY guest entry, this synchronous door lets QUERIES
-    // through and refuses EVENTS, and the return shape is what tells them
-    // apart:
+    // through and refuses EVENTS:
     //
     //   Id / Int — a data-source or toolbar READ (row counts, cell values,
     //   toolbar items). These have nested inside execs since CG5 — a
@@ -169,7 +195,21 @@ fn dispatch(this: *mut c_void, selector: &str, args: &[ArgVal], ret: RetShape) -
     //   the interleaving the rule forbids: refused with the shape default
     //   (a close answers NO, an action does nothing) — the user acts again
     //   when the VM is idle, and every queued path is unaffected.
-    if crate::embed::guest_active() && matches!(ret, RetShape::Void | RetShape::Bool) {
+    //
+    // Return shape was the FIRST classifier here, and it was one selector too
+    // coarse: query-vs-event is a property of the SELECTOR, and Bool has
+    // members on both sides. `outlineView:isItemExpandable:` is a data-source
+    // read in the same synchronous reload batch as `child:ofItem:` (Id) and
+    // `numberOfChildrenOfItem:` (Int) — refusing it handed AppKit `NO`
+    // mid-exec, and since reloads RUN inside refresh execs, every outline
+    // cached expandable=false at build time, drew no disclosure triangles,
+    // and tree expansion broke app-wide (Browser v2, the Outliner, Help).
+    // Bisected to the door's first cut (a1c2595); [`is_bool_query`] now names
+    // the Bool-shaped reads that belong with the queries.
+    if crate::embed::guest_active()
+        && matches!(ret, RetShape::Void | RetShape::Bool)
+        && !is_bool_query(selector)
+    {
         return 0;
     }
     // SAFETY: the UI worker's `VmHandle` outlives the run loop (design §3 step 4;
@@ -1231,6 +1271,13 @@ pub fn new_delegate(role: &str, gen: u64, ticket: i64) -> Result<*mut c_void, St
 mod tests {
     use super::*;
 
+    /// Serializes the tests that publish a sentinel `VmHandle`: `publish_ui_vm`
+    /// bumps the process-wide generation, so two publishers interleaved would
+    /// make each other's freshly-registered entries STALE — and a stale entry
+    /// fails closed at the generation gate, letting the assertion pass for the
+    /// wrong reason. One publisher at a time keeps each pin honest.
+    static PUBLISH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The stale-fail-closed guard is a pure decision on the entry's generation
     /// vs. the process's current one — provable with no ObjC and no VM. A missing
     /// instance and a generation mismatch both fail closed (answer the default,
@@ -1286,6 +1333,7 @@ mod tests {
     /// before `&mut *vmp`.
     #[test]
     fn reentrant_callback_fails_closed_before_vm_borrow() {
+        let _serial = PUBLISH_LOCK.lock().unwrap();
         // Publish FIRST (this bumps the generation), THEN read the now-current
         // generation and register under it — so the entry is NOT stale and the
         // only thing that can make `dispatch` return early is the callback guard.
@@ -1309,6 +1357,65 @@ mod tests {
 
         // Restore all thread/process state this test perturbed.
         crate::embed::set_callback_active_for_test(false);
+        crate::embed::publish_ui_vm(std::ptr::null_mut());
+        DELEGATES
+            .get()
+            .unwrap()
+            .write()
+            .unwrap()
+            .remove(&(inst as usize));
+    }
+
+    /// The busy-door's per-selector split — the pin for the a1c2595 regression
+    /// (tree expansion broke app-wide because `outlineView:isItemExpandable:`,
+    /// a Bool-shaped data-source READ, was refused with the consents). Two
+    /// halves are provable here without a VM:
+    ///
+    ///   - the classification itself, over the WHOLE Bool surface (four
+    ///     selectors, two per side) — a new Bool delegate method that skips
+    ///     [`is_bool_query`] shows up as a missing line here;
+    ///   - that consents and Void events still fail closed AT THE DOOR while a
+    ///     guest entry is live: the published `VmHandle` is the unmapped 0x1
+    ///     sentinel, so a clean `0` proves the refusal happened before the
+    ///     borrow — if the door let one through, this test would crash.
+    ///
+    /// The pass side (`isItemExpandable:` reaching a real VM mid-exec) needs a
+    /// live outline reload and is gated end-to-end by the Browser v2 probe:
+    /// 3 rows / expandable=false at a1c2595 → 199 rows / expandable=true with
+    /// the split in place.
+    #[test]
+    fn busy_door_refuses_consents_but_classifies_bool_queries_out() {
+        // The whole Bool-shaped delegate surface, both sides of the split.
+        assert!(is_bool_query("outlineView:isItemExpandable:"));
+        assert!(is_bool_query("application:delegateHandlesKey:"));
+        assert!(!is_bool_query("windowShouldClose:"));
+        assert!(!is_bool_query("applicationShouldTerminateAfterLastWindowClosed:"));
+
+        let _serial = PUBLISH_LOCK.lock().unwrap();
+        let sentinel = 0x1_usize as *mut crate::embed::VmHandle; // page 0 — unmapped
+        crate::embed::publish_ui_vm(sentinel);
+        let gen = crate::embed::current_ui_vm_generation();
+        let inst = 0x3000_usize as *mut c_void;
+        DELEGATES
+            .get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+            .write()
+            .unwrap()
+            .insert(inst as usize, DelegateEntry { gen, ticket: 1 });
+
+        {
+            let _busy = crate::embed::GuestEntry::enter();
+            assert_eq!(
+                dispatch(inst, "windowShouldClose:", &[], RetShape::Bool),
+                0,
+                "a Bool CONSENT must still be refused at the busy-door"
+            );
+            assert_eq!(
+                dispatch(inst, "windowWillClose:", &[], RetShape::Void),
+                0,
+                "a Void EVENT must still be refused at the busy-door"
+            );
+        }
+
         crate::embed::publish_ui_vm(std::ptr::null_mut());
         DELEGATES
             .get()
