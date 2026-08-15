@@ -380,3 +380,60 @@ fn the_display_spawns_an_app_vm_with_the_primary_uninvolved() {
         ) == "'clicks: 1'"
     });
 }
+
+/// CROSS-VM PANES (the design that lets the sprite editor run in its own
+/// VM): the tool's paint blocks run in the APP's VM against local planes;
+/// each frame ships the plane bytes beside the spec; the display copies them
+/// into its own surface and presents. Proven by pixels: a click paints a
+/// cell in the app VM, and the DISPLAY's surface shows that cell's colour.
+#[test]
+fn a_pane_tools_pixels_cross_to_the_displays_surface() {
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    primary.set_worker_boot(Arc::new(|| VmHandle::boot(opts(), Path::new("world"))));
+    let epoch = primary.primary_epoch().expect("epoch");
+    let (ui_id, ui_inbox, to_primary) = primary
+        .register_hosted_worker(Arc::new(|| {}))
+        .expect("register the display");
+    assert!(primary.set_ui_peer(ui_id));
+    let mut ui = VmHandle::boot(opts(), Path::new("world")).expect("display boots");
+    ui.install_worker_role(ui_id, to_primary);
+    ui.set_spawn_grant(epoch);
+    ui.exec("AppVmDisplay install.").expect("display listens");
+
+    // The display spawns the PANE tool in its own VM, under the tool's own id.
+    ui.exec(concat!(
+        "PaneApp := Worker spawn: ",
+        "'AppVmClient serve: ''AppDemoPane'' as: #panedemo.'."
+    ))
+    .expect("spawn the pane tool's VM");
+    drain_until(&mut ui, &ui_inbox, "waiting for the pane tool's frame", |ui| {
+        eval(ui, "(AppVmDisplay frameFor: #panedemo) isNil not printString") == "'true'"
+    });
+    assert_eq!(
+        eval(&mut ui, "(((AppToolWindow named: #panedemo) paneHandle: #grid) > 0) printString"),
+        "'true'",
+        "the display-side window realized the pane with a surface"
+    );
+
+    // A click in the pane, at cell (3,2) — the event crosses to the app VM,
+    // its paint block colours the cell in ITS plane, and the blit brings the
+    // pixels back to THIS surface.
+    ui.exec(concat!(
+        "(AppToolWindow named: #panedemo) dispatch: #grid ",
+        "value: (Array with: 3 * AppDemoPane cellSize + 5 with: 2 * AppDemoPane cellSize + 5)."
+    ))
+    .expect("the click ships");
+    drain_until(&mut ui, &ui_inbox, "waiting for the painted cell to cross", |ui| {
+        eval(
+            ui,
+            concat!(
+                "[ | w h plane stride | w := AppToolWindow named: #panedemo. ",
+                "h := w paneHandle: #grid. ",
+                "plane := AppPixels planeFor: h width: AppDemoPane paneSize height: AppDemoPane paneSize. ",
+                "stride := AppPixels strideFor: h. ",
+                "((AppPixels at: plane x: 3 * AppDemoPane cellSize + 4 y: 2 * AppDemoPane cellSize + 4 stride: stride) ",
+                "= (AppDemoPane bgraOf: 1)) printString ] value"
+            ),
+        ) == "'true'"
+    });
+}

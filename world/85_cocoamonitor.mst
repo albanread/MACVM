@@ -394,4 +394,7 @@ Object subclass: CocoaMonitorFace [
     numberOfRowsInTableView: aTable [ ^CocoaMonitor rowCount ]
     tableView: aTable objectValueForTableColumn: aCol row: aRow [
         ^CocoaMonitor valueAtCol: aCol row: aRow ]
+    "The C6 door forwards SELECTION notifications too (objc_delegate.rs's
+     selector set) — a face without this arm raised on every row click."
+    tableViewSelectionDidChange: aNote [ ^self ]
 ]

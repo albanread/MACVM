@@ -46,6 +46,13 @@ ArrayedCollection subclass: String [
     ]
     compare: other <String> ^ <Integer> [
         <primitive: 45>
+        "The primitive fails only for a non-byte argument. WITHOUT this body a
+         failed prim-45 answered SELF, so `'x' < 1` became `('x' compare: 1) < 0`
+         = `'x' < 0` — the same method, recursing to a FATAL operand-stack
+         overflow that `on: Error` could not catch. (Found because a test typo'd
+         `h > 0 printString`, which parses as `h > '0'`.) An honest raise turns
+         the typo into a catchable error."
+        self error: 'compare: expects a String, got ' , other class name
     ]
     = other <Object> ^ <Boolean> [
         other isString ifFalse: [ ^false ].

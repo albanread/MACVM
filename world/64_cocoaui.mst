@@ -1436,12 +1436,13 @@ Object subclass: CocoaUI [
      item fires. An app already registered is simply fronted — the setting
      decides how a thing STARTS, never what an open window does.
 
-     A TOOL WITH PANES STAYS IN-PROCESS whatever the setting says, and says so
-     rather than opening a window with dead pixels: a paint block runs in the
-     app's VM while the pane's surface belongs to the display's realizer, and
-     cross-VM pane painting is not built (docs/appspec.md, the A6 open list).
-     The controls would work and the drawing would not, which is exactly the
-     invisible-failure this framework keeps refusing to ship."
+     PANE TOOLS CROSS THE BOUNDARY TOO (the A6 open-list item, closed): the
+     tool paints its planes in ITS OWN VM — the null realizer gives it real
+     surfaces — and every publish ships the plane bytes beside the spec; the
+     display bulk-copies them into its surface and presents
+     (AppVmDisplay>>applyBlit:to:, proven by pixel in tests/it_appvm.rs). So
+     the in-process exception this method used to carve out is gone: the
+     sprite editor in its own VM draws."
     "A DEMO RUNS ON THE PRIMARY, and Debug > 'Launch in own VM' does not move
      it — the honest answer rather than a checkbox that quietly means nothing.
      A demo is a 60 Hz frame loop, and the pump that drives it is the
@@ -1467,14 +1468,11 @@ Object subclass: CocoaUI [
 
     CocoaUI class >> launchApp: anId tool: aClassName panes: hasPanes [
         (AppToolWindow named: anId) isNil ifFalse: [ ^AppToolWindow open: anId ].
-        (self launchInOwnVm and: [ hasPanes not ]) ifTrue: [
+        self launchInOwnVm ifTrue: [
             ^Worker uiRequest: #doitq
                 args: (Array with: 'AppVmHost start: #' , anId asString
                                   , ' tool: ''' , aClassName , '''')
                 onReply: [ :x | nil ] ].
-        (self launchInOwnVm and: [ hasPanes ]) ifTrue: [
-            self appendTranscript: anId printString ,
-                ': in-process — a pane''s pixels cannot cross a VM boundary yet' ].
         (Worker classNamed: aClassName asSymbol) ifNotNil: [ :c | c install ].
         ^AppToolWindow open: anId
     ]

@@ -547,4 +547,6 @@ Object subclass: CocoaTestsFace [
     numberOfRowsInTableView: aTable [ ^CocoaTests rowCount ]
     tableView: aTable objectValueForTableColumn: aCol row: aRow [
         ^CocoaTests valueAtCol: aCol row: aRow ]
+    "Selection notifications arrive through the same door; quiet no-op."
+    tableViewSelectionDidChange: aNote [ ^self ]
 ]

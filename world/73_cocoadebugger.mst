@@ -444,4 +444,7 @@ Object subclass: CocoaDebugger [
 Object subclass: CocoaDebuggerFace [
     numberOfRowsInTableView: aTable [ ^CocoaDebugger stackRowCount ]
     tableView: aTable objectValueForTableColumn: aCol row: aRow [ ^CocoaDebugger stackValueAt: aRow ]
+    "The door forwards selection changes; answered quietly (frame selection
+     is not a debugger gesture today — clicking rows used to raise)."
+    tableViewSelectionDidChange: aNote [ ^self ]
 ]

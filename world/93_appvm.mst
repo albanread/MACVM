@@ -49,6 +49,22 @@ Object subclass: AppVmClient [
     AppVmClient class >> serve: aToolClassName <String> as: anAppId <Symbol> [
         Tool := Worker classNamed: aToolClassName asSymbol.
         AppId := anAppId.
+        "PANE TOOLS RUN WHOLE, HERE (docs/process_services.md; the cross-VM
+         pane design): if the tool installs an AppToolWindow — under the SAME
+         id this app was started as — that window opens LOCALLY on the null
+         realizer, whose panes get REAL surfaces. The tool's own paint blocks
+         then run in THIS VM against local planes, and publish ships the
+         plane bytes with each frame. A tool with no install (a plain
+         spec+handler tool) keeps the original spec-only path."
+        "THIS VM HAS NO GLASS. A GUI-spawned app boots the full image, so the
+         late-bound realizer sweep would FIND CocoaRealize here — and realize
+         AppKit from a worker thread. Pin the null realizer first: the local
+         window is a model with real headless surfaces; the display owns Cocoa."
+        AppToolWindow realizerClass: AppNullRealizer.
+        (Tool isNil not and: [ (AppToolWindow named: AppId) isNil ]) ifTrue: [
+            [ Tool install ] on: Error do: [ :e | nil ] ].
+        (AppToolWindow named: AppId) isNil ifFalse: [
+            (AppToolWindow named: AppId) open ].
         "A SPAWNED worker drains through `dispatchPending`, so its inbound
          messages arrive at the `onMessage:` handler — unlike the UI worker,
          which is shape-routed. The two halves of this file use different
@@ -57,17 +73,66 @@ Object subclass: AppVmClient [
         ^self publish
     ]
 
+    "The local window, when the tool installed one under our id."
+    AppVmClient class >> localWindow ^ <Object> [
+        AppId isNil ifTrue: [ ^nil ].
+        ^AppToolWindow named: AppId
+    ]
+
+    "Every pane's whole plane, as {paneId. width. height. bytes} — the pixels
+     the display cannot compute (they are the tool's) shipped beside the spec
+     it can. Whole planes, v1: damage-rect subsetting is a recorded
+     optimization, not a correctness need."
+    AppVmClient class >> paneBlits ^ <Object> [
+        | w spec out |
+        w := self localWindow.
+        w isNil ifTrue: [ ^nil ].
+        spec := w lastSpec.
+        spec isNil ifTrue: [ ^nil ].
+        out := OrderedCollection new.
+        self collectPanesOf: spec body into: out window: w.
+        ^out isEmpty ifTrue: [ nil ] ifFalse: [ out asArray ]
+    ]
+
+    AppVmClient class >> collectPanesOf: aNode <Object> into: out <OrderedCollection> window: w <Object> [
+        | h plane |
+        aNode isNil ifTrue: [ ^self ].
+        (AppSpec paneTypes includes: aNode type) ifTrue: [
+            h := w paneHandle: aNode idOrEmpty.
+            h = 0 ifFalse: [
+                plane := AppPixels planeFor: h
+                    width: (AppRender widthFor: h) height: (AppRender heightFor: h).
+                plane isNil ifFalse: [
+                    out add: (Array with: aNode idOrEmpty
+                                    with: (AppRender widthFor: h)
+                                    with: (AppRender heightFor: h)
+                                    with: plane copy) ] ] ].
+        aNode children do: [ :c | self collectPanesOf: c into: out window: w ].
+        ^self
+    ]
+
     AppVmClient class >> tool ^ <Object> [ ^Tool ]
     AppVmClient class >> appId ^ <Object> [ ^AppId ]
 
     "A FRAME. Sent straight to the display — the primary is not consulted and
      does not see it."
     AppVmClient class >> publish [
-        | spec |
+        | spec blits w |
         Worker hasUi ifFalse: [ ^self ].
         spec := self currentSpec.
         spec isNil ifTrue: [ ^self ].
-        Worker ui send: (Array with: #appFrame with: AppId with: spec).
+        "THE WINDOW'S GEOMETRY RIDES THE SPEC ROOT: the tool registered its
+         window at a size the display cannot otherwise know — the registration
+         lives in THIS VM. Without it the display guessed 520x640 and the
+         sprite editor's 1020x720 layout crushed panes over controls."
+        w := self localWindow.
+        w isNil ifFalse: [
+            spec at: #width put: w width.
+            spec at: #height put: w height ].
+        blits := self paneBlits.
+        blits isNil
+            ifTrue: [ Worker ui send: (Array with: #appFrame with: AppId with: spec) ]
+            ifFalse: [ Worker ui send: (Array with: #appFrame with: AppId with: spec with: blits) ].
         ^self
     ]
 
@@ -78,9 +143,16 @@ Object subclass: AppVmClient [
          it costs the app rather than the display. A handler that raises must
          not take its own VM down: the app keeps its last frame and the window
          keeps showing it."
-        Tool isNil ifFalse: [
-            [ Tool handle: (payload at: 2) value: (payload at: 3) ]
-                on: Error do: [ :e | Transcript showCr: 'app handler: ' , e messageText ] ].
+        self localWindow isNil
+            ifFalse: [
+                "The full local pipeline: handler, rerender, and the tool's
+                 own paint blocks against local planes — dispatch does it all."
+                [ self localWindow dispatch: (payload at: 2) value: (payload at: 3) ]
+                    on: Error do: [ :e | Transcript showCr: 'app handler: ' , e messageText ] ]
+            ifTrue: [
+                Tool isNil ifFalse: [
+                    [ Tool handle: (payload at: 2) value: (payload at: 3) ]
+                        on: Error do: [ :e | Transcript showCr: 'app handler: ' , e messageText ] ] ].
         ^self publish
     ]
 
@@ -90,6 +162,9 @@ Object subclass: AppVmClient [
      anywhere explaining why. The transcript forwards to the display, so the
      reason arrives where somebody is looking."
     AppVmClient class >> currentSpec ^ <Object> [
+        self localWindow isNil ifFalse: [
+            "The local window's own retained spec, kept current by dispatch."
+            self localWindow lastSpec isNil ifFalse: [ ^self localWindow lastSpec ] ].
         Tool isNil ifTrue: [
             Transcript showCr: 'app: no tool class to render'.
             ^nil ].
@@ -220,7 +295,10 @@ Object subclass: AppVmDisplay [
         ((payload isKindOf: Array)
             and: [ payload size >= 3 and: [ (payload at: 1) == #appFrame ] ])
                 ifFalse: [ ^self passOn: m ].
-        ^self frame: (payload at: 3) for: (payload at: 2) from: m from
+        ^self frame: (payload at: 3)
+              for: (payload at: 2)
+              from: m from
+              blits: (payload size >= 4 ifTrue: [ payload at: 4 ] ifFalse: [ nil ])
     ]
 
     AppVmDisplay class >> passOn: m <Object> [
@@ -233,6 +311,10 @@ Object subclass: AppVmDisplay [
      block answers this, and the reconcile that follows is the same one an
      in-process tool gets."
     AppVmDisplay class >> frame: aSpec <Object> for: anId <Object> from: aPeer <Integer> [
+        ^self frame: aSpec for: anId from: aPeer blits: nil
+    ]
+
+    AppVmDisplay class >> frame: aSpec <Object> for: anId <Object> from: aPeer <Integer> blits: someBlits <Object> [
         | key win |
         key := anId asString asSymbol.
         self frames at: key put: aSpec.
@@ -245,6 +327,25 @@ Object subclass: AppVmDisplay [
         win isOpen
             ifTrue: [ win rerender ]
             ifFalse: [ win open ].
+        "THE APP'S PIXELS (the cross-VM pane design): the tool painted its
+         planes in ITS OWN VM; here they are copied — one bulk replace per
+         pane — into the display-side surface and presented. The display
+         computes nothing about them, which is the point: pixels are the
+         tool's, glass is ours."
+        someBlits isNil ifFalse: [
+            someBlits do: [ :b | self applyBlit: b to: win ] ].
+        ^self
+    ]
+
+    AppVmDisplay class >> applyBlit: aBlit <Array> to: win <Object> [
+        | h plane bytes |
+        h := win paneHandle: (aBlit at: 1).
+        h = 0 ifTrue: [ ^self ].
+        plane := AppPixels planeFor: h width: (aBlit at: 2) height: (aBlit at: 3).
+        plane isNil ifTrue: [ ^self ].
+        bytes := aBlit at: 4.
+        plane replaceFrom: 1 to: (plane size min: bytes size) with: bytes.
+        AppRender present: h.
         ^self
     ]
 
@@ -256,7 +357,8 @@ Object subclass: AppVmDisplay [
         AppToolWindow
             register: anId
             title: ((aSpec at: #title) ifNil: [ anId asString ]) asString
-            width: 520 height: 640
+            width: ((aSpec at: #width) ifNil: [ 520 ]) rounded
+            height: ((aSpec at: #height) ifNil: [ 640 ]) rounded
             render: [ AppVmDisplay frameFor: anId ]
             handler: [ :event :value | AppVmDisplay send: event value: value to: anId ].
         ^self
