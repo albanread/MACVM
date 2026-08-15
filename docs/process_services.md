@@ -226,6 +226,43 @@ grant's epoch (`workers::alive`). Authority to spawn into a fleet and
 visibility of what you spawned are the same grant; without it the display
 could not tell a live app from a corpse behind the same window.
 
+### What a VM leaves behind — the audit
+
+Asked directly ("double check we tidy up everything a VM used"), and answered
+per resource. Everything below is covered by
+`an_exited_vm_leaves_no_process_level_residue`.
+
+| resource | released by | state |
+|---|---|---|
+| heap (the whole mapping) | `Reservation::drop` → `munmap`, via the handle drop at the end of `worker_main` | ✅ clean exit only — a `pthread_exit` fatal runs no Drop, by design (S21) |
+| JIT code cache | `CodeCache::drop` | ✅ same path |
+| timer registration | the service drops a dead target's entry at the FIRST wake after death | ✅ **fixed here** — it used to wait for that entry's own deadline, so a slow timer held an inbox clone for as long as its interval |
+| worker table row | 60s grave, then swept | ✅ **new** |
+| Monitor roster row | 60s grave, then swept (a respawn under the same label still revives) | ✅ **new** |
+| fleet link | marked dead; slot reused with a bumped generation | ✅ bounded by `MAX_WORKERS` |
+| peer links held by OTHERS | dropped on first failed send | ✅ self-healing |
+| autorelease pool (bottom) | popped at thread exit | ✅ **fixed here** — the token lives in a `Cell` thread-local with no destructor, so a worker that ever touched Cocoa took its pool with it |
+| retained ObjC refs in a dying heap | nothing | ⚠️ **leaks, deliberately** — the bridge's documented bias ("a leak is diagnosable; an over-release corrupts a runtime we don't control"). Not reached in practice: app VMs use the null realizer and demo VMs draw through the command queue, so neither holds `ObjcRef`s |
+| native game pane | the demo VM emits `StopLoop` on shutdown | ✅ S6 |
+
+**The bug this audit turned up.** Process-wide services were being keyed by
+worker HANDLE — which repeats across epochs — and every primary registered as
+key 0. So one epoch's `w1` silently cancelled another's, and a second primary
+cancelled the first's timer outright. Exactly the identity bug S2 fixed for
+liveness, in a different table. Every VM now mints a **process-unique
+`vm_key`** for process-wide services, workers report theirs into the worker
+table (the parent cannot know it — it is minted inside the child), and the
+table is the map from "worker 2 of epoch 7" to "the registrant a service
+knows". Found because a cleanup test asked "is MY tick gone?" and got another
+VM's answer.
+
+**Why dead rows linger a minute.** Watching a row go from alive to dead is how
+you learn a VM ended cleanly rather than vanished — the distinction this whole
+record is about. A minute is long enough to see it while working and short
+enough that the roster stays a list of VMs rather than of everything that ever
+was one. Both sweeps run under the lock at every read and every registration:
+no thread, no timer, and the sweep happens exactly when somebody looks.
+
 ## 4. Exit — the sequence that does not exist today
 
 Today ⌘Q kills detached VM threads mid-instruction; the CLI end drops the

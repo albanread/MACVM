@@ -775,7 +775,18 @@ pub struct VmMonitorSlot {
     /// guest code" — the busy signal for VMs whose pump blocks inside `exec`,
     /// where a busy flag around the exec would read permanently busy.
     last_publish: Mutex<Option<std::time::Instant>>,
+    /// When this VM died. A dead row is KEPT — and shown as dead — for
+    /// [`GRAVE`], because watching a VM's state change is how you learn it
+    /// ended cleanly; after that it is swept, because a roster of corpses is
+    /// not a roster. Set by the sweep on first observation rather than by
+    /// `mark_dead`, so a death nobody reported (a reaped orphan) is buried on
+    /// the same clock as one that announced itself.
+    died_at: Mutex<Option<std::time::Instant>>,
 }
+
+/// How long a dead VM stays on the roster. Long enough to SEE the transition
+/// while working; short enough that an idle session is not a graveyard.
+const GRAVE: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl VmMonitorSlot {
     /// Park a fresh snapshot (owner thread only). Publishing revives a slot:
@@ -825,15 +836,55 @@ static VM_MONITOR: Mutex<Vec<std::sync::Arc<VmMonitorSlot>>> = Mutex::new(Vec::n
 /// primary or a reused worker id keeps ONE row rather than accreting
 /// tombstones); otherwise a new row is appended in registration order —
 /// which is also display order, so primary/ui land first naturally.
+/// Bury the long-dead (`GRAVE`). Runs under the roster lock at every read and
+/// every registration — no thread, no timer: the roster is only interesting
+/// when somebody looks at it, and that is exactly when this runs.
+fn monitor_sweep(roster: &mut Vec<std::sync::Arc<VmMonitorSlot>>) {
+    monitor_sweep_after(roster, GRAVE);
+}
+
+fn monitor_sweep_after(
+    roster: &mut Vec<std::sync::Arc<VmMonitorSlot>>,
+    grave: std::time::Duration,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = std::time::Instant::now();
+    roster.retain(|s| {
+        if s.alive.load(Relaxed) {
+            return true;
+        }
+        let mut died = s.died_at.lock().unwrap_or_else(|e| e.into_inner());
+        match *died {
+            None => {
+                *died = Some(now); // first sighting: start the clock
+                true
+            }
+            Some(t) => now.duration_since(t) < grave,
+        }
+    });
+}
+
+/// The roster's grave, made visible to a test (see
+/// `runtime::workers::worker_table_retire_now`). Production always uses
+/// [`GRAVE`]; this only shortens the wait.
+pub fn monitor_retire_now(grave: std::time::Duration) -> usize {
+    let mut roster = VM_MONITOR.lock().unwrap_or_else(|e| e.into_inner());
+    monitor_sweep_after(&mut roster, grave);
+    monitor_sweep_after(&mut roster, grave);
+    roster.len()
+}
+
 pub fn monitor_register(label: String, kind: &'static str) -> std::sync::Arc<VmMonitorSlot> {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     let mut roster = VM_MONITOR.lock().unwrap_or_else(|e| e.into_inner());
+    monitor_sweep(&mut roster);
     if let Some(slot) = roster
         .iter()
         .find(|s| !s.alive.load(Relaxed) && s.label == label)
     {
         slot.alive.store(true, Relaxed);
         slot.busy.store(false, Relaxed);
+        *slot.died_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return slot.clone();
     }
     let slot = std::sync::Arc::new(VmMonitorSlot {
@@ -843,6 +894,7 @@ pub fn monitor_register(label: String, kind: &'static str) -> std::sync::Arc<VmM
         busy: AtomicBool::new(false),
         metrics: Mutex::new(VmMetrics::default()),
         last_publish: Mutex::new(None),
+        died_at: Mutex::new(None),
     });
     roster.push(slot.clone());
     slot
@@ -851,7 +903,8 @@ pub fn monitor_register(label: String, kind: &'static str) -> std::sync::Arc<VmM
 /// Read-side: copy every row (any thread).
 pub fn monitor_snapshot() -> Vec<VmMonitorRow> {
     use std::sync::atomic::Ordering::Relaxed;
-    let roster = VM_MONITOR.lock().unwrap_or_else(|e| e.into_inner());
+    let mut roster = VM_MONITOR.lock().unwrap_or_else(|e| e.into_inner());
+    monitor_sweep(&mut roster);
     roster
         .iter()
         .map(|s| VmMonitorRow {
@@ -1653,6 +1706,13 @@ impl VmHandle {
     /// what makes this VM the PRIMARY (creates its inbox + registry); without
     /// it, `Worker spawn` fails cleanly. The closure runs ON each new worker
     /// thread.
+    /// This VM's process-unique key for process-wide services (timers today),
+    /// or `None` in a VM with no worker role. See
+    /// [`crate::runtime::workers::vm_key`].
+    pub fn vm_key(&self) -> Option<u64> {
+        crate::runtime::workers::vm_key(&self.vm)
+    }
+
     pub fn set_worker_boot(&mut self, f: crate::runtime::workers::WorkerBootFn) {
         self.vm.workers = Some(Box::new(crate::runtime::workers::WorkerState::new_primary(
             f,

@@ -254,6 +254,31 @@ fn ensure_pool(s: &Syms) {
 /// A cheap no-op on threads that never touched Cocoa — and ALWAYS on the main
 /// thread (see [`ensure_pool`]: popping our bottom pool there corrupts CF's pool
 /// stack, since the UI worker runs doits inside CF's own per-callout pool).
+/// A VM THREAD IS ENDING — drain its bottom pool and DON'T push a new one.
+/// The pool token lives in a `Cell<*mut c_void>` thread-local, which has no
+/// destructor, so a worker that ever touched Cocoa would otherwise take its
+/// bottom pool (and everything autoreleased into it) with it into the void.
+/// Every VM whose thread exits cleanly calls this — a worker that never
+/// touched Cocoa has no pool and pays a null check.
+///
+/// Never on the main thread, for `ensure_pool`'s reason: our token would be
+/// popped from under CoreFoundation's own pool stack. Main's VM ends with the
+/// process anyway.
+pub fn release_pool_on_thread_exit() {
+    if on_main_thread() {
+        return;
+    }
+    POOL.with(|p| {
+        let tok = p.get();
+        if !tok.is_null() {
+            if let Some(s) = syms() {
+                unsafe { (s.pool_pop)(tok) };
+            }
+            p.set(std::ptr::null_mut());
+        }
+    });
+}
+
 pub fn drain_pool_at_doit_boundary() {
     if on_main_thread() {
         return;

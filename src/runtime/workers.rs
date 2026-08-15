@@ -57,6 +57,23 @@ pub const MAX_WORKERS: usize = 16;
 /// Mints per-primary epoch ids. Starts at 1 so 0 can never name a real one.
 static NEXT_PRIMARY_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+/// Mints a PROCESS-unique registration key for every VM that can hold one.
+///
+/// Worker handles are unique only inside one primary's epoch, and every
+/// primary's `self_id` is 0 — so keying a process-wide service by handle makes
+/// two unrelated VMs the same registrant. The timer service did exactly that:
+/// `set_tick` replaces any entry with the same key, so worker w1 of one epoch
+/// silently CANCELLED worker w1 of another, and any second primary cancelled
+/// the first (both key 0). Found by a cleanup test that asked "is MY tick
+/// gone?" and got another VM's answer — the same identity bug S2 fixed for
+/// liveness, in a different table. Process-wide state needs a process-wide
+/// name.
+static NEXT_VM_KEY: AtomicU64 = AtomicU64::new(1);
+
+fn mint_vm_key() -> u64 {
+    NEXT_VM_KEY.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Epochs whose primary is GONE (fatal or clean — either way the star's
 /// center is dead). A tiny grow-only list: one entry per primary death in
 /// the whole process lifetime.
@@ -69,12 +86,30 @@ struct GlobalWorkerRow {
     primary_epoch: u64,
     spawned_at: std::time::Instant,
     alive: Arc<AtomicBool>,
+    /// This VM's process-unique service key ([`mint_vm_key`]), reported by the
+    /// worker itself once it has booted — the parent cannot know it, because
+    /// it is minted inside the child. With it, the table is the place to go
+    /// from "worker 2 of epoch 7" to "the registrant a process-wide service
+    /// knows", which is what makes a service's entries attributable at all.
+    vm_key: Option<u64>,
+    /// When this worker's death was first OBSERVED. The dying thread flips
+    /// `alive` from wherever it is, without the table lock, so the table
+    /// cannot know the instant — and does not need to: the row is kept, and
+    /// shown as dead, for [`GRAVE`] after we first notice, then swept.
+    died_at: Option<std::time::Instant>,
 }
+
+/// How long a dead worker stays in the table. Seeing a row go from alive to
+/// dead is how you learn a VM ended cleanly rather than vanished; a minute is
+/// long enough to watch it happen and short enough that the table stays a
+/// list of workers rather than a list of everything that ever was one.
+const GRAVE: Duration = Duration::from_secs(60);
 
 /// A read-side copy of one row.
 pub struct WorkerTableRow {
     pub worker_id: u32,
     pub primary_epoch: u64,
+    pub vm_key: Option<u64>,
     pub age: Duration,
     pub alive: bool,
 }
@@ -107,10 +142,47 @@ pub fn primary_epoch(vm: &VmState) -> Option<u64> {
     }
 }
 
+/// Retire rows whose grave period is up, and start the clock on any death
+/// seen for the first time. Runs under the table lock at every registration
+/// and every read — the table only matters when somebody consults it, which
+/// is exactly when this runs, so it needs no thread and no timer.
+fn worker_table_sweep(table: &mut Vec<GlobalWorkerRow>) {
+    worker_table_sweep_after(table, GRAVE);
+}
+
+fn worker_table_sweep_after(table: &mut Vec<GlobalWorkerRow>, grave: Duration) {
+    let now = std::time::Instant::now();
+    table.retain_mut(|r| {
+        if r.alive.load(Ordering::Relaxed) {
+            return true;
+        }
+        match r.died_at {
+            None => {
+                r.died_at = Some(now);
+                true
+            }
+            Some(t) => now.duration_since(t) < grave,
+        }
+    });
+}
+
+/// The grave, made visible to a test: sweep with a deadline of `grave` and
+/// answer how many rows remain. Nothing else may set the period — production
+/// always uses [`GRAVE`].
+pub fn worker_table_retire_now(grave: Duration) -> usize {
+    let mut table = WORKER_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    // Twice: the first pass marks a newly-seen death, the second retires it
+    // once `grave` has elapsed (zero, for a test that wants it now).
+    worker_table_sweep_after(&mut table, grave);
+    worker_table_sweep_after(&mut table, grave);
+    table.len()
+}
+
 fn worker_table_register(worker_id: u32, primary_epoch: u64, alive: Arc<AtomicBool>) {
     let mut table = WORKER_TABLE.lock().unwrap_or_else(|e| e.into_inner());
-    // Bounded history: spawn churn (a game fleet per launch) must not grow
-    // the table forever — once it gets long, dead rows have told their story.
+    worker_table_sweep(&mut table);
+    // Backstop for a spawn burst that outruns the grave period: a runaway
+    // must not grow the table without bound just because it is fast.
     if table.len() >= 64 {
         table.retain(|r| r.alive.load(Ordering::Relaxed));
     }
@@ -119,18 +191,33 @@ fn worker_table_register(worker_id: u32, primary_epoch: u64, alive: Arc<AtomicBo
         primary_epoch,
         spawned_at: std::time::Instant::now(),
         alive,
+        vm_key: None,
+        died_at: None,
     });
+}
+
+/// A worker reports its process-unique service key, once booted. Called on the
+/// worker's own thread — the only side that knows it.
+pub fn worker_table_note_vm_key(worker_id: u32, primary_epoch: u64, key: u64) {
+    let mut table = WORKER_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = table
+        .iter_mut()
+        .find(|r| r.worker_id == worker_id && r.primary_epoch == primary_epoch)
+    {
+        r.vm_key = Some(key);
+    }
 }
 
 /// Read-side: copy the table (any thread).
 pub fn worker_table_snapshot() -> Vec<WorkerTableRow> {
-    WORKER_TABLE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let mut table = WORKER_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    worker_table_sweep(&mut table);
+    table
         .iter()
         .map(|r| WorkerTableRow {
             worker_id: r.worker_id,
             primary_epoch: r.primary_epoch,
+            vm_key: r.vm_key,
             age: r.spawned_at.elapsed(),
             alive: r.alive.load(Ordering::Relaxed),
         })
@@ -381,12 +468,18 @@ pub enum WorkerState {
         /// For cloning to new workers and for synthesizing control
         /// envelopes into our own inbox.
         inbox_tx: InboxSender,
+        /// This VM's process-unique key for process-wide services (see
+        /// [`mint_vm_key`]) — never a handle, which repeats across epochs.
+        vm_key: u64,
         /// This primary's process-unique epoch. Everything else a primary
         /// used to hold here — links, the boot fn, the display — lives in
         /// `fleet` now (docs/process_services.md S4), keyed by this.
         epoch: u64,
     },
     Worker {
+        /// This VM's process-unique key for process-wide services (see
+        /// [`mint_vm_key`]).
+        vm_key: u64,
         self_id: u32,
         /// The staging slot (the `GameStep` pattern): the host loop parks
         /// the inbound envelope here, then execs `Worker dispatchPending.`,
@@ -450,6 +543,7 @@ impl WorkerState {
             inbox_rx: rx,
             inbox_tx,
             epoch,
+            vm_key: mint_vm_key(),
         }
     }
 
@@ -462,6 +556,7 @@ impl WorkerState {
             liveness: None,
             spawn_grant: None,
             peers: Vec::new(),
+            vm_key: mint_vm_key(),
         }
     }
 
@@ -787,6 +882,9 @@ fn worker_main(
         return;
     };
     handle.install_worker_role(id, to_primary.clone());
+    if let Some(k) = handle.vm_key() {
+        worker_table_note_vm_key(id, epoch, k);
+    }
     // Its own link, so anything it messages can answer it directly rather
     // than through the primary (`docs/worker_peer_links.md`).
     handle.set_self_inbox(self_inbox);
@@ -846,6 +944,7 @@ fn worker_main(
         mon.set_busy(false);
         mon.publish(handle.metrics());
         if !ok {
+            crate::runtime::objc_bridge::release_pool_on_thread_exit();
             mon.mark_dead();
             alive.store(false, Ordering::Relaxed);
             let _ = to_primary.send(died_envelope(id));
@@ -859,7 +958,8 @@ fn worker_main(
                     // The terminate order. Exit exactly as a guest fatal
                     // does — dead in the monitor, a death notice to the
                     // parent, the heap unmapped by the normal drop.
-                    mon.mark_dead();
+                    crate::runtime::objc_bridge::release_pool_on_thread_exit();
+            mon.mark_dead();
                     alive.store(false, Ordering::Relaxed);
                     let _ = to_primary.send(died_envelope(id));
                     return;
@@ -876,7 +976,8 @@ fn worker_main(
                 mon.set_busy(false);
                 mon.publish(handle.metrics());
                 if !ok {
-                    mon.mark_dead();
+                    crate::runtime::objc_bridge::release_pool_on_thread_exit();
+            mon.mark_dead();
                     alive.store(false, Ordering::Relaxed);
                     let _ = to_primary.send(died_envelope(id));
                     return;
@@ -895,7 +996,8 @@ fn worker_main(
                     eprintln!(
                         "macvm: worker {id} reaped — its primary (epoch {epoch}) is gone"
                     );
-                    mon.mark_dead();
+                    crate::runtime::objc_bridge::release_pool_on_thread_exit();
+            mon.mark_dead();
                     alive.store(false, Ordering::Relaxed);
                     return;
                 }
@@ -1050,15 +1152,28 @@ pub fn alive(vm: &VmState, id: u32) -> bool {
 /// down, and its process-level liveness flag so a dead VM's timer cancels
 /// itself. `None` when this VM has no inbox to tick (a hosted worker whose
 /// host never handed one over, a bare CLI VM with no role).
-pub fn tick_registration(vm: &VmState) -> Option<(u32, InboxSender, Option<Arc<AtomicBool>>)> {
+pub fn tick_registration(vm: &VmState) -> Option<(u64, InboxSender, Option<Arc<AtomicBool>>)> {
     match vm.workers.as_deref() {
         Some(WorkerState::Worker {
-            self_id,
+            vm_key,
             self_inbox: Some(inbox),
             liveness,
             ..
-        }) => Some((*self_id, inbox.clone(), liveness.clone())),
-        Some(WorkerState::Primary { inbox_tx, .. }) => Some((0, inbox_tx.clone(), None)),
+        }) => Some((*vm_key, inbox.clone(), liveness.clone())),
+        Some(WorkerState::Primary {
+            vm_key, inbox_tx, ..
+        }) => Some((*vm_key, inbox_tx.clone(), None)),
+        _ => None,
+    }
+}
+
+/// This VM's process-unique service key, for a caller that needs to ask a
+/// process-wide service about THIS VM (a cleanup test, a future registry).
+pub fn vm_key(vm: &VmState) -> Option<u64> {
+    match vm.workers.as_deref() {
+        Some(WorkerState::Worker { vm_key, .. } | WorkerState::Primary { vm_key, .. }) => {
+            Some(*vm_key)
+        }
         _ => None,
     }
 }

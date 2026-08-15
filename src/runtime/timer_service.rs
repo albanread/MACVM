@@ -27,7 +27,7 @@ struct Entry {
     /// The registrant's worker handle (0 = a primary). One repeating timer
     /// per VM — re-registration replaces, interval 0 removes: the same
     /// semantics `tickEvery:` always had.
-    key: u32,
+    key: u64,
     interval: Duration,
     next: Instant,
     target: InboxSender,
@@ -91,14 +91,19 @@ fn run(s: &Service) {
         entries = guard;
         let now = Instant::now();
         entries.retain_mut(|e| {
-            if e.next > now {
-                return true;
-            }
-            // Cancel-on-death: a dead target's entry is dropped, never fired.
+            // CANCEL-ON-DEATH FIRST, and for EVERY entry — not only the ones
+            // whose deadline has come. Checking after the deadline test let a
+            // dead VM's registration sit in the table until its next tick was
+            // due, holding a clone of its inbox: harmless at 16ms, a full hour
+            // of pointless residency for a slow timer. A dead target's entry
+            // now goes at the first wake after it dies, whoever woke us.
             if let Some(a) = &e.alive {
                 if !a.load(Ordering::Acquire) {
                     return false;
                 }
+            }
+            if e.next > now {
+                return true;
             }
             // Deliver the tick as a message; a closed inbox is a dead target.
             if e
@@ -114,10 +119,23 @@ fn run(s: &Service) {
     }
 }
 
+/// Does the service still hold a registration for `key`? The precise question
+/// a cleanup test must ask: a process-global service serves every VM in the
+/// process (and every test in the binary), so a total count is somebody
+/// else's business as much as yours.
+pub fn has_registration(key: u64) -> bool {
+    service()
+        .entries
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|e| e.key == key)
+}
+
 /// Ask the service to tick `target` every `ms` milliseconds (0 removes the
 /// registration). `key` identifies the registrant so re-registration
 /// replaces; `alive` is its process-level liveness flag when it has one.
-pub fn set_tick(key: u32, ms: u64, target: InboxSender, alive: Option<Arc<AtomicBool>>) {
+pub fn set_tick(key: u64, ms: u64, target: InboxSender, alive: Option<Arc<AtomicBool>>) {
     let s = service();
     let mut entries = s.entries.lock().unwrap_or_else(|e| e.into_inner());
     // A registration re-arms a parked service (see `run`'s stopped arm).

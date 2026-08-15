@@ -493,3 +493,94 @@ fn closing_the_window_makes_the_app_vm_exit_itself() {
         "the relaunched app is live behind its new window"
     );
 }
+
+/// WHAT A VM LEAVES BEHIND — nothing, once its grave period is up. Every
+/// process-level structure a worker touches is checked BY ITS OWN ID: the
+/// timer service's registration (it ticked), and the worker table's row. Dead
+/// rows are deliberately KEPT for a minute first — watching a VM go from
+/// alive to dead is how you learn it ended cleanly rather than vanished — so
+/// the test sweeps with a zero-length grave to see the retire without waiting
+/// one out. Everything here is asked per-id, never as a total: these are
+/// PROCESS-wide structures shared with every other test in this binary.
+#[test]
+fn an_exited_vm_leaves_no_process_level_residue() {
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    primary.set_worker_boot(Arc::new(|| VmHandle::boot(opts(), Path::new("world"))));
+
+    // A worker that ticks (so it holds a timer registration), then is ended.
+    // The init runs ONE top-level item, so the two statements are one block.
+    primary
+        .exec("Ghost := Worker spawn: '[ Worker onTick: [ nil ]. Worker tickEvery: 30 ] value.'.")
+        .expect("spawn a ticking worker");
+    let ghost: u32 = eval(&mut primary, "Ghost id printString")
+        .trim_matches('\'')
+        .parse()
+        .expect("the worker's handle");
+    // The timer service is PROCESS-wide, so it is asked by the VM's
+    // process-unique key — a handle repeats across epochs, and every other
+    // test in this binary has its own epoch.
+    let epoch = primary.primary_epoch().expect("this test's own epoch");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let ghost_key = loop {
+        let key = macvm::runtime::workers::worker_table_snapshot()
+            .into_iter()
+            .find(|r| r.worker_id == ghost && r.primary_epoch == epoch)
+            .and_then(|r| r.vm_key);
+        if let Some(k) = key {
+            break k;
+        }
+        assert!(Instant::now() < deadline, "the worker never reported its key");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !macvm::runtime::timer_service::has_registration(ghost_key) {
+        assert!(Instant::now() < deadline, "the worker never registered a tick");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        macvm::runtime::workers::worker_table_snapshot()
+            .iter()
+            .any(|r| r.worker_id == ghost && r.primary_epoch == epoch && r.alive),
+        "a live worker must be in the table"
+    );
+
+    primary.exec("Ghost terminate.").expect("end it");
+
+    // The timer registration goes on the service's next wake, because a dead
+    // target's entry is dropped by whoever woke it — not held until its own
+    // next tick would have been due.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while macvm::runtime::timer_service::has_registration(ghost_key) {
+        assert!(
+            Instant::now() < deadline,
+            "the dead VM's timer registration outlived it"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The row survives its grave — the point of keeping it — and is retired
+    // once that is up.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        macvm::runtime::workers::worker_table_retire_now(Duration::from_secs(3600));
+        let row = macvm::runtime::workers::worker_table_snapshot()
+            .into_iter()
+            .find(|r| r.worker_id == ghost && r.primary_epoch == epoch);
+        match row {
+            Some(r) if !r.alive => break, // dead, still visible: correct
+            _ => assert!(
+                Instant::now() < deadline,
+                "the worker's row never showed it dying"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    macvm::runtime::workers::worker_table_retire_now(Duration::ZERO);
+    assert!(
+        !macvm::runtime::workers::worker_table_snapshot()
+            .iter()
+            .any(|r| r.worker_id == ghost && r.primary_epoch == epoch),
+        "the row survived its grave period"
+    );
+}
