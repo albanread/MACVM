@@ -391,6 +391,14 @@ pub enum WorkerState {
         /// simply offers no link and behaves exactly as it did before peer
         /// links existed.
         self_inbox: Option<InboxSender>,
+        /// A VM-MANAGED FRAME TICK, in milliseconds; 0 is off. The worker
+        /// sets it on itself (`Worker tickEvery:`) and the loop below wakes
+        /// on it — a worker asleep in its inbox is woken by the VM at a
+        /// cadence it asked for, which is what makes a 60 Hz frame loop
+        /// possible in a VM that is otherwise purely message-driven. A
+        /// SERVICE, not a thread: no extra thread exists, the existing
+        /// `recv_timeout` deadline is simply shortened to the next tick.
+        tick_ms: u64,
         /// LINKS THIS WORKER HOLDS, not addresses it can resolve — id ->
         /// inbox for the peers it was introduced to at spawn and the ones it
         /// has learned by being messaged. There is no directory and no
@@ -436,6 +444,7 @@ impl WorkerState {
             pending: None,
             to_primary,
             self_inbox: None,
+            tick_ms: 0,
             peers: Vec::new(),
         }
     }
@@ -832,8 +841,26 @@ fn worker_main(
             return;
         }
     }
+    // The timer service's own bookkeeping: when the next tick is due, and
+    // the interval last asked for (read back from the VM after every entry,
+    // since the guest can change or stop it at any point).
+    let mut next_tick = std::time::Instant::now();
     loop {
-        match rx.recv_timeout(EPOCH_CHECK_INTERVAL) {
+        // Sleep until the sooner of the pulse check and this worker's next
+        // frame tick — no extra thread, no busy poll: the deadline the loop
+        // was already waiting on is simply the nearer one.
+        let tick = handle.worker_tick_ms();
+        let wait = if tick == 0 {
+            EPOCH_CHECK_INTERVAL
+        } else {
+            let now = std::time::Instant::now();
+            if next_tick <= now {
+                Duration::from_millis(0)
+            } else {
+                (next_tick - now).min(EPOCH_CHECK_INTERVAL)
+            }
+        };
+        match rx.recv_timeout(wait) {
             Ok(env) => {
                 handle.stage_pending(env);
                 // A guest error mid-dispatch (error:, DNU, even a native
@@ -854,6 +881,28 @@ fn worker_main(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // A FRAME TICK, if one is due: run top-level, exactly like an
+                // inbound message and under the same rule — one thing at a
+                // time. A tick that raises retires the worker like any other
+                // guest fatal; a slow tick simply delays the next (the
+                // deadline is recomputed from NOW, so a worker that cannot
+                // keep up degrades in rate rather than accumulating a debt it
+                // then tries to pay off in a burst).
+                let tick = handle.worker_tick_ms();
+                if tick != 0 && std::time::Instant::now() >= next_tick {
+                    mon.set_busy(true);
+                    let ok = handle.exec("Worker dispatchTick.").is_ok();
+                    mon.set_busy(false);
+                    mon.publish(handle.metrics());
+                    next_tick = std::time::Instant::now() + Duration::from_millis(tick);
+                    if !ok {
+                        mon.mark_dead();
+                        alive.store(false, Ordering::Relaxed);
+                        let _ = to_primary.send(died_envelope(id));
+                        return;
+                    }
+                    continue;
+                }
                 // The pulse check — supervision of last resort. A FATAL
                 // primary death runs no Drop glue: our channel sender leaks
                 // inside the dead VM's links and a plain `recv()` would park
@@ -998,6 +1047,29 @@ pub fn alive(vm: &VmState, id: u32) -> bool {
         return false;
     };
     link_for(links, id).map(|l| l.alive).unwrap_or(false)
+}
+
+/// This VM's frame-tick interval in milliseconds, 0 when it has none. Read
+/// by the worker loop to shorten its inbox wait (`docs/appspec.md`: the
+/// timer service a demo's 60 Hz step needs).
+pub fn tick_ms(vm: &VmState) -> u64 {
+    match vm.workers.as_deref() {
+        Some(WorkerState::Worker { tick_ms, .. }) => *tick_ms,
+        _ => 0,
+    }
+}
+
+/// Ask the VM to wake this worker every `ms` milliseconds (0 stops it). The
+/// wake arrives as `Worker dispatchTick.`, run top-level exactly like an
+/// inbound message — one thing at a time, never nested inside another.
+pub fn set_tick_ms(vm: &mut VmState, ms: u64) -> bool {
+    match vm.workers.as_deref_mut() {
+        Some(WorkerState::Worker { tick_ms, .. }) => {
+            *tick_ms = ms;
+            true
+        }
+        _ => false, // the primary has a host run loop; it needs no service
+    }
 }
 
 /// The handle this VM knows as the DISPLAY, or 0 if it has none. A primary

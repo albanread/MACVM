@@ -72,7 +72,8 @@ Object subclass: CocoaToolbarAction [
  every view against the fresh environment."
 Object subclass: CocoaUI [
     <classVars: Win ContentHost Transcript TranscriptScroll ActTarget
-                ToolsMenu ToolMenuIds
+                ToolsMenu ToolMenuIds LaunchInOwnVm LaunchVmMenuItem
+                DemoVmNoteShown
                 TranscriptText Views ActiveView ToolbarDelegates
                 MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
                 WorkspaceTextDelegate TabItems TabIndexes
@@ -1068,11 +1069,15 @@ Object subclass: CocoaUI [
          pane tools stay in-process for now: a paint block runs app-side and
          the display's thin window carries none — cross-VM pane painting is
          the recorded next step, not an oversight."
-        self appVmMenu: menu item: 'Declarative Demo…' id: #vmdemo tool: 'WinDemoTool'.
-        self appVmMenu: menu item: 'Mixed Demo…' id: #mixed tool: 'AppMixedDemo'.
-        self appToolsMenu: menu item: 'Sprite Editor (AppSpec)…' id: #spriteEd installs: #WinSpriteEd.
-        self appToolsMenu: menu item: 'Sound Editor (AppSpec)…' id: #soundEd installs: #WinSoundEd.
-        self appToolsMenu: menu item: 'Pane Demo…' id: #panedemo installs: #AppDemoPane.
+        "ONE ITEM KIND: each names its id, its tool class, and whether it
+         draws into panes; Debug > 'Launch in own VM' decides the rest when
+         the item fires. One id per app either way, so the same window is
+         fronted whichever path opened it."
+        self appMenu: menu item: 'Declarative Demo…' id: #demo tool: 'WinDemoTool' panes: false.
+        self appMenu: menu item: 'Mixed Demo…' id: #mixed tool: 'AppMixedDemo' panes: false.
+        self appMenu: menu item: 'Sprite Editor (AppSpec)…' id: #spriteEd tool: 'WinSpriteEd' panes: true.
+        self appMenu: menu item: 'Sound Editor (AppSpec)…' id: #soundEd tool: 'WinSoundEd' panes: true.
+        self appMenu: menu item: 'Pane Demo…' id: #panedemo tool: 'AppDemoPane' panes: true.
         AppToolWindow onRegister: [ :id | CocoaUI appToolRegistered: id ].
         toolsItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
             initWithTitle: 'Tools' action: nil keyEquivalent: ''.
@@ -1081,42 +1086,13 @@ Object subclass: CocoaUI [
         ^toolsItem
     ]
 
-    CocoaUI class >> appToolsMenu: menu item: aTitle id: anId installs: aClassSymbol [
-        "One AppSpec tool as a menu item: ensure it is registered (running its
-         class-side `install` late-bound, the toolsMenu:item:opens: discipline)
-         then front it through the registry."
+    CocoaUI class >> appMenu: menu item: aTitle id: anId tool: aClassName panes: hasPanes [
         | item holder delegate |
         ToolMenuIds at: anId put: true.
         item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
             initWithTitle: aTitle action: 'macvmAction:' keyEquivalent: ''.
         holder := CocoaToolbarAction on: [
-            ((AppToolWindow named: anId) isNil and: [ aClassSymbol isNil not ])
-                ifTrue: [ (Worker classNamed: aClassSymbol) ifNotNil: [ :c | c install ] ].
-            AppToolWindow open: anId ].
-        delegate := MacvmDelegate actionTargetOn: holder.
-        item onMain setTarget: delegate.
-        menu onMain addItem: item.
-        ToolbarDelegates add: delegate.
-        ^item
-    ]
-
-    "A menu item that launches an app IN ITS OWN VM. First use ships the
-     spawn to the primary and the window arrives with the first frame; once
-     registered, the item just fronts it — including a dead app's window,
-     which keeps its last frame by design."
-    CocoaUI class >> appVmMenu: menu item: aTitle id: anId tool: aClassName [
-        | item holder delegate |
-        ToolMenuIds at: anId put: true.
-        item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
-            initWithTitle: aTitle action: 'macvmAction:' keyEquivalent: ''.
-        holder := CocoaToolbarAction on: [
-            (AppToolWindow named: anId) isNil
-                ifTrue: [
-                    Worker uiRequest: #doitq
-                        args: (Array with: 'AppVmHost start: #' , anId asString
-                                          , ' tool: ''' , aClassName , '''')
-                        onReply: [ :x | nil ] ]
-                ifFalse: [ AppToolWindow open: anId ] ].
+            CocoaUI launchApp: anId tool: aClassName panes: hasPanes ].
         delegate := MacvmDelegate actionTargetOn: holder.
         item onMain setTarget: delegate.
         menu onMain addItem: item.
@@ -1135,9 +1111,9 @@ Object subclass: CocoaUI [
          frame arrives."
         ToolsMenu isNil ifTrue: [ ^self ].
         (ToolMenuIds includesKey: anId) ifTrue: [ ^self ].
-        self appToolsMenu: ToolsMenu
+        self appMenu: ToolsMenu
              item: ((AppToolWindow named: anId) title , '…')
-             id: anId installs: nil.
+             id: anId tool: nil panes: false.
         ^self
     ]
     CocoaUI class >> toolsMenu: menu item: aTitle opens: aClassSymbol [
@@ -1182,9 +1158,7 @@ Object subclass: CocoaUI [
                 initWithTitle: title action: 'macvmAction:' keyEquivalent: ''.
             "Launch via the host service (TOP-LEVEL on the primary), NOT a
              nested uiDoit — the frame loop's GC roots can't survive nesting."
-            holder := CocoaToolbarAction on: [
-                ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
-                    onMain launchDemo: entry ].
+            holder := CocoaToolbarAction on: [ CocoaUI launchDemo: entry ].
             delegate := MacvmDelegate actionTargetOn: holder.
             item onMain setTarget: delegate.
             demosMenu onMain addItem: item.
@@ -1250,6 +1224,24 @@ Object subclass: CocoaUI [
         jitDelegate := MacvmDelegate actionTargetOn: jitHolder.
         HaltMenuItem onMain setTarget: jitDelegate.
         debugMenu onMain addItem: HaltMenuItem.
+        ToolbarDelegates add: jitDelegate.
+
+        "Launch in own VM (docs/appspec.md A5; default ON): decides where a
+         thing launched from a menu RUNS. ON spawns a VM per app — its model,
+         render block and handler on their own core, crash-isolated, one
+         Monitor row each. OFF runs it in-process on this UI worker, which is
+         the lighter path and the one to reach for when debugging a tool
+         (its state is inspectable from the Workspace without a VM crossing).
+         Purely a launch-time decision: already-open windows are unaffected,
+         and the setting is read when a menu item fires, never cached."
+        LaunchInOwnVm := true.
+        LaunchVmMenuItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Launch in own VM' action: 'macvmAction:' keyEquivalent: ''.
+        LaunchVmMenuItem onMain setState: 1.
+        jitHolder := CocoaToolbarAction on: [ self toggleLaunchInOwnVm ].
+        jitDelegate := MacvmDelegate actionTargetOn: jitHolder.
+        LaunchVmMenuItem onMain setTarget: jitDelegate.
+        debugMenu onMain addItem: LaunchVmMenuItem.
         ToolbarDelegates add: jitDelegate.
 
         debugItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
@@ -1428,6 +1420,65 @@ Object subclass: CocoaUI [
             JitMenuItem onMain setState: (JitOn ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
         self appendTranscript: 'compiler (JIT) ', (JitOn ifTrue: [ 'ON' ] ifFalse: [ 'OFF (interpreting new methods)' ]).
     ]
+    CocoaUI class >> launchInOwnVm ^ <Boolean> [ ^LaunchInOwnVm == true ]
+
+    CocoaUI class >> toggleLaunchInOwnVm [
+        LaunchInOwnVm := self launchInOwnVm not.
+        LaunchVmMenuItem isNil ifFalse: [
+            LaunchVmMenuItem onMain setState: (self launchInOwnVm ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+        self appendTranscript: 'launch in own VM ',
+            (self launchInOwnVm
+                ifTrue: [ 'ON — apps spawn their own VM' ]
+                ifFalse: [ 'OFF — apps run in-process on the UI worker' ]).
+    ]
+
+    "ONE LAUNCH PATH FOR EVERY APP, reading the setting at the moment the menu
+     item fires. An app already registered is simply fronted — the setting
+     decides how a thing STARTS, never what an open window does.
+
+     A TOOL WITH PANES STAYS IN-PROCESS whatever the setting says, and says so
+     rather than opening a window with dead pixels: a paint block runs in the
+     app's VM while the pane's surface belongs to the display's realizer, and
+     cross-VM pane painting is not built (docs/appspec.md, the A6 open list).
+     The controls would work and the drawing would not, which is exactly the
+     invisible-failure this framework keeps refusing to ship."
+    "A DEMO RUNS ON THE PRIMARY, and Debug > 'Launch in own VM' does not move
+     it — the honest answer rather than a checkbox that quietly means nothing.
+     A demo is a 60 Hz frame loop, and the pump that drives it is the
+     PRIMARY's supervisor loop (`poll_primary_step` → `GamePane
+     stepWithKeys:`, top-level, never nested). The ENABLER for moving them
+     now exists — the VM timer service (`Worker tickEvery:`/`onTick:`, prim
+     277) wakes a worker at frame rate, proven at ~60 Hz in
+     tests/it_appvm.rs — but a demo needs more than a tick: its step loop,
+     key/mouse state and command sink all ride the primary's pump today, and
+     rerouting them is its own migration. ParallelMandel additionally spawns
+     compute workers, which only a primary can do.
+
+     Said once, on the first launch that would have been affected, so the
+     setting never silently lies."
+    CocoaUI class >> launchDemo: entry [
+        (self launchInOwnVm and: [ DemoVmNoteShown ~~ true ]) ifTrue: [
+            DemoVmNoteShown := true.
+            self appendTranscript:
+                'demos run on the primary — their 60 Hz step pump is its supervisor loop' ].
+        ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
+            onMain launchDemo: entry.
+    ]
+
+    CocoaUI class >> launchApp: anId tool: aClassName panes: hasPanes [
+        (AppToolWindow named: anId) isNil ifFalse: [ ^AppToolWindow open: anId ].
+        (self launchInOwnVm and: [ hasPanes not ]) ifTrue: [
+            ^Worker uiRequest: #doitq
+                args: (Array with: 'AppVmHost start: #' , anId asString
+                                  , ' tool: ''' , aClassName , '''')
+                onReply: [ :x | nil ] ].
+        (self launchInOwnVm and: [ hasPanes ]) ifTrue: [
+            self appendTranscript: anId printString ,
+                ': in-process — a pane''s pixels cannot cross a VM boundary yet' ].
+        (Worker classNamed: aClassName asSymbol) ifNotNil: [ :c | c install ].
+        ^AppToolWindow open: anId
+    ]
+
     CocoaUI class >> breakOnBrowserSelection: setIt [
         "DBG4 Break on Entry: plant (or clear) a breakpoint on Browser V2's
          currently-selected method. The host parks it; the primary pump applies

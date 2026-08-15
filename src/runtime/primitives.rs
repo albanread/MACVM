@@ -1576,6 +1576,19 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        // 277: the worker block (220-229) is full and 230+ belongs to the
+        // Cocoa bridge — the FIRST cut sat at 230 and produced the exact
+        // collision symptom WINARMVM's renumbering commit warns about: two
+        // descs, binary_search lands on the other one, the wrong primitive
+        // fails cleanly, the fallback runs, and nothing anywhere says why.
+        id: 277,
+        name: "Worker class>>primTickEvery:",
+        f: prim_worker_tick_every,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -2469,6 +2482,28 @@ fn prim_worker_self_id(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let _ = args;
     let id = vm.workers.as_ref().map_or(0, |ws| ws.self_id());
     PrimResult::Ok(SmallInt::new(i64::from(id)).oop())
+}
+
+/// `Worker class>>primTickEvery:` (230): ask the VM to wake this worker every
+/// `ms` milliseconds (0 stops it), delivering `Worker dispatchTick.` as a
+/// top-level entry. The timer is a VM SERVICE — no extra thread, no busy
+/// poll: the worker's existing inbox wait is shortened to the next deadline,
+/// so a message and a tick arrive by the same door under the same
+/// one-thing-at-a-time rule. Answers false in a VM with no worker role (the
+/// primary has a host run loop and needs none).
+fn prim_worker_tick_every(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    // args[0] is the RECEIVER (`Worker class`), args[1] the interval — the
+    // convention every other worker prim here uses (`primTerminate:`).
+    let Some(ms) = SmallInt::try_from(args[1]) else {
+        return PrimResult::Fail;
+    };
+    let ms = ms.value().max(0) as u64;
+    let ok = crate::runtime::workers::set_tick_ms(vm, ms);
+    PrimResult::Ok(if ok {
+        vm.universe.true_obj
+    } else {
+        vm.universe.false_obj
+    })
 }
 
 /// `Worker class>>primUiPeer` (229): the handle this VM knows as the display,
@@ -5638,6 +5673,7 @@ mod tests {
             (274, "replaceFrom:to:with:startingAt:"),
             (275, "GamePane>>paletteMemory"),
             (276, "GamePane>>paletteGlobalBase"),
+            (277, "Worker class>>primTickEvery:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

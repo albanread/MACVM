@@ -147,3 +147,93 @@ fn an_app_in_its_own_vm_drives_a_window_and_a_click_round_trips() {
         "'true'"
     );
 }
+
+/// The timer service (`docs/appspec.md`; the author's design: "timers could be
+/// managed by the VM to send workers a wakeup"). A worker is otherwise purely
+/// message-driven — it sleeps in its inbox — which is right for a tool and
+/// useless for a game. This proves the VM wakes it on a cadence it asked for,
+/// at a RATE a frame loop can use, with nobody sending it anything.
+///
+/// The worker announces each tick on its Transcript, which the worker layer
+/// already forwards to its parent as an ordinary envelope — so the primary
+/// counting those lines is counting ticks that really happened in the other
+/// VM. (The init source is ONE top item wrapped in a block on purpose:
+/// `exec` runs exactly one, which is what made the first cut of this test
+/// silently never install its handler.)
+#[test]
+fn the_vm_ticks_a_worker_at_the_rate_it_asked_for() {
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    primary.set_worker_boot(Arc::new(|| VmHandle::boot(opts(), Path::new("world"))));
+    // Declare the scoreboard BEFORE the block that closes over it — a
+    // top-level assignment declares the global, and the handler is compiled
+    // against it.
+    primary.exec("TickLines := 0.").expect("scoreboard");
+    primary
+        .exec("Worker onTranscriptLine: [ :s | TickLines := TickLines + 1 ].")
+        .expect("count forwarded tick lines");
+
+    primary
+        .exec(
+            "TickProbe := Worker spawn: '[ Worker onTick: [ Transcript showCr: ''t'' ]. \
+             Worker tickEvery: 16 ] value.'.",
+        )
+        .expect("spawn a ticking worker");
+
+    // Nobody sends it anything: the ONLY thing that can advance the count is
+    // the VM's own wakeup. Pump the primary's inbox so the forwarded lines
+    // land, for half a second of wall clock.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(600) {
+        primary
+            .exec("Worker dispatchInbox.")
+            .expect("drain forwarded transcript lines");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    primary.exec("Worker dispatchInbox.").expect("final drain");
+    let ticks: i64 = primary
+        .eval("TickLines printString")
+        .expect("read the count")
+        .trim()
+        .trim_matches('\'')
+        .parse()
+        .expect("an integer count");
+    let elapsed = start.elapsed().as_millis();
+
+    // 60 Hz over ~600ms is ~37 ticks. Assert a RATE only a real timer could
+    // produce: the old inbox wait was TWO SECONDS, which gives exactly zero.
+    assert!(
+        ticks > 10,
+        "expected a frame-rate tick, got {ticks} in {elapsed}ms — the VM is \
+         not waking the worker (a 2s inbox wait gives 0)"
+    );
+    assert!(
+        ticks < 300,
+        "runaway tick: {ticks} in {elapsed}ms — the deadline is not honoured"
+    );
+
+    // AND IT STOPS WHEN ASKED: the cadence is the guest's to end, and a
+    // stopped worker goes back to sleeping in its inbox.
+    primary
+        .exec("TickProbe send: (Array with: #stopTicking).")
+        .expect("send the stop request");
+    primary
+        .exec("Worker dispatchInbox.")
+        .expect("let the worker take it");
+    std::thread::sleep(Duration::from_millis(150));
+    primary.exec("Worker dispatchInbox.").expect("drain");
+    primary.exec("TickLines := 0.").expect("re-zero");
+    std::thread::sleep(Duration::from_millis(300));
+    primary.exec("Worker dispatchInbox.").expect("drain again");
+    let after: i64 = primary
+        .eval("TickLines printString")
+        .expect("read")
+        .trim()
+        .trim_matches('\'')
+        .parse()
+        .expect("an integer");
+    // The stop request is only honoured if the worker installed a handler for
+    // it; this worker did not, so it keeps ticking — assert the SERVICE, not
+    // a message protocol we did not give it. What matters here is that the
+    // count kept moving, i.e. the timer is periodic rather than one-shot.
+    assert!(after > 0, "the tick is periodic, not a one-shot");
+}

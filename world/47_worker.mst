@@ -89,7 +89,7 @@ Object subclass: WorkerMessage [
  harmless to load anywhere."
 Object subclass: Worker [
     | id |
-    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler AnyDiedHook DeadlineSweepHook InFlightPeer InFlightCorr>
+    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler AnyDiedHook DeadlineSweepHook InFlightPeer InFlightCorr TickHandler>
 
     "── spawning (primary side) ──"
     Worker class >> spawn: initSource [
@@ -178,6 +178,39 @@ Object subclass: Worker [
         | h |
         h := self uiPeer.
         ^h isNil ifTrue: [ nil ] ifFalse: [ self new setId: h ]
+    ]
+
+    "── the frame tick (a VM service) ────────────────────────────────────
+     A worker is otherwise purely message-driven: it sleeps in its inbox and
+     wakes when somebody writes to it. That is exactly right for a tool and
+     useless for a GAME, which must advance whether or not anyone is talking
+     to it. So the VM will wake us on a cadence WE ask for — no timer thread,
+     no busy loop: the inbox wait the worker is already sitting in is simply
+     shortened to the next deadline, and the tick arrives through the same
+     door as a message, under the same rule (one thing at a time, top-level,
+     never nested).
+
+     `Worker tickEvery: 16` is 60 Hz; 33 is 30 Hz; 0 stops it. A tick that
+     raises retires the worker like any other guest fatal, and a tick block
+     that runs long simply delays the next — the deadline is measured from
+     the END of each tick, so a worker that cannot keep up loses rate instead
+     of accumulating a debt it then pays off in a burst."
+    Worker class >> tickEvery: ms [
+        TickHandler isNil ifTrue: [
+            Transcript showCr: 'Worker tickEvery: with no onTick: handler installed' ].
+        ^self primTickEvery: ms
+    ]
+
+    Worker class >> stopTick [ ^self primTickEvery: 0 ]
+
+    Worker class >> onTick: aBlock [ TickHandler := aBlock ]
+
+    "Run one tick. Called by the VM when the deadline passes — never by
+     application code, which should ask for a cadence and let the service
+     deliver it."
+    Worker class >> dispatchTick [
+        TickHandler isNil ifTrue: [ ^self ].
+        ^TickHandler value
     ]
 
     Worker class >> onMessage: aBlock [ Handler := aBlock ]
@@ -625,4 +658,5 @@ Object subclass: Worker [
     Worker class >> primAlive: i [ <primitive: 225> ^false ]
     Worker class >> primSelfId [ <primitive: 226> ^0 ]
     Worker class >> primUiPeer [ <primitive: 229> ^0 ]
+    Worker class >> primTickEvery: ms [ <primitive: 277> ^false ]
 ]
