@@ -483,6 +483,13 @@ pub fn install_app_delegate(app: Id) {
     extern "C" fn should_terminate(_self: Id, _cmd: Sel, _app: Id) -> u8 {
         1
     }
+
+    /// S3 (docs/process_services.md §4): the one exit hook AppKit gives us.
+    /// Runs the orderly sequence — timers stopped, workers poisoned, bounded
+    /// wait — then lets termination proceed regardless.
+    extern "C" fn will_terminate(_self: Id, _cmd: Sel, _note: Id) {
+        crate::shutdown::run_from_will_terminate();
+    }
     let superclass = get_class("NSObject");
     let cname = CString::new("MacvmCocoaAppDelegate").unwrap();
     let alloc_pair: extern "C" fn(Class, *const i8, usize) -> Class =
@@ -497,6 +504,12 @@ pub fn install_app_delegate(app: Id) {
             sel("applicationShouldTerminateAfterLastWindowClosed:"),
             should_terminate as extern "C" fn(Id, Sel, Id) -> u8 as *const c_void,
             types.as_ptr(),
+        );
+        add_method(
+            cls,
+            sel("applicationWillTerminate:"),
+            will_terminate as extern "C" fn(Id, Sel, Id) as *const c_void,
+            c"v@:@".as_ptr(),
         );
         let register_pair: extern "C" fn(Class) =
             unsafe { std::mem::transmute(sym("objc_registerClassPair")) };

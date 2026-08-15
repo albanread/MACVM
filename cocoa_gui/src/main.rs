@@ -22,6 +22,7 @@ mod format;
 mod game;
 mod host_service;
 mod objc;
+mod shutdown;
 mod panels;
 mod primary_restart;
 mod rebuild;

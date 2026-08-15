@@ -37,6 +37,10 @@ impl GameSink for CapSink {
     }
 }
 
+/// The two tests below share one process — and one process-global timer
+/// service, which the shutdown test deliberately stops. Serialize them.
+static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
 fn presents_in(cmds: &Arc<Mutex<Vec<GameCommand>>>) -> usize {
     cmds.lock()
         .unwrap()
@@ -47,6 +51,7 @@ fn presents_in(cmds: &Arc<Mutex<Vec<GameCommand>>>) -> usize {
 
 #[test]
 fn a_game_in_its_own_vm_renders_frames_on_the_vm_timer() {
+    let _x = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
     // The transcript SERVICE (the author's design): every VM writes to it
     // directly, and this test reads it directly — the game worker's words
     // are visible with no primary pump and no envelope chain, which is the
@@ -124,5 +129,46 @@ fn a_game_in_its_own_vm_renders_frames_on_the_vm_timer() {
     assert_eq!(
         after_kill, later,
         "a terminated game VM kept presenting frames — the tick outlived its VM"
+    );
+}
+
+/// S3's gate (`docs/process_services.md` §4): the exit sequence. Two ticking
+/// game VMs are alive; `orderly_shutdown` stops the timers, poisons both,
+/// and the process-level flags confirm every VM thread exited — with never a
+/// join anywhere.
+#[test]
+fn orderly_shutdown_stops_every_ticking_worker() {
+    let _x = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    let captured: Arc<Mutex<Vec<GameCommand>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    primary.set_worker_boot(Arc::new(move || {
+        let mut h = VmHandle::boot(opts(), Path::new("world"))?;
+        h.set_game_sink(Box::new(CapSink(cap.clone())));
+        Ok(h)
+    }));
+    for n in 0..2 {
+        primary
+            .exec(&format!(
+                "G{n} := Worker spawn: '[ Life launch. \
+                 Worker onTick: [ GamePane stepWithKeys: 0 mouseX: 0 y: 0 buttons: 0 ]. \
+                 Worker tickEvery: 16 ] value.'."
+            ))
+            .expect("spawn a ticking game VM");
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        presents_in(&captured) > 0,
+        "the games never started — nothing to shut down"
+    );
+
+    let all_dead = primary.orderly_shutdown(1000);
+    assert!(all_dead, "a worker survived the exit sequence's bounded wait");
+    let after = presents_in(&captured);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        after,
+        presents_in(&captured),
+        "frames after shutdown — a timer or a worker outlived the sequence"
     );
 }

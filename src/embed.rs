@@ -1812,6 +1812,19 @@ impl VmHandle {
     /// `GameStep` pattern): the host loop calls this, then execs
     /// `Worker dispatchPending.`, whose `primPoll` takes it. Rust bytes only
     /// — nothing here is visible to the GC.
+    /// S3's poison broadcast — every live spawned worker is sent the
+    /// terminate order. See [`crate::runtime::workers::terminate_all`].
+    /// The whole S3 exit sequence: timers stopped, workers poisoned, bounded
+    /// wait on the process-level flags. Answers whether everything died in
+    /// time; the caller exits either way.
+    pub fn orderly_shutdown(&mut self, wait_ms: u64) -> bool {
+        crate::runtime::workers::orderly_shutdown(&mut self.vm, wait_ms)
+    }
+
+    pub fn terminate_all_workers(&mut self) -> usize {
+        crate::runtime::workers::terminate_all(&mut self.vm)
+    }
+
     /// Tell this PRIMARY which of its registered workers is the UI — the
     /// display every app VM it later spawns is introduced to, and which is
     /// introduced to them (`docs/worker_peer_links.md` §3). Call once, right
@@ -1820,6 +1833,17 @@ impl VmHandle {
     /// degraded one.
     pub fn set_ui_peer(&mut self, handle: u32) -> bool {
         crate::runtime::workers::set_ui_peer(&mut self.vm, handle)
+    }
+
+    /// Hand this (worker-role) VM its own process-level liveness flag — the
+    /// exact Arc the table row holds (see `WorkerState::set_liveness`).
+    pub fn set_worker_liveness(
+        &mut self,
+        a: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        if let Some(ws) = self.vm.workers.as_mut() {
+            ws.set_liveness(a);
+        }
     }
 
     /// Hand this (worker-role) VM its own inbox — the link it offers as an
@@ -6080,8 +6104,27 @@ mod tests {
         )
         .expect("fresh worker is alive");
         vm.exec("WkTest w1 terminate.").expect("terminate");
-        vm.exec("WkTest w1 isAlive ifTrue: [ nil error: 'terminated worker must not be alive' ].")
-            .expect("terminated worker is not alive");
+        // S2 (docs/process_services.md): `terminate` is an ORDER (a poison
+        // envelope) and `isAlive` reports the FACT (the table flag the dying
+        // thread itself flips) — so there is a real, bounded gap between
+        // them. The old assertion pinned the lie: link-state false the
+        // instant terminate returned, while the thread still ran.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let alive = vm
+                .eval("WkTest w1 isAlive printString")
+                .expect("read liveness")
+                .trim()
+                .to_string();
+            if alive == "'false'" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminated worker never died (isAlive stayed {alive})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         // Sending to a terminated worker raises (primSend fails -> the world
         // method's error fallback), surfacing as a GuestError here.
         assert!(

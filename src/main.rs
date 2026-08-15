@@ -154,6 +154,10 @@ fn cmd_run(args: &[String], debug: bool) {
             macvm::codecache::guard::GUARD_ICACHE_BYTES.load(Relaxed),
         );
     }
+    // S3 (docs/process_services.md §4): the run is over — stop the timers,
+    // poison any workers it spawned, and give them a bounded moment to run
+    // their exits (never a join). A run that spawned nothing pays nothing.
+    macvm::runtime::workers::orderly_shutdown(&mut vm, 250);
     match result {
         Ok(()) => std::process::exit(vm.exit_code.unwrap_or(0)),
         Err(e) => {

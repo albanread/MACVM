@@ -442,6 +442,16 @@ fn primary_generation_main(
     // of File In's contract.
     let filein_birth = crate::filein::birth_stamp();
     while !stop.load(Ordering::Acquire) {
+        // S3 (docs/process_services.md §4): the exit sequence, run HERE
+        // because this thread owns the primary. applicationWillTerminate:
+        // raised the flag and is waiting (bounded) on the process-level
+        // liveness flags; we poison every live worker and acknowledge by
+        // those same flags going false. Timers were already stopped by the
+        // requester. One beat of latency at most.
+        if crate::shutdown::requested() {
+            primary.orderly_shutdown(250);
+            crate::shutdown::acknowledge();
+        }
         let m = primary.metrics();
         *metrics.lock().unwrap_or_else(|e| e.into_inner()) = m;
         mon.publish(m);

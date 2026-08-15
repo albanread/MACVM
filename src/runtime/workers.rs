@@ -391,6 +391,13 @@ pub enum WorkerState {
         /// simply offers no link and behaves exactly as it did before peer
         /// links existed.
         self_inbox: Option<InboxSender>,
+        /// THIS VM's own process-level liveness flag — the same Arc the
+        /// worker table row holds and the dying thread flips. Handed over at
+        /// birth so services (the timer) get the EXACT flag with no lookup:
+        /// handles are unique only within one primary, so a table search by
+        /// handle alone can find another primary's namesake (two test
+        /// primaries — or two GUI generations — both have a w1 gen1).
+        liveness: Option<Arc<AtomicBool>>,
         /// LINKS THIS WORKER HOLDS, not addresses it can resolve — id ->
         /// inbox for the peers it was introduced to at spawn and the ones it
         /// has learned by being messaged. There is no directory and no
@@ -436,7 +443,16 @@ impl WorkerState {
             pending: None,
             to_primary,
             self_inbox: None,
+            liveness: None,
             peers: Vec::new(),
+        }
+    }
+
+    /// Hand this worker its own process-level liveness flag (see the field's
+    /// own doc). Called by the worker thread beside `set_self_inbox`.
+    pub fn set_liveness(&mut self, a: Arc<AtomicBool>) {
+        if let WorkerState::Worker { liveness, .. } = self {
+            *liveness = Some(a);
         }
     }
 
@@ -823,6 +839,7 @@ fn worker_main(
     // Its own link, so anything it messages can answer it directly rather
     // than through the primary (`docs/worker_peer_links.md`).
     handle.set_self_inbox(self_inbox);
+    handle.set_worker_liveness(alive.clone());
     // And the display's link, installed BEFORE the init doit runs so a worker
     // whose very first act is to draw something already has somewhere to send
     // it. Introductions happen on this thread because the peer list lives in
@@ -1052,15 +1069,17 @@ pub fn alive(vm: &VmState, id: u32) -> bool {
     // flipped by the dying thread itself, readable with nobody pumping
     // anything. Hosted peers (the UI) have no table row and keep the link
     // check; a handle the registry never saw is dead either way.
-    if let Some(a) = worker_table_alive_arc(id) {
-        return a.load(Ordering::Acquire);
-    }
     let Some(ws) = vm.workers.as_ref() else {
         return false;
     };
-    let WorkerState::Primary { links, .. } = &**ws else {
+    let WorkerState::Primary { links, epoch, .. } = &**ws else {
         return false;
     };
+    // Scoped by OUR epoch: handles repeat across primaries (each generation's
+    // first worker is w1 gen1), so the row must be this primary's own.
+    if let Some(a) = worker_table_alive_arc_scoped(*epoch, id) {
+        return a.load(Ordering::Acquire);
+    }
     link_for(links, id).map(|l| l.alive).unwrap_or(false)
 }
 
@@ -1074,22 +1093,25 @@ pub fn tick_registration(vm: &VmState) -> Option<(u32, InboxSender, Option<Arc<A
         Some(WorkerState::Worker {
             self_id,
             self_inbox: Some(inbox),
+            liveness,
             ..
-        }) => Some((*self_id, inbox.clone(), worker_table_alive_arc(*self_id))),
+        }) => Some((*self_id, inbox.clone(), liveness.clone())),
         Some(WorkerState::Primary { inbox_tx, .. }) => Some((0, inbox_tx.clone(), None)),
         _ => None,
     }
 }
 
-/// The process-level liveness flag for worker `id` — the table row's own
-/// `Arc`, flipped by the dying thread itself, readable with nobody pumping
-/// anything. `None` for a handle the table never saw (a hosted peer).
-pub fn worker_table_alive_arc(id: u32) -> Option<Arc<AtomicBool>> {
+/// The process-level liveness flag for worker `id` OF PRIMARY `epoch` — the
+/// table row's own `Arc`, flipped by the dying thread itself, readable with
+/// nobody pumping anything. Epoch-scoped because handles are unique only
+/// within one primary. `None` for a handle this epoch never spawned (a
+/// hosted peer, someone else's namesake).
+pub fn worker_table_alive_arc_scoped(epoch: u64, id: u32) -> Option<Arc<AtomicBool>> {
     let table = WORKER_TABLE.lock().unwrap_or_else(|e| e.into_inner());
     table
         .iter()
         .rev()
-        .find(|r| r.worker_id == id)
+        .find(|r| r.primary_epoch == epoch && r.worker_id == id)
         .map(|r| r.alive.clone())
 }
 
@@ -1109,6 +1131,59 @@ pub fn ui_peer_handle(vm: &VmState) -> u32 {
         Some(WorkerState::Worker { peers, .. }) => peers.first().map(|(h, _)| *h).unwrap_or(0),
         None => 0,
     }
+}
+
+/// S3's poison broadcast (`docs/process_services.md` §4): every live spawned
+/// link gets the terminate order, exactly as `terminate` sends it, and is
+/// marked dead. Hosted peers (the UI — its thread is the host's) are NOT
+/// poisoned: their lifecycle belongs to the host that registered them.
+/// Answers how many were asked.
+pub fn terminate_all(vm: &mut VmState) -> usize {
+    let Some(ws) = vm.workers.as_mut() else {
+        return 0;
+    };
+    let WorkerState::Primary { links, .. } = &mut **ws else {
+        return 0;
+    };
+    let mut n = 0;
+    for link in links.iter_mut() {
+        if link.alive {
+            let _ = link.inbox.send(terminate_envelope());
+            link.alive = false;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// THE EXIT SEQUENCE (`docs/process_services.md` §4), shared by both hosts:
+/// stop the timers, poison every live worker, wait — bounded, on the
+/// process-level flags, NEVER a join (S21) — then return regardless. The
+/// caller exits either way; the sequence exists so guest code gets its
+/// `ensure:` blocks and the monitor its true final states, not to promise
+/// what a kill -9 can't.
+pub fn orderly_shutdown(vm: &mut VmState, wait_ms: u64) -> bool {
+    crate::runtime::timer_service::stop_all();
+    let asked = terminate_all(vm);
+    if asked == 0 {
+        return true;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
+    while std::time::Instant::now() < deadline {
+        if all_workers_dead() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    all_workers_dead()
+}
+
+/// Are all SPAWNED workers dead, by the process layer's own flags? Hosted
+/// rows never enter the table, so this is exactly "every VM thread we own
+/// has exited". The exit sequence polls this with a deadline — never a join.
+pub fn all_workers_dead() -> bool {
+    let table = WORKER_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    table.iter().all(|r| !r.alive.load(Ordering::Acquire))
 }
 
 /// Tell this primary which of its registered workers is the UI — the display

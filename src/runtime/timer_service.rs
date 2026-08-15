@@ -65,8 +65,17 @@ fn run(s: &Service) {
     let mut entries = s.entries.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if s.stopped.load(Ordering::Acquire) {
+            // Parked, not dead: entries are gone, but a later registration
+            // re-arms (tests exercise shutdown and then keep living; a real
+            // exit never registers again and this just sleeps into the
+            // process's end).
             entries.clear();
-            return;
+            let (guard, _) = s
+                .cv
+                .wait_timeout(entries, Duration::from_secs(3600))
+                .unwrap_or_else(|e| e.into_inner());
+            entries = guard;
+            continue;
         }
         // Sleep to the earliest deadline (or park until somebody registers).
         let now = Instant::now();
@@ -111,6 +120,8 @@ fn run(s: &Service) {
 pub fn set_tick(key: u32, ms: u64, target: InboxSender, alive: Option<Arc<AtomicBool>>) {
     let s = service();
     let mut entries = s.entries.lock().unwrap_or_else(|e| e.into_inner());
+    // A registration re-arms a parked service (see `run`'s stopped arm).
+    s.stopped.store(false, Ordering::Release);
     entries.retain(|e| e.key != key);
     if ms > 0 {
         entries.push(Entry {
