@@ -1045,6 +1045,16 @@ pub fn terminate(vm: &mut VmState, id: u32) -> bool {
 /// Is worker `id` believed alive (prim 225)? False once death is DETECTED
 /// (failed send / terminate) — not instantly at crash (§5).
 pub fn alive(vm: &VmState, id: u32) -> bool {
+    // TRUTH FROM THE PROCESS LAYER (docs/process_services.md S2). The link's
+    // flag updates only when this primary PUMPS the death notice — so it
+    // lies, for as long as the parent is busy, about a worker that died at
+    // birth (lived: an hour lost to exactly that). The table row's Arc is
+    // flipped by the dying thread itself, readable with nobody pumping
+    // anything. Hosted peers (the UI) have no table row and keep the link
+    // check; a handle the registry never saw is dead either way.
+    if let Some(a) = worker_table_alive_arc(id) {
+        return a.load(Ordering::Acquire);
+    }
     let Some(ws) = vm.workers.as_ref() else {
         return false;
     };

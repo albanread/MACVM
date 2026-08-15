@@ -95,7 +95,7 @@ Object subclass: WorkerMessage [
  harmless to load anywhere."
 Object subclass: Worker [
     | id |
-    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler AnyDiedHook DeadlineSweepHook InFlightPeer InFlightCorr TickHandler>
+    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler AnyDiedHook DeadlineSweepHook InFlightPeer InFlightCorr TickHandler DeathWatchers>
 
     "── spawning (primary side) ──"
     Worker class >> spawn: initSource [
@@ -298,6 +298,17 @@ Object subclass: Worker [
          child registration) by SupervisorRegistry. Routed shape-first in
          dispatchOne:, so once a tree exists deaths belong to it."
         DiedHandler := aBlock ]
+    "PLURAL death watchers (docs/process_services.md S2) — unlike the two
+     single-block hooks below, ANY number of parties may subscribe (AppVmHost
+     watches its apps; a future display watches its peers) and every one is
+     told every death. Fired unconditionally, before and independent of the
+     supervision routing."
+    Worker class >> alsoOnWorkerDied: aBlock [
+        DeathWatchers isNil ifTrue: [ DeathWatchers := OrderedCollection new ].
+        DeathWatchers add: aBlock.
+        ^self
+    ]
+
     Worker class >> onAnyWorkerDied: aBlock [
         "ServiceWorker's OWN death seam (docs/otp_workers_design.md §3.4/§4.2):
          unlike DiedHandler (SupervisorRegistry's, populated only once a tree
@@ -418,6 +429,8 @@ Object subclass: Worker [
              crash-isolation test observes deaths via onReply:, and
              unsupervised embeddings keep that behavior exactly."
             AnyDiedHook isNil ifFalse: [ AnyDiedHook value: (msg payload at: 2) ].
+            DeathWatchers isNil ifFalse: [
+                DeathWatchers do: [ :w | w value: (msg payload at: 2) ] ].
             DiedHandler isNil ifFalse: [
                 DiedHandler value: (msg payload at: 2).
                 ^self ] ].

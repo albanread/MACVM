@@ -103,7 +103,7 @@ Object subclass: AppVmClient [
 "────────────────────────────────────────────────────────────────────────
  ON THE PRIMARY — the only VM that can spawn, and the only thing it does."
 Object subclass: AppVmHost [
-    <classVars: Apps>
+    <classVars: Apps Watching>
 
     AppVmHost class >> apps ^ <Dictionary> [
         Apps isNil ifTrue: [ Apps := Dictionary new ].
@@ -118,8 +118,32 @@ Object subclass: AppVmHost [
      answers `spec` and takes `handle:value:` — the SAME two messages a tool
      implements for the in-process path, so a tool does not know or care which
      side of a VM boundary it is on."
+    "A DEAD APP IS REPORTED AND RETIRED (docs/process_services.md S2): the
+     death notice reaches this primary, the watcher names the app, removes
+     its entry (so liveCount is true), and says out loud what the display
+     will show — the window keeps its last frame, a known corpse rather than
+     a mystery. Installed once, on first start."
+    AppVmHost class >> watchDeaths [
+        Watching == true ifTrue: [ ^self ].
+        Watching := true.
+        Worker alsoOnWorkerDied: [ :deadId | AppVmHost noteDeath: deadId ].
+        ^self
+    ]
+
+    AppVmHost class >> noteDeath: deadId <Integer> [
+        | gone |
+        gone := nil.
+        self apps keysAndValuesDo: [ :k :w |
+            w id = deadId ifTrue: [ gone := k ] ].
+        gone isNil ifTrue: [ ^self ].
+        self apps removeKey: gone ifAbsent: [ nil ].
+        Transcript showCr: 'app ' , gone printString , ' died — its window keeps its last frame'.
+        ^self
+    ]
+
     AppVmHost class >> start: anId <Symbol> tool: aToolClassName <String> ^ <Object> [
         | w |
+        self watchDeaths.
         w := [ Worker spawn: (self initSourceFor: anId tool: aToolClassName) ]
             on: Error do: [ :e |
                 Transcript showCr: 'app ' , anId printString , ': ' , e messageText.

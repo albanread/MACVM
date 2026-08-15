@@ -278,3 +278,55 @@ fn a_primary_can_tick_too() {
     assert!(n >= 5, "the primary never ticked (TickN = {n})");
     primary.exec("Worker stopTick.").expect("and it stops");
 }
+
+/// S2's gates (`docs/process_services.md`): liveness is read from the
+/// process layer — `isAlive` answers false the moment the worker thread
+/// exits, with NOBODY pumping any inbox (the old link-based answer lied for
+/// as long as the parent was busy) — and a dead app is noticed, reported and
+/// retired by the death watcher when the notice arrives.
+#[test]
+fn liveness_is_true_unpumped_and_a_dead_app_is_retired() {
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    primary.set_worker_boot(Arc::new(|| VmHandle::boot(opts(), Path::new("world"))));
+
+    primary
+        .exec("AppVmHost start: #dx tool: 'WinDemoTool'.")
+        .expect("app starts");
+    assert_eq!(
+        eval(&mut primary, "(AppVmHost named: #dx) isAlive printString"),
+        "'true'"
+    );
+
+    // Kill it — and read liveness WITHOUT pumping anything. The table's own
+    // flag flips as the thread exits; the link's would still say true.
+    primary
+        .exec("(AppVmHost named: #dx) terminate.")
+        .expect("poison sent");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if eval(&mut primary, "(AppVmHost named: #dx) isAlive printString") == "'false'" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "isAlive never turned false — the table truth is not being read"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Now pump ONCE: the death notice arrives, the watcher names the app,
+    // retires the entry, and liveCount tells the truth.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        primary.exec("Worker dispatchInbox.").expect("pump the notice");
+        if eval(&mut primary, "(AppVmHost named: #dx) isNil printString") == "'true'" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the death watcher never retired the dead app"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(eval(&mut primary, "AppVmHost liveCount printString"), "'0'");
+}
