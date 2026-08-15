@@ -59,7 +59,7 @@ the Browser while it runs.
 
 | | |
 |---|---|
-| ![Breakout](10-demo-breakout.png) | **Breakout** — the reference game. Paddle on the arrow keys, brick collision, lives, score, sound. The best first read for anyone learning the engine. |
+| ![Breakout](10-demo-breakout.png) | **Breakout** — the reference game, mid-rally: holes eaten through the bottom rows, the ball in flight, and one life left of the three (the counter is top right). Paddle on the arrow keys, brick collision, lives, score, sound. The best first read for anyone learning the engine. |
 | ![Galaxigans](13-demo-galaxigans.png) | **Galaxigans** — a full arcade game: sprite sheets, waves, score, HUD, attract mode. |
 | ![Worms](12-demo-worms.png) | **Worms** — sprite handling and swarm movement. |
 | ![Game of Life](20-demo-life.png) | **Game of Life** — Conway, with the generation and population counted on screen (paused here at generation 161, after a drawn-in population settled into gliders and still lifes). SPACE pauses and resumes; the left button *draws* live cells and the right one erases, and because drawing reads the button's held state rather than a click, dragging paints a stroke. |
