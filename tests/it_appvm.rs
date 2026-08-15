@@ -330,3 +330,53 @@ fn liveness_is_true_unpumped_and_a_dead_app_is_retired() {
     }
     assert_eq!(eval(&mut primary, "AppVmHost liveCount printString"), "'0'");
 }
+
+/// S4's gate (`docs/process_services.md` §5): THE DISPLAY SPAWNS AN APP VM
+/// WITH THE PRIMARY UNINVOLVED. The primary boots, registers the display,
+/// grants it the epoch — and is then never exec'd again. The UI itself runs
+/// `Worker spawn:` through the fleet; the newborn is introduced to the
+/// display (which is its spawner's own window server), sends its first
+/// frame straight there, and a window opens. The language thread did
+/// nothing but exist.
+#[test]
+fn the_display_spawns_an_app_vm_with_the_primary_uninvolved() {
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    primary.set_worker_boot(Arc::new(|| VmHandle::boot(opts(), Path::new("world"))));
+    let epoch = primary.primary_epoch().expect("a primary has an epoch");
+    let (ui_id, ui_inbox, to_primary) = primary
+        .register_hosted_worker(Arc::new(|| {}))
+        .expect("register the display");
+    assert!(primary.set_ui_peer(ui_id));
+
+    let mut ui = VmHandle::boot(opts(), Path::new("world")).expect("display boots");
+    ui.install_worker_role(ui_id, to_primary);
+    ui.set_spawn_grant(epoch);
+    ui.exec("AppVmDisplay install.").expect("display listens");
+
+    // THE DISPLAY SPAWNS. From here on the primary is a bystander.
+    ui.exec(concat!(
+        "SpawnedApp := Worker spawn: ",
+        "'AppVmClient serve: ''WinDemoTool'' as: #gx.'."
+    ))
+    .expect("the display spawns the app VM");
+
+    drain_until(&mut ui, &ui_inbox, "waiting for the frame", |ui| {
+        eval(ui, "(AppVmDisplay frameFor: #gx) isNil not printString") == "'true'"
+    });
+    assert_eq!(
+        eval(&mut ui, "(AppToolWindow named: #gx) isOpen printString"),
+        "'true'",
+        "the app's window opened on the display that spawned it"
+    );
+    // And the round trip works without the primary too.
+    ui.exec("(AppToolWindow named: #gx) dispatch: #bump value: nil.")
+        .expect("event to the app");
+    drain_until(&mut ui, &ui_inbox, "waiting for the re-frame", |ui| {
+        eval(
+            ui,
+            "[ | out | out := ''. (AppVmDisplay frameFor: #gx) body children do: [ :c | \
+               c idOrEmpty = 'stateCard' ifTrue: [ c children do: [ :k | \
+                 k idOrEmpty = 'clicks' ifTrue: [ out := k at: #text ] ] ] ]. out ] value",
+        ) == "'clicks: 1'"
+    });
+}

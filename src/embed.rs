@@ -1835,6 +1835,15 @@ impl VmHandle {
         crate::runtime::workers::set_ui_peer(&mut self.vm, handle)
     }
 
+    /// S4b: grant this (worker-role) VM — the registered display — the
+    /// right to spawn into `epoch`. `Worker spawn:` then works here exactly
+    /// as it does on the primary, through the same fleet operation.
+    pub fn set_spawn_grant(&mut self, epoch: u64) {
+        if let Some(ws) = self.vm.workers.as_mut() {
+            ws.set_spawn_grant(epoch);
+        }
+    }
+
     /// Hand this (worker-role) VM its own process-level liveness flag — the
     /// exact Arc the table row holds (see `WorkerState::set_liveness`).
     pub fn set_worker_liveness(

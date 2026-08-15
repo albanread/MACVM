@@ -400,6 +400,12 @@ pub enum WorkerState {
         /// simply offers no link and behaves exactly as it did before peer
         /// links existed.
         self_inbox: Option<InboxSender>,
+        /// S4b (`docs/process_services.md` §5): the epoch this VM may spawn
+        /// INTO — granted by the host to exactly one worker-role VM, the
+        /// registered display. `None` for every ordinary worker, which is
+        /// the policy "workers don't spawn" expressed as an absent
+        /// capability rather than a refusal branch.
+        spawn_grant: Option<u64>,
         /// THIS VM's own process-level liveness flag — the same Arc the
         /// worker table row holds and the dying thread flips. Handed over at
         /// birth so services (the timer) get the EXACT flag with no lookup:
@@ -454,7 +460,16 @@ impl WorkerState {
             to_primary,
             self_inbox: None,
             liveness: None,
+            spawn_grant: None,
             peers: Vec::new(),
+        }
+    }
+
+    /// Grant this (worker-role) VM the right to spawn into `epoch` — the
+    /// display's capability, handed over by the host that registered it.
+    pub fn set_spawn_grant(&mut self, epoch: u64) {
+        if let WorkerState::Worker { spawn_grant, .. } = self {
+            *spawn_grant = Some(epoch);
         }
     }
 
@@ -695,10 +710,17 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
     // The registry half lives in the fleet now (S4): this VM contributes only
     // its epoch — the authorization — and the fleet does the rest.
     let ws = vm.workers.as_ref()?;
-    let WorkerState::Primary { epoch, .. } = &**ws else {
-        return None; // workers don't spawn (policy; the display gains it in S4b)
+    let epoch = match &**ws {
+        WorkerState::Primary { epoch, .. } => *epoch,
+        // S4b: the registered display carries a spawn grant; every other
+        // worker has none, and that absence IS the policy.
+        WorkerState::Worker {
+            spawn_grant: Some(e),
+            ..
+        } => *e,
+        _ => return None,
     };
-    crate::runtime::fleet::spawn(*epoch, init)
+    crate::runtime::fleet::spawn(epoch, init)
 }
 
 /// Register an *externally-hosted* worker on an EXISTING thread — no
