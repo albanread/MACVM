@@ -33,7 +33,7 @@
 "────────────────────────────────────────────────────────────────────────
  IN THE DEMO'S OWN VM."
 Object subclass: DemoVmClient [
-    <classVars: Fps>
+    <classVars: Fps StartGen>
 
     "Installed by the init source `DemoVmHost` ships, AFTER the demo's own
      entry doit has run (so `GamePane onStep:` is already registered). From
@@ -49,6 +49,12 @@ Object subclass: DemoVmClient [
      second copy; introspection is not worth a quoting hazard."
     DemoVmClient class >> serveAt: n <Integer> [
         Fps := n max: 1.
+        "WHICH STOP REQUESTS ARE OURS: the ones that come after we start. The
+         first version read a sticky boolean, so a single earlier Escape made
+         every later demo quit on its first beat — demos simply refused to
+         open. Recorded before the tick is installed, so no beat can precede
+         it."
+        StartGen := GamePane exitGeneration.
         Worker onMessage: [ :m | DemoVmClient handle: m payload ].
         "THE FRAME CLOCK IS THE VM'S OWN. No supervisor, no host loop, no
          sleep: the timer service wakes this VM, the tick dispatches top-level
@@ -75,7 +81,7 @@ Object subclass: DemoVmClient [
          input, and this notices on its very next beat and runs the same clean
          shutdown a menu stop runs. Checked BEFORE the step so the frame the
          user quit on is not drawn."
-        GamePane exitRequested ifTrue: [ ^self shutdown ].
+        GamePane exitGeneration > StartGen ifTrue: [ ^self shutdown ].
         ^[ GamePane stepFromInput ]
             on: Error do: [ :e |
                 Worker tickEvery: 0.

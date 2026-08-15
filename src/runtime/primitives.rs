@@ -2573,7 +2573,7 @@ fn prim_worker_tick_every(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 fn prim_game_input_state(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let _ = args;
     let s = crate::runtime::game_input::snapshot();
-    let a = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 5);
+    let a = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 6);
     a.at_put(0, SmallInt::new(s.keys).oop());
     a.at_put(1, SmallInt::new(s.mouse_x).oop());
     a.at_put(2, SmallInt::new(s.mouse_y).oop());
@@ -2588,6 +2588,14 @@ fn prim_game_input_state(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         } else {
             vm.universe.false_obj
         },
+    );
+    // The sixth is the process's monotonic count of stop requests. A demo
+    // captures it at birth and reacts when it MOVES — a request raised before
+    // this demo existed is not its request. (The flag alone was sticky and
+    // made every demo launched after one Escape exit on its first beat.)
+    a.at_put(
+        5,
+        SmallInt::new(i64::try_from(s.exit_generation).unwrap_or(i64::MAX)).oop(),
     );
     PrimResult::Ok(a.oop())
 }

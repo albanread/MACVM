@@ -744,11 +744,20 @@ Object subclass: GamePane [
      being told, and its whole frame loop is `Worker onTick: [ GamePane
      stepFromInput ]`."
     GamePane class >> inputState ^ <Array> [
-        "{keys. mouseX. mouseY. buttons. exitRequested}"
+        "{keys. mouseX. mouseY. buttons. exitRequested. exitGeneration}"
         <primitive: 279>
         "No host writing input (a CLI run, a test): rest, not an error — a
          demo stepped headlessly should behave like nobody is touching it."
-        ^Array with: 0 with: -1 with: -1 with: 0 with: false
+        ^{ 0. -1. -1. 0. false. 0 }
+    ]
+
+    "HOW MANY STOP REQUESTS this process has seen (Escape, close buttons),
+     counting only up. A demo records it at birth and ends itself when it
+     MOVES — a request raised before the demo existed is not its request.
+     `exitRequested` alone was sticky, and made every demo launched after one
+     Escape shut down on its first beat."
+    GamePane class >> exitGeneration ^ <Integer> [
+        ^self inputState at: 6
     ]
 
     "THE USER ASKED THIS DEMO TO STOP — Escape, or the pane's close button.

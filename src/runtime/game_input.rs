@@ -37,14 +37,29 @@ pub struct InputState {
     pub mouse_x: i64,
     pub mouse_y: i64,
     pub buttons: i64,
-    /// THE USER ASKED THIS DEMO TO STOP — Escape, or the pane's close button.
-    /// It rides with the input because that is what it IS: a key the user
+    /// THE USER ASKED A DEMO TO STOP — Escape, or the pane's close button. It
+    /// rides with the input because that is what it IS: a key the user
     /// pressed, read by the demo's own tick like every other key. A demo in a
-    /// VM of its own then ENDS ITSELF (`DemoVmClient`: stop the clock, close
-    /// the pane, announce, exit) instead of being killed from outside, which
-    /// is the whole difference between a program that quits and one that is
-    /// shot. Sticky until `reset` — a demo that reads it late still sees it.
+    /// VM of its own then ENDS ITSELF (`DemoVmClient`) instead of being killed
+    /// from outside — the difference between a program that quits and one that
+    /// is shot.
+    ///
+    /// A BOOLEAN WAS THE WRONG SHAPE, and shipped broken for exactly one
+    /// commit: the only thing that cleared it was the IN-PROCESS launch path,
+    /// so after a single Escape every demo launched into its own VM read a
+    /// stale `true` on its first beat and shut down instantly. Demos "refused
+    /// to open" — the author saw it before any test did.
+    ///
+    /// So the truth is [`exit_generation`], which only ever counts UP: a demo
+    /// records it at birth and reacts when it has moved. A request raised
+    /// before this demo existed cannot be its request — which is what "the
+    /// user asked THIS demo to stop" always meant. The flag below is kept for
+    /// a reader that just wants "was a stop asked during this session".
     pub exit_requested: bool,
+    /// How many stop requests this process has ever seen. Monotonic and NEVER
+    /// reset — a comparison that can go backwards is a bug waiting for a
+    /// second demo.
+    pub exit_generation: u64,
 }
 
 static STATE: Mutex<InputState> = Mutex::new(InputState {
@@ -53,6 +68,7 @@ static STATE: Mutex<InputState> = Mutex::new(InputState {
     mouse_y: -1,
     buttons: 0,
     exit_requested: false,
+    exit_generation: 0,
 });
 
 fn with<R>(f: impl FnOnce(&mut InputState) -> R) -> R {
@@ -77,7 +93,10 @@ pub fn set_mouse(x: i64, y: i64, buttons: i64) {
 /// The user asked the running demo to stop (Escape, the close button). Read
 /// by the demo itself; cleared when the next session resets.
 pub fn request_exit() {
-    with(|s| s.exit_requested = true);
+    with(|s| {
+        s.exit_requested = true;
+        s.exit_generation += 1;
+    });
 }
 
 /// No pane, no pointer — what a closed session reports.
@@ -88,12 +107,19 @@ pub fn clear_mouse() {
 /// Everything back to rest. A new session must not inherit the last one's held
 /// keys: a demo that ended with Left down would otherwise start walking.
 pub fn reset() {
-    with(|s| *s = InputState {
-        keys: 0,
-        mouse_x: -1,
-        mouse_y: -1,
-        buttons: 0,
-        exit_requested: false,
+    with(|s| {
+        // The generation SURVIVES a reset: it is the process's count of stop
+        // requests, not this session's state, and a demo compares against a
+        // value it captured earlier.
+        let gen = s.exit_generation;
+        *s = InputState {
+            keys: 0,
+            mouse_x: -1,
+            mouse_y: -1,
+            buttons: 0,
+            exit_requested: false,
+            exit_generation: gen,
+        };
     });
 }
 
@@ -121,16 +147,26 @@ mod tests {
                 mouse_x: 120,
                 mouse_y: 64,
                 buttons: 1,
-                exit_requested: false
+                exit_requested: false,
+                exit_generation: 0
             }
         );
         reset();
         let s = snapshot();
         assert_eq!(s.keys, 0, "a new session inherits no held keys");
         assert_eq!(s.mouse_x, -1, "no pane means no pointer");
+        let before = snapshot().exit_generation;
         request_exit();
         assert!(snapshot().exit_requested, "the stop key is readable");
+        assert_eq!(snapshot().exit_generation, before + 1, "the count moved");
         reset();
         assert!(!snapshot().exit_requested, "a new session starts unasked");
+        assert_eq!(
+            snapshot().exit_generation,
+            before + 1,
+            "the generation must SURVIVE a reset — a demo born after this \
+             request compares against it, and a count that goes backwards \
+             makes every later demo exit on its first beat"
+        );
     }
 }

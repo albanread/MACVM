@@ -333,3 +333,92 @@ fn an_exit_asked_from_outside_still_closes_the_pane() {
         std::thread::sleep(Duration::from_millis(25));
     }
 }
+
+/// A DEMO LAUNCHED AFTER AN EARLIER ONE WAS STOPPED MUST RUN. The bug this
+/// pins, reported from the chair before any test caught it: "games/demos
+/// refuse to open and close instantly after a couple have been closed, almost
+/// like there is a pending exit message hitting the new worker." Exactly that
+/// — the Escape request was a sticky global boolean whose only clear lived on
+/// the IN-PROCESS launch path, so one Escape poisoned every demo launched into
+/// a VM of its own from then on: each read the stale `true` on its first beat
+/// and shut itself down. The request is generational now — a demo reacts only
+/// to requests raised AFTER it started — and this walks the reported sequence:
+/// stop one demo the Escape way, launch another, and require it to still be
+/// running and drawing.
+#[test]
+fn a_demo_launched_after_a_stop_keeps_running() {
+    let _x = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+    macvm::runtime::game_input::reset();
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    let captured: Arc<Mutex<Vec<GameCommand>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    primary.set_worker_boot(Arc::new(move || {
+        let mut h = VmHandle::boot(opts(), Path::new("world"))?;
+        h.set_game_sink(Box::new(CapSink(cap.clone())));
+        Ok(h)
+    }));
+
+    // Two full cycles, because the report said "after a couple".
+    for round in 1..=2 {
+        primary
+            .exec("DemoVmHost start: 'Life launch'.")
+            .expect("launch a demo");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while presents_in(&captured) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: the demo never drew — it exited on a stop \
+                 request raised before it was born"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Escape (what the host's frame tick does when the key is down).
+        macvm::runtime::game_input::request_exit();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            primary.exec("Worker dispatchInbox.").expect("pump");
+            if primary
+                .eval("DemoVmHost liveCount printString")
+                .unwrap_or_default()
+                .trim()
+                == "'0'"
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: the demo ignored Escape"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        captured.lock().unwrap().clear();
+    }
+
+    // THE THIRD LAUNCH — the one that used to die instantly — must live and
+    // keep drawing, with two stop requests already behind it.
+    primary
+        .exec("DemoVmHost start: 'Life launch'.")
+        .expect("launch after two stops");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while presents_in(&captured) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "a demo launched after two stops never drew — a stale exit request \
+             reached a VM that did not exist when it was made"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let early = presents_in(&captured);
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        presents_in(&captured) > early,
+        "it drew once and stopped — it is still exiting on somebody else's Escape"
+    );
+    assert_eq!(
+        primary.eval("DemoVmHost liveCount printString").unwrap().trim(),
+        "'1'",
+        "the third demo should still be alive"
+    );
+    primary.exec("DemoVmHost stopAll.").expect("tidy up");
+}
