@@ -91,7 +91,9 @@ Object subclass: CocoaHelp [
             add: (Array with: 'Automation'     with: #automationText);
             yourself)).
         s add: (self section: 'Reference' articles: (OrderedCollection new
-            add: (Array with: 'Under the Hood' with: #internalsText);
+            add: (Array with: 'Numbers'         with: #numbersText);
+            add: (Array with: 'Dates and Times' with: #datesText);
+            add: (Array with: 'Under the Hood'  with: #internalsText);
             yourself)).
         Sections := s asArray.
         ^Sections
@@ -2279,11 +2281,11 @@ Otherwise the command line will show your new suite and the Tests tab will not �
 
     CocoaHelp class >> automationText [ ^'# Automation
 
-This environment is not a sealed application — it is live Smalltalk that answers from the outside as readily as from the Workspace. macVM ships an **AppleScript** dictionary, so any script — and any AI agent that can run `osascript` — can reach into the same running world your code already lives in.
+This environment is not a sealed application — it is live Smalltalk that answers from the outside as readily as from the Workspace. macVM ships an **AppleScript** dictionary, so any script — and any AI agent that can run `osascript` — can reach into the same running world your code already lives in. And the dictionary has grown past "run some code": a script can browse, debug, set breakpoints, and roll the whole world back.
 
-## AppleScript
+## Evaluate, browse, look
 
-macVM ships a scripting dictionary; open it in Script Editor with *File ▸ Open Dictionary…* and choose macVM. Then talk to the app by its bundle id:
+Open the dictionary in Script Editor with *File ▸ Open Dictionary…* and choose macVM, then talk to the app by its bundle id:
 
 ```ref
 tell application id "com.macvm.cocoa"
@@ -2295,9 +2297,47 @@ tell application id "com.macvm.cocoa"
 end tell
 ```
 
-`evaluate` runs a string of Smalltalk and hands back the result as text; if the code raises, that becomes a real AppleScript error you can catch with `try … on error`. It accepts an optional `time limit` in seconds, because it runs on the supervisor beat rather than blocking the window — the interface never freezes waiting on your expression. Beside it are the verbs `browse`, `snapshot in`, and `clear transcript`, and a handful of properties to read or set: `current view`, `appearance` (system, light, or dark), `workspace text`, and the read-only `transcript` and `busy`.
+`evaluate` runs a string of Smalltalk and hands back the result as text; if the code raises, that becomes a real AppleScript error you can catch with `try … on error`. It accepts an optional `time limit` in seconds, because it runs on the supervisor beat rather than blocking the window — the interface never freezes waiting on your expression.
 
-## From a script or an agent
+The properties are how a script *looks around*: `current view` (read-write — every tab name works: workspace, browser, browser2, outliner, editor, canvas, monitor, debugger, find, help), `appearance` (system, light, or dark), `workspace text` (read-write), `transcript` and `busy` (read-only), `transcript collapsed`, and the read-only selection trio `selected package`, `selected class`, `selected method` — whatever the Browser is pointed at right now.
+
+## Debug from a script
+
+The step debugger answers to scripting too. `debug` takes the same words the debugger''s own buttons mean, runs one, and answers the machine''s state — so a script (or an agent) can step and look, step and look:
+
+```ref
+tell application id "com.macvm.cocoa"
+    set breakpoint "Breakout" selector "tick"
+    evaluate "Breakout run" time limit 5
+    debug "frame 2"
+    debug "print ball"
+    debug "step"
+    get debugger state
+    debug "continue"
+    clear breakpoint "Breakout" selector "tick"
+end tell
+```
+
+`debug` understands `step`, `next`, `finish`, `continue`, `abort`, `frame N`, and `print <expr>` — the whole vocabulary of the Debugger tab, minus the mouse.
+
+## The world verbs
+
+The world is a database, and the database verbs are scriptable — the same operations as Caring for Your World, callable from automation:
+
+```ref
+tell application id "com.macvm.cocoa"
+    save snapshot                          -- answers the snapshot''s path
+    evaluate "..."                         -- something ambitious
+    revert last change                     -- undo the newest accepted method
+    restore snapshot                       -- back to the newest snapshot
+    compact world                          -- vacuum the database
+    revert world                           -- all the way back to the shipped world
+end tell
+```
+
+`restore snapshot` takes an optional `from (POSIX file …)`; without it, the newest snapshot wins. Together with `evaluate`, this is a transactional workflow: snapshot, experiment freely, and either keep the result or roll it back — from a script, with nothing touched by hand.
+
+## From a shell, or an agent
 
 Because AppleScript is reachable through `osascript`, macVM drives from a plain shell too — which is how a script, or an AI agent with a terminal, works the app without a hand on the mouse:
 
@@ -2309,11 +2349,10 @@ The result prints straight to standard output. Point anything that can shell out
 
 ## Why it matters
 
-Because it is Smalltalk all the way down, *automating the app* and *programming the system* are the same act. A script does not poke at a frozen interface from outside; it sends messages into the identical live world the Workspace talks to — the same objects, the same classes, the same worker that runs your code. The window is one client of that world; a script, or an agent, is simply another. Anything you can do here by hand, you can hand to something else to do for you.
+Because it is Smalltalk all the way down, *automating the app* and *programming the system* are the same act. A script does not poke at a frozen interface from outside; it sends messages into the identical live world the Workspace talks to — the same objects, the same classes, the same worker that runs your code. The window is one client of that world; a script, or an agent, is simply another. Anything you can do here by hand — evaluate, browse, debug, snapshot, revert — you can hand to something else to do for you.
 
 > evaluate turns an error into an answer instead of a hang: a raise inside your string comes back as an AppleScript error the caller can catch, never a spinning beachball.
 ' ]
-
     CocoaHelp class >> worldCareText [ ^'# Caring for Your World
 
 Your **world** is everything this system knows: every class, every method, the whole library and all the tools — including the browser you read it in. It is worth understanding where that lives, because keeping it safe is easy once you know, and bewildering if you don''t.
@@ -2383,6 +2422,96 @@ Every other Smalltalk hands you an **image**: a frozen snapshot of a running hea
 This world is not that. It is a **database** — rows for classes, rows for methods, each one versioned, queryable, revertable, exportable, and readable by tools that know nothing about Smalltalk. That is why you can walk a single method back through its history, prune the past without touching the present, archive the lot into a file you can email, and have every one of those operations be an ordinary transaction rather than an act of faith.
 
 > The world is not a class Smalltalk image. It is a database — and that is what makes it safe to change.
+' ]
+
+    CocoaHelp class >> numbersText [ ^'# Numbers
+
+macVM carries the full Smalltalk numeric tower, and its organising idea is **exactness**. Integers, fractions and scaled decimals are exact — arithmetic on them never loses a digit, however large it grows. Floats are the fast, approximate species you opt into. The tower coerces itself: mix any two kinds and the answer takes the more approximate side.
+
+## The kinds
+
+- `SmallInteger` — a tagged 61-bit integer, the everyday workhorse (`SmallInteger maxVal` is 2305843009213693951). Arithmetic that outgrows it **overflows automatically** into…
+- `LargePositiveInteger` / `LargeNegativeInteger` — arbitrary precision. `40 factorial` and `2 raisedTo: 100` just work; nothing wraps, nothing saturates.
+- `Fraction` — the exact quotient. `/` on integers answers one: `7/2` *is* seven halves, and it stays reduced — `(1/3) + (1/6)` answers `1/2`.
+- `ScaledDecimal` — exact decimal with a fixed scale, written `1.50s2`. Money arithmetic without float dust: `1.50s2 + 0.25s2` is `1.75s2`, exactly.
+- `Double` — the 64-bit IEEE float, written `0.1` or `1.0e10`. The approximate species, and the fastest: the JIT compiles Double loops to machine arithmetic.
+
+Comparison works across the tower — `(3/2) < 1.6` is true, `1 = 1.0` is true — and `asFloat`, `asInteger`, `rounded`, `truncated`, `floor`, `ceiling` move values between kinds when you want the crossing to be explicit (`3.7 rounded` is 4; `3.7 truncated` is 3).
+
+## Division, precisely
+
+Smalltalk gives you every division and does not make you guess which one you got:
+
+- `/` — the exact answer: `7/2` is a Fraction.
+- `//` and `\\` — **floored** quotient and remainder: `-7 // 2` is -4, `-7 \\ 2` is 1 (the remainder takes the divisor''s sign).
+- `quo:` and `rem:` — **truncated** toward zero: `-7 rem: 2` is -1.
+- `gcd:`, `lcm:` — the integer classics.
+
+## Bases and bits
+
+Integer literals take any radix — `16rFF` is 255, `2r1010` is 10 — and print back the same way: `255 printString: 16` answers `''ff''`. The bit protocol is all there: `bitAnd:`, `bitOr:`, `bitXor:`, `bitShift:` (`1 bitShift: 10` is 1024), `bitAt:`, `highBit`, `isPowerOfTwo`.
+
+## The transcendentals
+
+`sqrt`, `sin`, `cos`, `tan`, `arcSin`, `arcTan:`, `exp`, `ln`, `log`, `raisedTo:` are defined on **every** Number — `2 sqrt` and `1 sin` work straight off an integer, coercing through Float exactly as you would by hand. `Double pi` is there (the float class is named Double, as in Strongtalk), with `degreesToRadians` / `radiansToDegrees` beside it, and integer-exact `sqrtFloor` when you want the root without leaving the integers.
+
+## What to reach for
+
+- counting, indexing, ids — `SmallInteger`, and let it overflow into Large when it must
+- money, quantities that must not drift — `ScaledDecimal` or `Fraction`
+- geometry, physics, signal work — `Double`, the JIT''s favourite
+- number theory — Large integers and `gcd:`; exactness is the whole point
+
+The pinned behaviour lives in the numeric tests of the world suite — and every number in this article was produced by the running system before it was written down.
+' ]
+
+    CocoaHelp class >> datesText [ ^'# Dates and Times
+
+`Date today` and `Time now` answer this machine''s calendar and clock — zone-aware, daylight-saving included, read through the same C library the rest of the Mac trusts (`localtime_r`; the zone offset comes from the struct the OS fills in). Both classes are ordinary immutable values with ordinary protocol.
+
+## Date
+
+```
+Date today.                              "August 15, 2026"
+Date today dayOfWeek.                    "#Saturday"
+Date newDay: 25 month: #December year: 2026.
+```
+
+- **Construction** — `today`, `todayUTC`, `newDay:month:year:` (month by name) or `newDay:monthIndex:year:`, and `fromEpochSeconds:` for anything that came from Unix time.
+- **Accessors** — `year`, `month` (a Symbol like `#August`), `monthIndex`, `dayOfMonth`, `dayOfWeek` / `dayOfWeekIndex`, `dayOfYear`, `daysInMonth`, `isLeapYear`.
+- **Comparison** — `<`, `<=`, `>`, `=` all work, so dates sort and compare directly.
+
+## Date arithmetic
+
+The honest unit is the **epoch day**: `asEpochDays` answers days since 1970, exact and timezone-free, and `fromEpochSeconds:` builds a Date back. Add days as integers in between:
+
+```
+| deadline |
+deadline := Date fromEpochSeconds: (Date today asEpochDays + 30) * 86400.
+deadline printString.
+```
+
+(Strongtalk''s own Date shipped its Julian-day arithmetic unfinished — `addDays:` was never implemented in the original — so macVM keeps the arithmetic where it is real: on the integers.)
+
+## Time
+
+```
+Time now.                                "11:51:59"
+Time now hour.
+```
+
+- `now` / `nowUTC` — the wall clock, zone-aware, as a Time holding seconds-since-midnight.
+- `hour`, `minute`, `second` — the clock-face reading; `minutes` and `asSeconds` are the running totals.
+- `fromSeconds:` builds one; Times compare with the same `<`, `<=`, `>`, `=` set.
+
+## Measuring, not telling
+
+Two clocks, two jobs — and mixing them up is the classic bug:
+
+- `Time secondsSinceEpoch` is **calendar time**: Unix seconds, right for timestamps that leave the machine.
+- `Time millisecondClockValue` is **elapsed time since the VM started**: right for measuring, wrong for telling time. The convenience is `Time millisecondsToRun: [ … ]`, which brackets a block with it and answers the cost.
+
+> Everything on this page was executed before it was written: the dates you see are the day this article was generated, on the machine that generated it.
 ' ]
 
     CocoaHelp class >> internalsText [ ^'# Under the Hood
