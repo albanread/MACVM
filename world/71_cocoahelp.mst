@@ -76,9 +76,11 @@ Object subclass: CocoaHelp [
             add: (Array with: 'The Strongtalk World'   with: #worldText);
             add: (Array with: 'Exceptions'             with: #exceptionsText);
             add: (Array with: 'Strings and Text'       with: #stringsText);
+            add: (Array with: 'Workers and VMs'        with: #workersText);
             yourself)).
         s add: (self section: 'The Environment' articles: (OrderedCollection new
             add: (Array with: 'The Environment'       with: #environmentText);
+            add: (Array with: 'The Monitor'           with: #monitorText);
             add: (Array with: 'Caring for Your World' with: #worldCareText);
             yourself)).
         s add: (self section: 'Guides' articles: (OrderedCollection new
@@ -1378,7 +1380,7 @@ Not a museum piece, not an emulator, and not a toy. It is a working system for b
 
 ---
 
-> The dream was always a system that is *alive all the way down*, and fast enough that you never have to apologise for it. That dream now runs on the machine in front of you.
+> The dream was always a system that is alive all the way down, and fast enough that you never have to apologise for it. That dream now runs on the machine in front of you.
 ' ]
 
     CocoaHelp class >> historyText [ ^'# History and Credits
@@ -1506,7 +1508,7 @@ Full ANSI-style exceptions, implemented in the world itself:
 
 Handlers can `return:`, `retry`, `pass`, and `resume:` — the whole protocol.
 
-> Try every one of these **right now**: copy a line into the Workspace and press Cmd-P. The best way to learn Smalltalk is to ask the system.
+> Try every one of these RIGHT NOW: copy a line into the Workspace and press Cmd-P. The best way to learn Smalltalk is to ask the system.
 ' ]
 
     CocoaHelp class >> environmentText [ ^'# The Environment
@@ -1598,7 +1600,7 @@ Source files are the truth, but edits made in the browsers persist to a versione
 
 `BenchmarkDashboard` drives the classic suite — richards, deltablue, and the micro set — with the same workloads and the same clocks used to compare against Cog and the Dart VM. The numbers on the project''s wall came from here.
 
-> Read the world the way you would read a good book: start at `01_object.mst` and just keep going. There is no magic underneath — it is Smalltalk all the way down until you hit the VM.
+> Read the world the way you would read a good book: start at 01_object.mst and just keep going. There is no magic underneath — it is Smalltalk all the way down until you hit the VM.
 ' ]
 
     CocoaHelp class >> exceptionsText [ ^'# Exceptions
@@ -1735,181 +1737,171 @@ Conversion is where encoding questions belong, and it is **loud**: a String whos
 The pinned truth lives in `world/tests/56` and `57`: every number above is asserted there, from both sides of the disagreement.
 ' ]
 
+    CocoaHelp class >> workersText [ ^'# Workers and VMs
+
+macVM is a **multi-VM system**. The window you are looking at is drawn by one Smalltalk VM (the *interface* VM, on the main thread); your code runs in another (the *primary*); and either can spawn more — each with its **own heap, its own JIT, and its own OS thread**, up to thirty-two of them. The games in the Demos menu and the apps in the Tools menu each run in a VM of their own. On a machine with this many cores, parallel Smalltalk is just Smalltalk.
+
+## No shared state — ever
+
+Everything that crosses a VM boundary is a **deep copy**, carried as pickle bytes and rebuilt on the far side. There is no shared object, no lock, and no identity across heaps: you cannot race on what you cannot reach. What crosses is *data* — numbers, strings, arrays, whole object graphs. Blocks do not pickle, which is why messages carry event names and payloads rather than code — and classes never need to cross, because **every VM boots the same world**.
+
+## Spawn, send, reply
+
+```
+| w |
+w := Worker spawn: ''Worker onMessage: [ :m | Worker reply: m payload ]''.
+w send: #(1 2 3) onReply: [ :r | Transcript showCr: ''echoed: '' , r printString ].
+```
+
+The spawn argument is an **init doit**, run once in the fresh VM — installing the `onMessage:` handler is what it is for. `send:` never waits: the sender carries on, and the reply arrives later as a **continuation**, matched by correlation id. Inside the worker, messages are dispatched strictly serially — one to completion before the next, so a handler never sees itself re-entered.
+
+A handler receives a `WorkerMessage`: `payload` is the rebuilt copy, `from` says who sent it. `Worker reply:` answers the sender; `w send:` (no reply block) is fire-and-forget.
+
+## Endings
+
+Two ways out, and they are not the same:
+
+- `w terminate` — an outside decision. The worker''s thread is asked to stop and its resources are reclaimed.
+- `Worker exit: reason` — the VM ends **itself**, on purpose: teardown runs, `ensure:` blocks fire, a goodbye is announced. Closing an app window works this way — the display *asks* the app to leave, and the app owns its own ending.
+
+A death, either kind, is delivered to the spawner as an ordinary message — `{#workerDied. id}` down the same inbox as everything else — and `Worker onWorkerDied:` hooks it. Supervisors are built from nothing more: the app host that relaunches a crashed tool is a dozen lines of this.
+
+## Watching them
+
+The **Monitor** tab is the roster: one row per live VM with its memory, GC and JIT counters. Spawn the echo worker above and watch it appear; right-click a row to ask a VM to exit. The transcript is also multi-VM aware — every VM writes to it directly, and worker lines arrive tagged with their id.
+' ]
+
+    CocoaHelp class >> monitorText [ ^'# The Monitor
+
+The Monitor tab is the answer to one question, kept live: **what are all these VMs doing?** One table row per running VM — the primary, the interface VM, every spawned worker, app and demo — refreshed at a period you pick from the popup.
+
+## The columns
+
+- **VM / KIND / STATE** — who it is, what role it plays, and what it is doing now.
+- **MEMORY / HEAP** — bytes in use against the heap''s size.
+- **GC S·F** — collections so far: scavenges (the cheap, young-space ones) and full collections.
+- **ALLOC/S** — allocation rate, derived here from the raw totals and the refresh period you chose. The busiest VM in the room is whoever''s number this is.
+- **NMETHODS / COMPILES / DEOPTS / IC MISSES** — the JIT at work: how much compiled code exists, how fast it is being made, how often speculation had to be unwound, and how often a send site met a receiver it had not seen before.
+
+## How to read it
+
+A healthy program **warms up**: COMPILES climbs while the JIT meets your hot loops, then settles; DEOPTS ticks a little as it learns and then goes quiet. A DEOPTS column that keeps climbing means code is being re-profiled over and over — worth a look. ALLOC/S tells you who is generating garbage; GC S·F tells you what it costs. Scavenges are routine; frequent *full* collections are the number to respect.
+
+## The bridge band
+
+Below the table, the **UI BRIDGE** band counts the main-thread work no VM-side counter can see: drain passes, delegate callback dispatches, worker envelopes, script requests. When the interface feels busy, this is where busy is visible.
+
+## Asking a VM to leave
+
+Right-click a row and **Send exit** asks that VM to end itself — the polite form: its teardown runs, its `ensure:` blocks fire, and it announces its own ending. Nothing here kills. A VM that dies on its own stays on the roster for a minute — marked, so a crash is a fact you can see rather than a row that vanished — and is then buried, with anything it left behind audited.
+' ]
+
     CocoaHelp class >> appGuideText [ ^'# Guide: Build an App
 
-We are going to add a **temperature converter** to this window — drag a slider, read Celsius, Fahrenheit and Kelvin at once — while the system runs. Every block with a play button is a **complete program**; nothing carries over between presses, so each step shows the whole thing again.
+We are going to build a **thermometer** — drag a slider, read Celsius and Fahrenheit — twice. First live in this window, then as a program running in a **VM of its own**. Both times the routine is the same, and it is the reactive one:
 
-> **Where this code runs.** MACVM keeps two VMs. Your own work runs in the **primary**; the **interface** VM owns the window and everything AppKit. View code — `CocoaUI`, `Cocoa classNamed:`, `MacvmDelegate` — exists only in the interface VM, so the buttons on this page run these blocks *there*. Paste them into the Workspace instead and you get `undeclared variable ''CocoaUI''`, because the Workspace talks to the primary.
+> STATE IN, WINDOW OUT. Your code holds some state and answers a description of the whole window — a spec. An event arrives, your handler changes the state, and the window is described again. You never touch a control: what is on screen is a function of the state, so the two cannot disagree. The differ is what makes this affordable — it compares the new spec to the old and patches only what changed.
 
-## 1. The scale of everything
+The pieces are `AppSpec` (specs are pure data — no Cocoa in them anywhere) and `AppToolWindow` (which owns the native window, the controls, and their whole lifecycle — you never retain, wire, or free a view).
 
-Press play. This is a temperature explorer: twelve landmarks from **absolute zero to the surface of the sun**, with the colour, the bar and the numbers all following the slider.
+## 1. A window is data
+
+A spec is a tree of typed nodes: containers (`stack:`, `row:`, `grid:columns:`, `card:`), controls (`heading:`, `text:`, `button:event:`, `slider:value:min:max:event:`, `input:value:event:`, `checkbox:checked:event:`, `select:value:options:event:`), and panes for pixels. Two rules do all the work:
+
+- **Every node gets an id** — the last keyword of every constructor. The differ''s law is that identity is *(type, id)*: same identity with changed props patches in place; different identity rebuilds that subtree. Name everything and your window updates by tiny patches forever.
+- **Handlers are not in the tree.** A control carries an event *name* (`#set`, `#reset`); the spec stays pure data — which is also exactly what lets it travel between VMs later.
+
+## 2. Open it live
+
+This block is a complete reactive app. The state is one variable; the render block reads it; the handler writes it and asks for a rerender:
 
 ```ui
-Object subclass: TempScale [
-    <classVars: Slider Name Readout Bar Fill BarW BarY>
-    TempScale class >> stops [
-        | t |
-        t := OrderedCollection new.
-        t add: (Array with: ''Absolute zero''      with: -273).
-        t add: (Array with: ''Liquid nitrogen''    with: -196).
-        t add: (Array with: ''Dry ice''            with: -78).
-        t add: (Array with: ''Water freezes''      with: 0).
-        t add: (Array with: ''A warm room''        with: 20).
-        t add: (Array with: ''Your body''          with: 37).
-        t add: (Array with: ''A hot bath''         with: 45).
-        t add: (Array with: ''Water boils''        with: 100).
-        t add: (Array with: ''A pizza oven''       with: 450).
-        t add: (Array with: ''Flowing lava''       with: 1200).
-        t add: (Array with: ''Steel melts''        with: 1500).
-        t add: (Array with: ''Surface of the sun'' with: 5500).
-        ^t asArray
+| celsius |
+celsius := 21.
+AppToolWindow register: #thermo title: ''Thermometer''
+    width: 360 height: 240
+    render: [ AppSpec window: ''Thermometer'' id: #thermoWin body: (
+        AppSpec stack: (Array
+            with: (AppSpec heading: celsius printString , '' degrees C'' id: #big)
+            with: (AppSpec slider: ''Celsius'' value: celsius
+                           min: -30 max: 50 event: #set id: #dial)
+            with: (AppSpec text: ''Fahrenheit: '' ,
+                           (celsius * 9 / 5 + 32) asFloat printString id: #fahr))
+            id: #col) ]
+    handler: [ :event :value |
+        event == #set ifTrue: [ celsius := value rounded ].
+        (AppToolWindow named: #thermo) rerender ].
+AppToolWindow open: #thermo.
+```
+
+Drag the slider. The heading and the Fahrenheit line follow — that is the handler writing `celsius` and the rerender describing the window again. Two things worth noticing in the code:
+
+- The state lives in the **closure**. No class, no instance variables — for a window this size, a block''s own captured variable is enough.
+- `asFloat` is doing real work: `37 * 9 / 5` is Smalltalk arithmetic, so it is the *exact* fraction `333/5` until you ask for a Float. Leave it off and your thermometer reads `493/5` — precisely correct and no use to anybody.
+
+Run the block again and you get a fresh registration and a fresh window; close the spare — close **hides** a tool window, so your state survives it.
+
+## 3. Watch it patch, not rebuild
+
+The framework counts its own work, and the counters are the proof of the id discipline:
+
+```ui
+Transcript showCr: ''patches: '' , AppToolWindow patchCount printString ,
+    ''  rebuilds: '' , AppToolWindow rebuildCount printString.
+(AppToolWindow named: #thermo) dispatch: #set value: 37.
+Transcript showCr: ''patches: '' , AppToolWindow patchCount printString ,
+    ''  rebuilds: '' , AppToolWindow rebuildCount printString.
+```
+
+`dispatch:value:` is exactly what a real slider drag delivers. Each one costs a few prop patches — `patches` grows, `rebuilds` stands still. Remove an `id:` from a node in step 2 and watch the difference: `normalize` stamps a positional auto-id on it, and the moment a sibling shifts, that subtree rebuilds instead of patching.
+
+## 4. When your code is wrong
+
+Three failures, three honest outcomes, none of them fatal:
+
+- A render block that **raises** is reported to the transcript and the window keeps its last frame.
+- A **malformed spec** is refused before it is half-realized, and the report names the tool.
+- A handler that raises does not take the window down — fix it and carry on. The system stays live throughout; that is the whole point of a Smalltalk.
+
+## 5. A program of its own
+
+The **Tools** menu already runs apps this way: *Declarative Demo*, *Mixed Demo*, and the AppSpec sprite and sound editors are all reactive tools, and with **Debug ▸ Launch in own VM** on (the default), each one runs in a freshly spawned VM on its own thread and core:
+
+```ui
+CocoaUI launchApp: #demo tool: ''WinDemoTool'' panes: false.
+```
+
+Three VMs share the work, and each does one thing. The **primary** spawns the app VM — that is all. The **app VM** holds the model, the render block and the handler; it answers *frames* (whole specs, pickled across as real objects). The **interface VM** realizes frames and sends *events* back. The two ends talk directly. Your logic can loop, allocate, or crash without the window ever stuttering — and if the app VM dies, its window keeps the last frame while the transcript says so. Closing the window *asks the app to end*; it tears down, runs its `ensure:` blocks, and exits its VM.
+
+A tool that can be launched this way is just a class that answers `spec` and takes `handle:value:` — the same two messages as step 2, so **a tool does not know or care which side of a VM boundary it is on**:
+
+```ref
+Object subclass: Thermometer [
+    <classVars: Celsius>
+    Thermometer class >> celsius [ ^Celsius isNil ifTrue: [ 21 ] ifFalse: [ Celsius ] ]
+    Thermometer class >> spec [
+        ^AppSpec window: ''Thermometer'' id: #thermoWin body: ( "...as step 2..." )
     ]
-    "Cold is blue, hot is red, and the sun is white-hot."
-    TempScale class >> colorFor: c [
-        | r g b |
-        c < 0
-            ifTrue:  [ r := 40.  g := 90 + (c max: -273) // 4. b := 255 ]
-            ifFalse: [ c < 100
-                ifTrue:  [ r := 60 + (c * 2). g := 170. b := 200 - c ]
-                ifFalse: [ c < 1500
-                    ifTrue:  [ r := 255. g := 60 + (c // 12). b := 40 ]
-                    ifFalse: [ r := 255. g := 220. b := 120 + (c // 60) ] ] ].
-        ^(Cocoa classNamed: ''NSColor'') onMain
-            colorWithRed: (r min: 255) / 255.0
-            green: (g min: 255) / 255.0
-            blue: (b min: 255) / 255.0
-            alpha: 1.0
+    Thermometer class >> handle: event value: value [
+        event == #set ifTrue: [ Celsius := value rounded ]
     ]
-    TempScale class >> update [
-        | i stop c f k w |
-        i := (Slider onMain doubleValue) rounded max: 1.
-        stop := self stops at: (i min: self stops size).
-        c := stop at: 2.
-        f := (c * 9 / 5 + 32) rounded.
-        k := c + 273.
-        Name onMain setStringValue: (stop at: 1).
-        Readout onMain setStringValue:
-            c printString , '' C     '' , f printString , '' F     '' , k printString , '' K''.
-        w := BarW * i // self stops size.
-        Fill onMain setFrame: (Array with: 24.0 with: BarY with: w asFloat with: 26.0).
-        Fill onMain setFillColor: (self colorFor: c).
-        Name onMain setTextColor: (self colorFor: c)
-    ]
-    TempScale class >> containerView [
-        "Fill the pane and lay out from the TOP. A view built at a fixed size
-         sits in the bottom-left corner of a big window, because AppKit''s
-         origin is bottom-left and nothing told it otherwise. Take the host''s
-         size, measure down from `h`, and pin each control with
-         maskMinYMargin (keep the distance to the top) so a resize behaves."
-        | v holder delegate title frame w h top |
-        frame := CocoaUI contentHost onMain frame.
-        w := frame at: 3. h := frame at: 4.
-        BarW := (w - 48) min: 560.
-        v := ((Cocoa classNamed: ''NSView'') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
-        v onMain setAutoresizesSubviews: true.
-        top := h - 56.
-        title := ((Cocoa classNamed: ''NSTextField'') onMain alloc) onMain
-            initWithFrame: (Array with: 24.0 with: top with: 400.0 with: 22.0).
-        title onMain setAutoresizingMask: CocoaUI maskMinYMargin.
-        title onMain setEditable: false. title onMain setBordered: false.
-        title onMain setDrawsBackground: false.
-        title onMain setStringValue: ''How hot is the universe?''.
-        v onMain addSubview: title.
-        Name := ((Cocoa classNamed: ''NSTextField'') onMain alloc) onMain
-            initWithFrame: (Array with: 24.0 with: top - 44 with: 500.0 with: 30.0).
-        Name onMain setAutoresizingMask: CocoaUI maskMinYMargin.
-        Name onMain setEditable: false. Name onMain setBordered: false.
-        Name onMain setDrawsBackground: false.
-        Name onMain setFont: ((Cocoa classNamed: ''NSFont'') onMain
-                                  boldSystemFontOfSize: 22.0).
-        v onMain addSubview: Name.
-        Readout := ((Cocoa classNamed: ''NSTextField'') onMain alloc) onMain
-            initWithFrame: (Array with: 24.0 with: top - 76 with: 500.0 with: 22.0).
-        Readout onMain setAutoresizingMask: CocoaUI maskMinYMargin.
-        Readout onMain setEditable: false. Readout onMain setBordered: false.
-        Readout onMain setDrawsBackground: false.
-        Readout onMain setFont: ((Cocoa classNamed: ''NSFont'') onMain
-                                     userFixedPitchFontOfSize: 14.0).
-        v onMain addSubview: Readout.
-        "Track and fill are SIBLINGS, both in the parent view. Putting the
-         fill INSIDE the track looks natural but an NSBox parents subviews
-         into its own content view, which is inset from its frame — the fill
-         then overhangs the top and left edges and reads as a drop shadow.
-         The fill is added second, so it draws over the track."
-        BarY := top - 120.
-        Bar := ((Cocoa classNamed: ''NSBox'') onMain alloc) onMain
-            initWithFrame: (Array with: 24.0 with: BarY with: BarW with: 26.0).
-        Bar onMain setAutoresizingMask: CocoaUI maskMinYMargin.
-        Bar onMain setBoxType: 4. Bar onMain setTitlePosition: 0.
-        Bar onMain setFillColor: ((Cocoa classNamed: ''NSColor'') onMain
-                                      quaternaryLabelColor).
-        v onMain addSubview: Bar.
-        Fill := ((Cocoa classNamed: ''NSBox'') onMain alloc) onMain
-            initWithFrame: (Array with: 24.0 with: BarY with: 100.0 with: 26.0).
-        Fill onMain setAutoresizingMask: CocoaUI maskMinYMargin.
-        Fill onMain setBoxType: 4. Fill onMain setTitlePosition: 0.
-        v onMain addSubview: Fill.
-        Slider := ((Cocoa classNamed: ''NSSlider'') onMain alloc) onMain
-            initWithFrame: (Array with: 24.0 with: top - 160 with: BarW with: 24.0).
-        Slider onMain setAutoresizingMask: CocoaUI maskMinYMargin.
-        Slider onMain setMinValue: 1.0.
-        Slider onMain setMaxValue: self stops size asFloat.
-        Slider onMain setNumberOfTickMarks: self stops size.
-        Slider onMain setAllowsTickMarkValuesOnly: true.
-        Slider onMain setDoubleValue: 5.0.
-        Slider onMain setContinuous: true.
-        holder := CocoaToolbarAction on: [ self update ].
-        delegate := MacvmDelegate actionTargetOn: holder.
-        Slider onMain setTarget: delegate.
-        Slider onMain setAction: ''macvmAction:''.
-        v onMain addSubview: Slider.
-        self update.
-        ^v
+    Thermometer class >> install [
+        AppToolWindow register: #thermo title: ''Thermometer'' width: 360 height: 240
+            render: [ Thermometer spec ]
+            handler: [ :e :v | Thermometer handle: e value: v.
+                               (AppToolWindow named: #thermo) rerender ]
     ]
 ]
 ```
 
-Four ideas carry the whole thing. **`Cocoa classNamed:`** fetches a real AppKit class. **`onMain`** sends the message on the UI thread — that is the entire bridge. **`MacvmDelegate actionTargetOn:`** is the event story: AppKit calls the delegate, the delegate runs your block. And the drawing is nothing exotic — a grey `NSBox` with a coloured `NSBox` inside it that you resize, which is all a bar chart ever is.
+One rule matters here: a spawned VM boots **the world**, not your Workspace — a class defined in a doit exists only in the VM that ran the doit. So a tool headed for its own VM lives in a world file: write it in the **Editor** tab and use **Add to World**, or drop the file in `world/` yourself, add it to `world.list`, and reseed (`./reseed-world.sh` — the app boots from the image, not from `.mst` files). Then `AppVmHost start: #thermo tool: ''Thermometer''` — or a Tools-menu entry — runs it in a VM of its own.
 
-`setAllowsTickMarkValuesOnly: true` makes the slider snap from landmark to landmark; `setContinuous: true` makes it report while you drag rather than when you let go.
+## 6. Pixels, and the escape hatch
 
-## 2. Give it a tab
+When a window needs drawing, the spec *places* a pane (`rgbaPane:width:height:`, `indexedPane:`, `textGrid:columns:rows:`) and a `paint:` block fills it — pixels are yours, placement is the framework''s. The AppSpec sprite editor is built exactly this way; read `world/91b_winspriteed.mst`. And a spec can embed a hand-built native view with `foreignView:` — declarative, mixed, and fully-native are all allowed.
 
-```ui
-CocoaUI registerViewNamed: #temp title: ''Temperature'' icon: ''thermometer.medium''
-        container: [ TempScale containerView ]
-        onShow: [ ].
-```
-
-A **Temperature** icon appears in the toolbar — click it and drag. The icon name is an SF Symbol; the base name of an SVG in `gui/assets/icons-mono/` works too.
-
-## 3. Change it while it runs
-
-Edit step 1 — add Rankine, or colour the readout blue below zero — press its play button, click another tab and back. The view rebuilds with your changes. Nothing restarted; the system stayed live throughout. That is the whole point of a Smalltalk.
-
-## 4. Keep it in a file — the familiar way
-
-Nothing here obliges you to grow the image. Treat the VM and image as your operating system, and your program as an ordinary document:
-
-1. Write the class in a plain `.mst` file — the **Editor** tab, or any editor, anywhere you like; your Documents folder is fine.
-2. **File ▸ File In.** The primary restarts from its clean boot state and loads your file on top — the same as `macvm run yourfile.mst`, but inside the running app. Because it starts from a fresh world every time, the same file files in again and again without stale-shape errors.
-3. Run it.
-
-Edit, file in, try. Your work lives in your file, not tangled into the image — and a file-in never leaves the world in a state you cannot get back to.
-
-## 5. Or make it part of the world
-
-When something has earned a permanent place, the Editor''s **Add to World** graduates its file into `world/user_<name>.mst`, adds it to `world.list`, imports it into the image, and restarts the primary with it present — so every future fresh world, and every reseed, still has it.
-
-By hand: drop the file in `world/`, add a line to `world/world.list` (or `world/cocoaui.list` for view code), then run `./reseed-world.sh` — **the app boots from `world/image.sqlite3`, not from the `.mst` files**, so without a reseed your file is never read.
-
-The Docs view you are reading took that path — read `world/71_cocoahelp.mst` for a complete worked example, sidebar and all.
-
-> Every view in this window — Browser, Debugger, this one — is built from these same pieces and nothing more.
+> One more thing worth knowing: AppSpec is the same contract as the Windows port''s WinSpec — alias classes make the names interchangeable — and the tools are portable BYTE-FOR-BYTE: the Declarative Demo you launched above is WinDemoTool, unedited from the sister repo.
 ' ]
-
     CocoaHelp class >> gameGuideText [ ^'# Guide: Build a Game
 
 Press the play button beside a block and it runs. Every block that has one is a **complete program** — nothing is remembered between presses, so each step here shows the whole thing again, a little bigger. Copy the newest one and you always have something that works.
@@ -1959,7 +1951,7 @@ Every game has the same two halves:
 
 `run` does not loop and does not block; it says *this program is live* and returns. The app owns the clock.
 
-> A single **picture**, like section 2, can be drawn straight from the Workspace — the first drawing command opens a window around itself. A **game** cannot: a frame loop has to keep running between frames, and a Workspace instruction is a one-off errand that finishes. So games live in a class and get **launched**.
+> A single PICTURE, like section 2, can be drawn straight from the Workspace — the first drawing command opens a window around itself. A GAME cannot: a frame loop has to keep running between frames, and a Workspace instruction is a one-off errand that finishes. So games live in a class and get LAUNCHED.
 
 ## 5. A ball that moves
 
@@ -2156,7 +2148,7 @@ Each is one readable class, in the Browser:
 - `Worms`, `Galaxigans` — sprites and swarms.
 - `MandelZoom` — heavy arithmetic, the JIT at full stretch.
 
-> Whole numbers are your friend: they behave predictably *and* run on the VM''s fastest path. Breakout''s physics is nothing but integer addition.
+> Whole numbers are your friend: they behave predictably, and they run on the VM''s fastest path. Breakout''s physics is nothing but integer addition.
 ' ]
 
     CocoaHelp class >> assetEditorsText [ ^'# Guide: Edit Sprites and Sounds
@@ -2319,7 +2311,7 @@ The result prints straight to standard output. Point anything that can shell out
 
 Because it is Smalltalk all the way down, *automating the app* and *programming the system* are the same act. A script does not poke at a frozen interface from outside; it sends messages into the identical live world the Workspace talks to — the same objects, the same classes, the same worker that runs your code. The window is one client of that world; a script, or an agent, is simply another. Anything you can do here by hand, you can hand to something else to do for you.
 
-> `evaluate` turns an error into an answer instead of a hang: a raise inside your string comes back as an AppleScript error the caller can catch, never a spinning beachball.
+> evaluate turns an error into an answer instead of a hang: a raise inside your string comes back as an AppleScript error the caller can catch, never a spinning beachball.
 ' ]
 
     CocoaHelp class >> worldCareText [ ^'# Caring for Your World
@@ -2483,6 +2475,6 @@ The benchmark protocol is fixed: identical workloads, microsecond clocks, interl
 
 ---
 
-> Full designs: `docs/intrinsics_design.md`, `docs/exceptions_design.md`, `docs/cocoa_gui_design.md`, `docs/applescript_design.md`, and the sprint logs. The repository *is* the book.
+> Full designs: docs/intrinsics_design.md, docs/exceptions_design.md, docs/cocoa_gui_design.md, docs/applescript_design.md, and the sprint logs. The repository IS the book.
 ' ]
 ]
