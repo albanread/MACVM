@@ -91,8 +91,10 @@ Object subclass: CocoaHelp [
             add: (Array with: 'Automation'     with: #automationText);
             yourself)).
         s add: (self section: 'Reference' articles: (OrderedCollection new
+            add: (Array with: 'Collections'     with: #collectionsText);
             add: (Array with: 'Numbers'         with: #numbersText);
             add: (Array with: 'Dates and Times' with: #datesText);
+            add: (Array with: 'Sockets'         with: #socketsText);
             add: (Array with: 'Under the Hood'  with: #internalsText);
             yourself)).
         Sections := s asArray.
@@ -2424,6 +2426,64 @@ This world is not that. It is a **database** — rows for classes, rows for meth
 > The world is not a class Smalltalk image. It is a database — and that is what makes it safe to change.
 ' ]
 
+    CocoaHelp class >> collectionsText [ ^'# Collections
+
+Collections are where Smalltalk''s claim to readability is settled, and the trick is that there is one **enumeration protocol** over every kind. Learn eight messages and you can traverse, filter, and fold anything in the system — an Array, a Dictionary, a Set, a Bag — without writing a loop.
+
+## The kinds
+
+- `Array` — fixed size, literal syntax `#(1 2 3)`. The workhorse for data that does not grow.
+- `OrderedCollection` — the growable default: `add:`, `addFirst:`, `removeLast`, and friends. When in doubt, this one.
+- `Dictionary` — keyed: `at:put:`, `at:ifAbsent:`, `removeKey:`, `keysAndValuesDo:`, `keys`, `values`.
+- `Set` — membership without duplicates, folding by **equality**. `IdentitySet` folds by identity instead: two equal-but-separate strings are one element of a Set and two of an IdentitySet.
+- `IdentityDictionary` — the same distinction, keyed.
+- `Bag` — counted membership: `add:` as many times as you like, `occurrencesOf:` answers how many.
+- `SortedCollection` — keeps itself ordered as you add: `SortedCollection sortBlock: [ :a :b | a > b ]`.
+- `Interval` — `1 to: 10 by: 3` is a real collection: `(1 to: 4) collect: [ :e | e * e ]` answers `#(1 4 9 16)` without materialising anything first.
+- `ByteArray` — raw bytes, literal `#[104 105]`.
+- `Association` — one `key -> value` pair; Dictionaries are made of them.
+
+## The enumeration protocol
+
+```
+| words |
+words := #(''the'' ''quick'' ''brown'' ''fox'') asOrderedCollection.
+Transcript showCr: (words collect: [ :w | w asUppercase ]) printString.
+Transcript showCr: (words select: [ :w | w size > 3 ]) printString.
+Transcript showCr: (words detect: [ :w | w startsWith: ''q'' ] ifNone: [ ''none'' ]).
+Transcript showCr: (words inject: 0 into: [ :sum :w | sum + w size ]) printString.
+```
+
+- `do:` — visit each element; `do:separatedBy:` runs a second block between them; `reverseDo:` walks backwards; `doWithIndex:` hands you the position too.
+- `collect:` — transform each element into a new collection.
+- `select:` / `reject:` — keep or drop by a predicate.
+- `detect:ifNone:` — the first match, with an honest miss.
+- `inject:into:` — the fold: thread an accumulator through.
+- `count:`, `anySatisfy:`, `allSatisfy:`, `sum`, `max` — the questions you would otherwise write loops for.
+- `with:do:` / `with:collect:` — walk two collections in lockstep.
+
+All of it works on **every** kind — `aSet count: [ :e | e odd ]`, `aBag select: […]`, `aDictionary collect: […]` — because anything that only needs `do:` is defined once, at the top. One species note to know: `select:` and `collect:` on a Dictionary enumerate its **values**, and filtering answers a sequenceable result (an OrderedCollection), so chains keep working.
+
+## Slicing and building
+
+`copyFrom:to:`, `,` (concatenation), `copyWith:` (one longer), `copyWithout:` (drop every equal element), `reverse`, `indexOf:`, `includes:`, `first`, `last`, `isEmpty`, `notEmpty` — all present on the sequenceable kinds, and written against `at:`/`size` only, so `Interval` and `ByteArray` inherit them working.
+
+## Sorting and converting
+
+`asArray`, `asOrderedCollection`, `asSet`, `asBag`, `asSortedCollection:` cross between kinds; `sort` orders an OrderedCollection in place. Deduplicate by round-tripping through a Set; count by round-tripping through a Bag; order by handing a sort block to either sorter:
+
+```
+Transcript showCr: (#(3 1 2 1 3 1) asSet asSortedCollection: [ :a :b | a < b ]) asArray printString.
+Transcript showCr: (#(3 1 2 1 3 1) asBag occurrencesOf: 1) printString.
+```
+
+## Removal is honest
+
+`Dictionary>>removeKey:` and `Set>>remove:` really remove — no tombstones left behind — and the missing-element paths signal catchable errors, so `[ aSet anyOne ] on: Error do: […]` behaves. `at:ifAbsent:` and `detect:ifNone:` are the no-drama spellings when absence is an ordinary case.
+
+> Streams are the other half of this story — ReadStream and WriteStream walk and build collections incrementally — and the Strings page covers the text-shaped members of the family.
+' ]
+
     CocoaHelp class >> numbersText [ ^'# Numbers
 
 macVM carries the full Smalltalk numeric tower, and its organising idea is **exactness**. Integers, fractions and scaled decimals are exact — arithmetic on them never loses a digit, however large it grows. Floats are the fast, approximate species you opt into. The tower coerces itself: mix any two kinds and the answer takes the more approximate side.
@@ -2512,6 +2572,57 @@ Two clocks, two jobs — and mixing them up is the classic bug:
 - `Time millisecondClockValue` is **elapsed time since the VM started**: right for measuring, wrong for telling time. The convenience is `Time millisecondsToRun: [ … ]`, which brackets a block with it and answers the cost.
 
 > Everything on this page was executed before it was written: the dates you see are the day this article was generated, on the machine that generated it.
+' ]
+
+    CocoaHelp class >> socketsText [ ^'# Sockets
+
+macVM speaks the full BSD socket surface — TCP, UDP, options, even unprivileged ICMP — as **pure Smalltalk over the FFI**. There is no C glue layer to read around: `Posix class >> sendFd:buf:len:flags:` *is* `send(2)`, one line per call, and everything above it is ordinary Smalltalk you can browse.
+
+Two ways in, and they are both first-class: a **synchronous** path that reads like a script, and an **asynchronous** path that scales like a server.
+
+## The synchronous path
+
+For a tool, a probe, an agent with a job to do — straight-line code that blocks briefly and answers. `Socket` (TCP), `UdpSocket`, and `IcmpSocket` wrap an fd; `InetAddress` names the peer:
+
+```
+| a b reply |
+a := UdpSocket boundToLoopback.
+b := UdpSocket boundToLoopback.
+b sendTo: InetAddress loopback port: a localPort data: ''ping''.
+reply := a receive.
+Transcript showCr: (reply at: 1).
+a close. b close.
+```
+
+That is a complete two-socket exchange. The verbs: `connectTo:port:` and `send:` / `receiveUpTo:` for TCP; `sendTo:port:data:` and `receive` (answering data, sender, and port) for datagrams; `bindTo:port:`, `localPort`, `close`. Options are spelled out — `reuseAddress:`, `receiveBufferSize:`, TTL, `tcpNodelay` — and `Socket domain:type:protocol:` opens anything the kernel will give you.
+
+**Errors are values here, not exceptions** — deliberately, because this is a syscall surface: a failed call answers a negative code and `Posix errno` says why, exactly as C would, with no unwinding mid-protocol. Connect to a closed port and you get `-1` and a readable errno, not a raise.
+
+Name resolution is synchronous too: `Dns blockingResolve: ''localhost''` answers the addresses (here: `''::1''` and `''127.0.0.1''`).
+
+## The asynchronous path
+
+Servers should not block, so the second layer inverts the flow: an `IoWorker` pumps kernel readiness (kqueue), and an `IoStream` turns raw arrivals into the requests you actually mean — **continuation-based**, no blocking read anywhere:
+
+```ref
+listener := TcpListener on: iow backlog: 8.
+listener onConnection: [ :stream |
+    stream eachLineDo: [ :line |
+        stream writeLine: ''echo: '' , line ] ].
+```
+
+- `nextLineDo:` — the next line, without its terminator; nil at end of input.
+- `nextCount:do:` — exactly N bytes, however they arrived; `upToEndDo:` — everything, once the input ends.
+- `eachLineDo:` — the server idiom: re-arms itself per line until the stream ends.
+- `write:` / `writeLine:` — straight out the fd, answering the byte count actually written.
+
+Requests queue strictly FIFO, each fires once when satisfiable, and a request registered inside a firing continuation joins the same sweep — the re-arm pattern is safe by construction. Writes go straight out the fd; in this version a write larger than the socket buffer can stall until the peer drains, so it is sized for replies, not bulk transfer.
+
+## The floor you stand on
+
+Memory handed to the kernel lives in a `NativeBuffer` — one mmap-backed page whose address never moves under GC, because a movable heap object must never meet a syscall. Two honest limits, both the platform''s: true raw sockets need root (the unprivileged `IcmpSocket` datagram path is how Ping works without it — see world/61d), and the FFI cannot call variadic C, so there is no `fcntl` non-blocking mode — readiness-with-amounts from kqueue does that job instead.
+
+> The pinned behaviour lives in the socket and IoStream tests of the world suite; the synchronous example above ran, round-tripped its ping, and printed it before this page was written.
 ' ]
 
     CocoaHelp class >> internalsText [ ^'# Under the Hood
