@@ -1,5 +1,20 @@
 # MACVM inspired by Strongtalk
 
+## Download
+
+**[macVM v2026.08.15 — the manual](https://github.com/albanread/MACVM/releases/latest)** ·
+[macVM.dmg](https://github.com/albanread/MACVM/releases/download/v2026.08.15/macVM.dmg) (3.7 MB)
+
+Signed and notarized for macOS on Apple Silicon: drag macVM to Applications and
+double-click — no right-click-Open, no `xattr` incantation. The app is
+self-contained (it carries the whole `world/` source and seeds its own image on
+first run) and needs nothing installed.
+
+Once it opens, the **Docs** tab is a 22-article manual whose examples have play
+buttons — including a live temperature explorer that runs from absolute zero to
+the surface of the sun, and a weather app that fetches a real forecast over a
+socket. Everything else here is for building it yourself.
+
 ## Motivation
 
 A from-scratch Apple Silicon compiler for Smalltalk — the most complex
@@ -132,7 +147,7 @@ full measured record is [`docs/cog_bench.md`](docs/cog_bench.md).
   a64 disassembler, IR dumps, and step-between-calls ([`docs/DEBUGGER.md`](docs/DEBUGGER.md)).
 - **SUnit** — the real thing, exception-based: `TestCase` with
   `setUp`/`tearDown`, a fresh instance per test, `assert:equals:`,
-  `should:raise:`, and failure kept apart from error. **572 tests across 65
+  `should:raise:`, and failure kept apart from error. **666 tests across 73
   suites**, runnable three ways — `macvm-gui test` (exits 0/1, for a build
   script), `MyTest run` in a Workspace, or the GUI's **Tests tab** (suite tree,
   a row per test, failure text, Run All / Run Selected). Tests run on the
