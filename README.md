@@ -192,7 +192,7 @@ full measured record is [`docs/cog_bench.md`](docs/cog_bench.md).
   GC on its own OS thread) that communicate with the primary by **deep-copy
   message passing** (the MOP pickle) — Erlang-style share-nothing, no shared
   state, no identity across heaps, consistent with the `become:` stance below.
-  A primary can hold a pool of **up to 16 concurrent worker VMs**, each
+  A primary can hold a pool of **up to 32 concurrent worker VMs**, each
   independently addressable (`send:onReply:` per worker). It began as a star —
   every worker talking only to the primary — and no longer is: a worker holds
   **peer links** to VMs it has been introduced to (the link is *learned*, not

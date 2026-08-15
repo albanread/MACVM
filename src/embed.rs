@@ -6336,11 +6336,16 @@ mod tests {
     #[test]
     fn worker_spawn_cap_is_enforced() {
         let mut vm = boot_worker_primary();
-        vm.exec("1 to: 16 do: [:i | Worker spawn ].")
-            .expect("16 spawns fit under the cap");
+        // Written against the CONSTANT, not a literal: the cap moved 16 -> 32
+        // when nested VMs made it reachable (a ParallelMandel launch is five
+        // VMs), and a test that hardcodes the old number reports a deliberate
+        // change as a failure.
+        let cap = crate::runtime::workers::MAX_WORKERS;
+        vm.exec(&format!("1 to: {cap} do: [:i | Worker spawn ]."))
+            .expect("a full fleet fits under the cap");
         assert!(
             vm.exec("Worker spawn.").is_err(),
-            "the 17th spawn must raise"
+            "the spawn past the cap must raise"
         );
         // Tidy up: drop every channel so the (still booting) workers exit.
         vm.exec("1 to: 16 do: [:i | (Worker new setId: i) terminate ].")

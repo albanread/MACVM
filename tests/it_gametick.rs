@@ -422,3 +422,53 @@ fn a_demo_launched_after_a_stop_keeps_running() {
     );
     primary.exec("DemoVmHost stopAll.").expect("tidy up");
 }
+
+/// PARALLELMANDEL IN A VM OF ITS OWN — the demo that spawns. It is the one
+/// shape S6 could break twice over, and did: a demo VM fans four compute
+/// workers, sends each a band with `send:onReply:`, and counts them home. Two
+/// bugs sat under that, both invisible (the demo just stopped advancing, with
+/// no error anywhere): the spawner held no LINK to what it spawned (peer links
+/// are learned from arriving envelopes, and a newborn has not spoken yet), and
+/// a spawned worker's dispatcher had no CONTINUATION routing at all — replies
+/// arrived, matched nothing, and fell through to its message handler. The
+/// author found it by running the demo; this keeps it found.
+#[test]
+fn parallel_mandel_runs_in_a_vm_of_its_own() {
+    let _x = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+    macvm::runtime::game_input::reset();
+    macvm::runtime::transcript_service::activate();
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    let captured: Arc<Mutex<Vec<GameCommand>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    primary.set_worker_boot(Arc::new(move || {
+        let mut h = VmHandle::boot(opts(), Path::new("world"))?;
+        h.set_game_sink(Box::new(CapSink(cap.clone())));
+        Ok(h)
+    }));
+
+    primary
+        .exec("DemoVmHost start: 'ParallelMandel launch'.")
+        .expect("launch the demo that spawns");
+
+    // It must keep PRESENTING. One frame proves it started; the second sample
+    // proves the band replies came home — without them `pendingBands` never
+    // reaches zero and the dive stops after its first frame.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while presents_in(&captured) < 2 {
+        let (_, said) = macvm::runtime::transcript_service::drain_since(0);
+        assert!(
+            Instant::now() < deadline,
+            "ParallelMandel stalled in its own VM ({} frames) — its compute \
+             workers' replies are not reaching it: {said:?}",
+            presents_in(&captured)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let early = presents_in(&captured);
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        presents_in(&captured) > early,
+        "the dive stopped advancing after {early} frames"
+    );
+    primary.exec("DemoVmHost stopAll.").expect("tidy up");
+}

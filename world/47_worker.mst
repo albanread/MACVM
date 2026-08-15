@@ -266,6 +266,13 @@ Object subclass: Worker [
         ((payload isKindOf: Array) and: [ (payload size >= 1) and: [ (payload at: 1) == #exitPlease ] ])
             ifTrue: [ ^self exit: (payload size >= 2 ifTrue: [ payload at: 2 ] ifFalse: [ #asked ]) ].
         (self isRpcRequest: payload) ifTrue: [ ^self serveRpc: payload ].
+        "A REPLY TO SOMETHING THIS WORKER ASKED. A worker with children of its
+         own (S6: a demo VM may spawn) sends with `send:onReply:` exactly as a
+         primary does, and its continuations must fire here too — matched by
+         (peer, corr) before the general handler, so a reply is never mistaken
+         for an unsolicited message."
+        (self fireContinuationFor: (env at: 1) corr: CurrentCorr payload: payload)
+            ifTrue: [ ^self ].
         Handler isNil ifFalse: [
             Handler value: (WorkerMessage from: (env at: 1) payload: payload) ]
     ]
@@ -500,14 +507,31 @@ Object subclass: Worker [
         msg isSnapshot ifTrue: [
             SnapshotHandler isNil ifFalse: [ SnapshotHandler value: msg payload ].
             ^self ].
-        k := (PendingReplies notNil and: [ corr ~= 0 ])
-            ifTrue: [ PendingReplies at: (self replyKeyFor: peer corr: corr) ifAbsent: [ nil ] ]
-            ifFalse: [ nil ].
-        k isNil
-            ifTrue: [ ReplyHandler isNil ifFalse: [ ReplyHandler value: msg ] ]
-            ifFalse: [
-                PendingReplies at: (self replyKeyFor: peer corr: corr) put: nil.
-                k value: msg payload ]
+        (self fireContinuationFor: peer corr: corr payload: msg payload)
+            ifFalse: [ ReplyHandler isNil ifFalse: [ ReplyHandler value: msg ] ]
+    ]
+
+    "FIRE THE CONTINUATION a `send:onReply:` registered for (peer, corr), if
+     there is one; answers whether it fired.
+     SHARED BY BOTH DISPATCHERS, which is the whole point: this lived only in
+     `dispatchOne:` (the primary's path), so a SPAWNED worker that sent with a
+     continuation never got it back — the reply arrived, matched nothing, and
+     fell through to the worker's own message handler, which ignored it.
+     Harmless while workers were leaves; the moment a worker could spawn
+     children (S6: a demo VM running ParallelMandel, which fans four compute
+     workers and counts their bands home) it meant the demo simply stopped
+     advancing, with no error anywhere to say why."
+    Worker class >> fireContinuationFor: peer <Integer> corr: corr <Integer> payload: payload <Object> ^ <Boolean> [
+        | key k |
+        (PendingReplies isNil or: [ corr isNil or: [ corr = 0 ] ]) ifTrue: [ ^false ].
+        key := self replyKeyFor: peer corr: corr.
+        k := PendingReplies at: key ifAbsent: [ nil ].
+        k isNil ifTrue: [ ^false ].
+        "Tombstoned (no removeKey: here) — a (peer, corr) key is unique, so a
+         tombstone is never rekeyed."
+        PendingReplies at: key put: nil.
+        k value: payload.
+        ^true
     ]
     Worker class >> nextCorr [
         NextCorr isNil ifTrue: [ NextCorr := 0 ].
@@ -517,14 +541,22 @@ Object subclass: Worker [
 
     "── (peer, corr) continuation namespacing (review R4, §7.3) ──────────
      PendingReplies is keyed by a SmallInteger packing the originating peer id
-     (0 = the primary, 1..16 = a worker) with the correlation id, so peerA's
-     corr=c and peerB's corr=c are DISTINCT keys and can never fire the wrong
-     continuation. A packed smi is used (not a 2-element Array) because Array
-     hashes by identity here — value equality without value hash would break
-     Dictionary lookup; a SmallInteger hashes by value. MAX_WORKERS is 16, so
-     five bits hold every peer id."
+     with the correlation id, so peerA's corr=c and peerB's corr=c are DISTINCT
+     keys and can never fire the wrong continuation. A packed smi is used (not
+     a 2-element Array) because Array hashes by identity here — value equality
+     without value hash would break Dictionary lookup; a SmallInteger hashes by
+     value.
+
+     THIRTY-TWO BITS FOR THE PEER, not five. Five was right when a peer id was
+     a slot number in 1..16; it stopped being right the day handles became
+     (slot, generation) packed into a u32 — a peer id is 65538, not 2, so the
+     shift no longer cleared it and `(corr, peerA)` could collide with
+     `(corr', peerB)` and fire somebody else's continuation. Latent rather than
+     seen (it needs two live peers whose ids differ by exactly 32x a corr
+     delta), and fixed here rather than left for the day a fleet is big enough
+     to find it."
     Worker class >> replyKeyFor: peer corr: corr [
-        ^(corr bitShift: 5) + peer
+        ^(corr bitShift: 32) + peer
     ]
     Worker class >> registerReply: aBlock fromPeer: peer corr: corr [
         "GC-root a continuation under its (peer, corr) key. Shared by

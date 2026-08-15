@@ -167,42 +167,42 @@ fn the_vm_ticks_a_worker_at_the_rate_it_asked_for() {
     // Declare the scoreboard BEFORE the block that closes over it — a
     // top-level assignment declares the global, and the handler is compiled
     // against it.
-    primary.exec("TickLines := 0.").expect("scoreboard");
-    primary
-        .exec("Worker onTranscriptLine: [ :s | TickLines := TickLines + 1 ].")
-        .expect("count forwarded tick lines");
+    // COUNT THROUGH THE TRANSCRIPT SERVICE, not through forwarding. A worker's
+    // words go to whichever channel is live, and the service is process-global
+    // and sticky: the moment ANY test in this binary activates it, a worker
+    // stops forwarding `#workerTranscript` envelopes to its primary and writes
+    // straight to the service instead. Counting forwarded lines therefore
+    // passed or failed depending on which sibling test ran first — a
+    // measurement whose answer depends on test order is not a measurement.
+    // Activating it here makes the channel deterministic in both worlds.
+    macvm::runtime::transcript_service::activate();
+    let before = macvm::runtime::transcript_service::drain_since(0).0;
 
     primary
         .exec(
-            "TickProbe := Worker spawn: '[ Worker onTick: [ Transcript showCr: ''t'' ]. \
+            "TickProbe := Worker spawn: '[ Worker onTick: [ Transcript showCr: ''TICKMARK'' ]. \
              Worker tickEvery: 16 ] value.'.",
         )
         .expect("spawn a ticking worker");
 
     // Nobody sends it anything: the ONLY thing that can advance the count is
-    // the VM's own wakeup. Pump the primary's inbox so the forwarded lines
-    // land, for half a second of wall clock.
+    // the VM's own wakeup.
     let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(600) {
-        primary
-            .exec("Worker dispatchInbox.")
-            .expect("drain forwarded transcript lines");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    primary.exec("Worker dispatchInbox.").expect("final drain");
-    let ticks: i64 = primary
-        .eval("TickLines printString")
-        .expect("read the count")
-        .trim()
-        .trim_matches('\'')
-        .parse()
-        .expect("an integer count");
+    std::thread::sleep(Duration::from_millis(600));
+    let (_, words) = macvm::runtime::transcript_service::drain_since(before);
+    let ticks = words.iter().filter(|w| w.contains("TICKMARK")).count();
     let elapsed = start.elapsed().as_millis();
 
-    // 60 Hz over ~600ms is ~37 ticks. Assert a RATE only a real timer could
-    // produce: the old inbox wait was TWO SECONDS, which gives exactly zero.
+    // 60 Hz over ~600ms is ~37 ticks. What is being distinguished is a real
+    // timer from the old TWO-SECOND inbox wait, which gives exactly ZERO — so
+    // the bar is set for that question, not for the frame rate. It used to be
+    // >10 and went flaky the day the suite started spawning five-VM demos in
+    // a neighbouring test binary: on a fanless machine under that load a 60 Hz
+    // tick genuinely thins out, and a test that fails from contention teaches
+    // nothing. Anything above zero answers the question; a handful answers it
+    // with room to spare.
     assert!(
-        ticks > 10,
+        ticks > 3,
         "expected a frame-rate tick, got {ticks} in {elapsed}ms — the VM is \
          not waking the worker (a 2s inbox wait gives 0)"
     );
@@ -220,17 +220,12 @@ fn the_vm_ticks_a_worker_at_the_rate_it_asked_for() {
         .exec("Worker dispatchInbox.")
         .expect("let the worker take it");
     std::thread::sleep(Duration::from_millis(150));
-    primary.exec("Worker dispatchInbox.").expect("drain");
-    primary.exec("TickLines := 0.").expect("re-zero");
+    // Re-zero by moving the cursor, not a guest variable: the count lives in
+    // the service now (see above).
+    let mark = macvm::runtime::transcript_service::drain_since(0).0;
     std::thread::sleep(Duration::from_millis(300));
-    primary.exec("Worker dispatchInbox.").expect("drain again");
-    let after: i64 = primary
-        .eval("TickLines printString")
-        .expect("read")
-        .trim()
-        .trim_matches('\'')
-        .parse()
-        .expect("an integer");
+    let (_, later) = macvm::runtime::transcript_service::drain_since(mark);
+    let after = later.iter().filter(|w| w.contains("TICKMARK")).count();
     // The stop request is only honoured if the worker installed a handler for
     // it; this worker did not, so it keeps ticking — assert the SERVICE, not
     // a message protocol we did not give it. What matters here is that the
@@ -644,4 +639,91 @@ fn a_wake_hook_may_reenter_the_services_it_is_woken_by() {
         let _ = ui.dispatch_hosted_envelope(env);
     }
     primary.exec("Tick terminate.").expect("terminate under the same hook");
+}
+
+/// A WORKER WITH CHILDREN GETS ITS REPLIES. `send:onReply:` continuations were
+/// routed only in `dispatchOne:` — the PRIMARY's dispatcher — while a spawned
+/// worker drains through `dispatchPending`, which had no continuation lookup at
+/// all. Harmless while workers were leaves; the moment one could spawn (S6
+/// grants a demo VM that right) it meant a reply arrived, matched nothing, and
+/// fell through to the worker's own handler, which ignored it. ParallelMandel
+/// in a VM of its own is exactly that shape — fan four compute workers, count
+/// the bands home — and it simply stopped advancing, with no error anywhere.
+/// The author found it by running the demo; this pins the mechanism.
+#[test]
+fn a_spawned_worker_gets_its_own_send_on_reply_continuations() {
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    primary.set_worker_boot(Arc::new(|| VmHandle::boot(opts(), Path::new("world"))));
+    macvm::runtime::transcript_service::activate();
+    let before = macvm::runtime::transcript_service::drain_since(0).0;
+
+    // A GRANTED worker (what a demo VM is) that spawns a child of its own,
+    // asks it a question with a continuation, and reports what came back —
+    // through the transcript service, so no pump of ours is in the path.
+    primary
+        .exec(concat!(
+            "Parent := Worker spawnGranted: '[ ",
+            "Kid := Worker spawn: ''Worker onMessage: [ :m | Worker reply: (m payload at: 1) * 2 ]''. ",
+            "Kid send: (Array with: 21) onReply: [ :r | ",
+            "Transcript showCr: ''CHILD-SAID='' , r printString ] ] value.'."
+        ))
+        .expect("spawn a worker that spawns");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, words) = macvm::runtime::transcript_service::drain_since(before);
+        if words.iter().any(|w| w.contains("CHILD-SAID=42")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker never received its own reply — a spawned worker's \
+             send:onReply: continuation is not being routed: {words:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// WHAT `replyKeyFor:peer:corr:` ACTUALLY PACKS. Five bits holds 0..31 — fine
+/// for a slot number, and nowhere near a HANDLE, which carries a generation in
+/// its high half (`gen << 16 | slot`). The envelope's `from` is the handle, so
+/// the old five-bit shift left the peer overlapping the correlation id and two
+/// different (peer, corr) pairs could name one key. Measured, not assumed.
+#[test]
+fn a_peer_id_is_a_handle_not_a_slot() {
+    let mut primary = VmHandle::boot(opts(), Path::new("world")).expect("primary boots");
+    primary.set_worker_boot(Arc::new(|| VmHandle::boot(opts(), Path::new("world"))));
+    primary.exec("Peer := nil.").expect("scoreboard");
+    // The general handler, not a continuation: a `send:onReply:` continuation
+    // consumes its own reply and this needs to see the envelope's `from`.
+    primary
+        .exec("Worker onReply: [ :m | Peer := m from ].")
+        .expect("watch the from");
+    primary
+        .exec("W := Worker spawn: 'Worker onMessage: [ :m | Worker reply: 7 ]'.")
+        .expect("spawn");
+    primary.exec("W send: (Array with: 1).").expect("ask");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while eval(&mut primary, "Peer printString") == "'nil'" {
+        primary.exec("Worker dispatchInbox.").ok();
+        assert!(Instant::now() < deadline, "no reply arrived");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let peer: i64 = eval(&mut primary, "Peer printString")
+        .trim_matches('\'')
+        .parse()
+        .expect("an integer peer id");
+    assert!(
+        peer > 31,
+        "a peer id was {peer} — if peer ids really were small slot numbers the \
+         old five-bit key would have been sound; they are handles, and it was not"
+    );
+    assert_eq!(
+        peer,
+        eval(&mut primary, "W id printString")
+            .trim_matches('\'')
+            .parse::<i64>()
+            .unwrap(),
+        "the envelope's `from` IS the worker's handle"
+    );
 }

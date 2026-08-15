@@ -27,9 +27,20 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Star-topology cap (§5 prim 220): far above any sane core count, far
-/// below a runaway spawn loop.
-pub const MAX_WORKERS: usize = 16;
+/// Fleet cap (§5 prim 220): comfortably above what the hardware can run at
+/// once, far below a runaway spawn loop.
+///
+/// Was 16, chosen when a fleet meant "the primary's compute workers". It stopped
+/// being enough once VMs nested: a ParallelMandel launch is FIVE (its own demo
+/// VM plus four compute workers), so three launches plus the UI's hosted peer
+/// hit the ceiling and the fourth silently opened no window — `Worker spawn:`
+/// answering nil is not a crash, just an absence. 32 leaves room for several
+/// such demos, their children, the display and a few app VMs at once, on a
+/// machine with 14 cores: still a backstop against a loop, no longer a limit
+/// anyone reaches by using the thing as intended. (The real fix for that leak
+/// was letting a granted VM terminate what it spawned — see `terminate`; this
+/// is headroom, not a patch.)
+pub const MAX_WORKERS: usize = 32;
 
 // ─────────────── the global worker table + primary epochs ───────────────
 // Supervision of LAST RESORT lives ABOVE all VMs, in plain process-global
@@ -823,7 +834,22 @@ pub fn spawn_granted(vm: &mut VmState, init: Option<String>, grant: bool) -> Opt
         } => *e,
         _ => return None,
     };
-    crate::runtime::fleet::spawn(epoch, init, grant)
+    let id = crate::runtime::fleet::spawn(epoch, init, grant)?;
+    // A WORKER THAT MAY SPAWN MUST BE ABLE TO TALK TO WHAT IT SPAWNED. The
+    // grant handed out the right to create a child and nothing else: peer
+    // links are LEARNED from arriving envelopes, and a newborn has not spoken
+    // yet, so the spawner held no link to it and its very first `send:` failed
+    // with "cannot send (unknown or dead worker)". (A primary needs none of
+    // this — it addresses its fleet by handle.) The child learns its parent
+    // the ordinary way, from the `reply_to` on that first message.
+    if let Some(ws) = vm.workers.as_mut() {
+        if matches!(&**ws, WorkerState::Worker { .. }) {
+            if let Some(inbox) = crate::runtime::fleet::inbox_of(epoch, id) {
+                ws.add_peer(id, inbox);
+            }
+        }
+    }
+    Some(id)
 }
 
 /// Register an *externally-hosted* worker on an EXISTING thread — no
@@ -1110,10 +1136,22 @@ pub fn terminate(vm: &mut VmState, id: u32) -> bool {
     let Some(ws) = vm.workers.as_ref() else {
         return false;
     };
-    let WorkerState::Primary { epoch, .. } = &**ws else {
-        return false;
+    // THE GRANT IS ONE CAPABILITY, NOT THREE. A spawn-granted VM could create
+    // children (`spawn`) and see whether they lived (`alive`) but not stop
+    // them — so ParallelMandel in a VM of its own leaked its four compute
+    // workers on every launch: its `onReset:` terminated them and the
+    // primitive quietly answered false. Three launches exhausted the 16-worker
+    // cap and the fourth opened no window at all. Whoever may put VMs into a
+    // fleet may take them out of it.
+    let epoch = match &**ws {
+        WorkerState::Primary { epoch, .. } => *epoch,
+        WorkerState::Worker {
+            spawn_grant: Some(e),
+            ..
+        } => *e,
+        _ => return false,
     };
-    crate::runtime::fleet::terminate(*epoch, id)
+    crate::runtime::fleet::terminate(epoch, id)
 }
 
 /// Is worker `id` believed alive (prim 225)? False once death is DETECTED
