@@ -700,6 +700,20 @@ pub(crate) fn palette_memory() -> Option<(*mut u8, usize, usize)> {
 /// thread channel, exactly like the transcript sink hands text.
 pub trait GameSink: Send {
     fn emit(&mut self, cmd: GameCommand);
+
+    /// Which pane this VM draws into, or `0` for "the only one".
+    ///
+    /// The sink is the VM's connection to the display, so it is the natural
+    /// place to learn one's own pane — and this is the FIRST time the id needs
+    /// to cross into the VM crate at all. It is needed because input has to be
+    /// answered per subject (`runtime::game_input::snapshot_for`): a demo asks
+    /// what the keyboard is doing, and the honest answer depends on whether
+    /// its window has focus.
+    ///
+    /// Defaulted so no test sink and no headless embedding has to care.
+    fn pane_id(&self) -> u32 {
+        0
+    }
 }
 
 /// Per-VM, lock-free live signals a monitor (e.g. the GUI metrics dashboard)

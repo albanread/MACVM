@@ -64,11 +64,14 @@ impl PaneId {
     fn mint() -> Self {
         PaneId(NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed))
     }
-    /// The pane every command addressed before there was addressing. Used
-    /// while the drain still routes everything to the one window; it is what
-    /// the next step replaces with a real lookup.
+    /// The pane every command addressed before there was addressing.
     pub fn legacy() -> Self {
         PaneId(0)
+    }
+    /// The bare number, for the parts that cross into the VM crate (the input
+    /// service's subject, via `GameSink::pane_id`).
+    pub fn raw(self) -> u32 {
+        self.0
     }
 }
 
@@ -138,6 +141,10 @@ impl Default for PrimaryGameSink {
 }
 
 impl GameSink for PrimaryGameSink {
+    fn pane_id(&self) -> u32 {
+        self.pane.raw()
+    }
+
     fn emit(&mut self, cmd: GameCommand) {
         if let Ok(mut q) = GAME_CMDS.lock() {
             q.push_back((self.pane, cmd));
@@ -281,6 +288,12 @@ fn ensure_pane_for(id: PaneId) {
         if let Some(tp) = text_plane.as_ref() {
             macvm::embed::publish_text_memory(tp.cells_ptr(), tp.cols() as usize, tp.rows() as usize);
         }
+        // A NEW PANE TAKES THE KEYBOARD. That is what happens on screen — the
+        // window opens in front and becomes key — and saying so here is what
+        // gives `primInputState` a subject to answer for. When panes can
+        // coexist this same call moves to `windowDidBecomeKey:`, which is the
+        // signal that actually means focus rather than merely "newest".
+        game_input::set_focus(id.raw());
         // `id` is the PaneId; the `pane` field below is the IndexedPane.
         cell.borrow_mut().insert(id, NativeGame {
             win,

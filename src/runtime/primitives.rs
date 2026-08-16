@@ -2572,7 +2572,13 @@ fn prim_worker_tick_every(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// frame tick, not by anything a guest can grow.
 fn prim_game_input_state(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let _ = args;
-    let s = crate::runtime::game_input::snapshot();
+    // ASK AS SOMEBODY. The snapshot is the machine's, but the answer is this
+    // VM's: an unfocused demo reads no keys and a pointer outside its pane
+    // (docs/multi_pane_design.md §2c). A VM with no sink, or a sink that never
+    // claimed a pane, asks as 0 and is answered in full — headless and
+    // single-window behaviour, unchanged.
+    let pane = vm.game_sink.as_ref().map(|s| s.pane_id()).unwrap_or(0);
+    let s = crate::runtime::game_input::snapshot_for(pane);
     let a = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 6);
     a.at_put(0, SmallInt::new(s.keys).oop());
     a.at_put(1, SmallInt::new(s.mouse_x).oop());

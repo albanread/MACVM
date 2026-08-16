@@ -25,6 +25,7 @@
 //! `format!`. A mutex rather than four atomics for the same reason: the
 //! coherence IS the contract.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 /// One instant of input. Position is in PANE PIXELS (the frame tick converts
@@ -60,6 +61,57 @@ pub struct InputState {
     /// reset — a comparison that can go backwards is a bug waiting for a
     /// second demo.
     pub exit_generation: u64,
+}
+
+/// WHICH PANE OWNS THE KEYBOARD (`docs/multi_pane_design.md` §2c).
+///
+/// Input is a process service: there is one keyboard and one pointer, so the
+/// snapshot below is the truth for the machine. What was missing was a
+/// SUBJECT — `primInputState` took no key, so every VM that asked got the same
+/// answer, and two demos would both have answered to the same keystrokes.
+///
+/// The rule adopted is the one every window system already implements: **the
+/// focused window owns the keyboard, and the pointer belongs to the window
+/// under it.** An unfocused demo reads no keys and a pointer outside its pane,
+/// which is exactly right — a background game must not respond to typing aimed
+/// at the Browser.
+///
+/// `0` means "no pane has claimed focus", and every asker is answered in full.
+/// That is the headless and single-window case, and it is why this can land
+/// without changing anything that works today.
+static FOCUSED_PANE: AtomicU32 = AtomicU32::new(0);
+
+/// The host tells the service who has focus — on pane creation now, and on
+/// `windowDidBecomeKey:` once panes can coexist.
+pub fn set_focus(pane: u32) {
+    FOCUSED_PANE.store(pane, Ordering::Release);
+}
+
+pub fn focused_pane() -> u32 {
+    FOCUSED_PANE.load(Ordering::Acquire)
+}
+
+/// This instant's input AS SEEN BY `pane` — the read behind primitive 279.
+///
+/// The stop request is deliberately NOT gated here. `exit_generation` is
+/// monotonic by design ("a comparison that can go backwards is a bug waiting
+/// for a second demo"), and blanking it for an unfocused pane would hand a demo
+/// a number that had gone backwards. Escape is still session-wide, and becomes
+/// per-pane when sessions do — the last step of the design, where the host
+/// stops asking "the" demo to quit and asks the focused one.
+pub fn snapshot_for(pane: u32) -> InputState {
+    let live = snapshot();
+    let focus = focused_pane();
+    if pane == 0 || focus == 0 || pane == focus {
+        return live;
+    }
+    InputState {
+        keys: 0,
+        mouse_x: -1,
+        mouse_y: -1,
+        buttons: 0,
+        ..live
+    }
 }
 
 static STATE: Mutex<InputState> = Mutex::new(InputState {
@@ -132,10 +184,78 @@ pub fn snapshot() -> InputState {
 mod tests {
     use super::*;
 
+    /// THE FOCUS RULE, pinned. The keyboard belongs to the focused pane and
+    /// the pointer to the window under it, so an unfocused demo must read no
+    /// keys and a pointer outside — otherwise two demos would both answer to
+    /// typing aimed at one of them (or at the Browser).
+    #[test]
+    fn only_the_focused_pane_reads_the_keyboard() {
+        let _guard = FOCUS_TEST_LOCK.lock().unwrap();
+        reset();
+        set_focus(0);
+        set_keys(0b1011);
+        set_mouse(120, 64, 1);
+
+        // Nobody has claimed focus: every asker is answered in full. This is
+        // the headless and single-window case, and why the rule can land
+        // without disturbing anything that already worked.
+        assert_eq!(snapshot_for(0), snapshot());
+        assert_eq!(snapshot_for(9), snapshot());
+
+        set_focus(7);
+        let mine = snapshot_for(7);
+        assert_eq!(mine.keys, 0b1011, "the focused pane reads the keyboard");
+        assert_eq!((mine.mouse_x, mine.mouse_y), (120, 64));
+        assert_eq!(mine.buttons, 1);
+
+        let theirs = snapshot_for(8);
+        assert_eq!(theirs.keys, 0, "an unfocused pane reads no keys");
+        assert_eq!(
+            (theirs.mouse_x, theirs.mouse_y),
+            (-1, -1),
+            "and a pointer that is outside it"
+        );
+        assert_eq!(theirs.buttons, 0);
+
+        // The pane asking as 0 — a VM with no sink, or one that never claimed
+        // a pane — is still answered in full rather than silenced.
+        assert_eq!(snapshot_for(0).keys, 0b1011);
+        set_focus(0);
+    }
+
+    /// The stop request is NOT gated by focus, deliberately: `exit_generation`
+    /// only ever counts up, and handing an unfocused demo a number that had
+    /// gone backwards is the bug its own doc comment warns about. Escape stays
+    /// session-wide until sessions themselves are per-pane.
+    #[test]
+    fn a_stop_request_survives_being_unfocused() {
+        let _guard = FOCUS_TEST_LOCK.lock().unwrap();
+        reset();
+        set_focus(7);
+        request_exit();
+        let live = snapshot();
+        let theirs = snapshot_for(8);
+        assert_eq!(theirs.keys, 0, "still silenced for the keyboard");
+        assert_eq!(
+            theirs.exit_generation, live.exit_generation,
+            "but the generation must never appear to move backwards"
+        );
+        assert_eq!(theirs.exit_requested, live.exit_requested);
+        set_focus(0);
+    }
+
+    /// The two focus tests share one process-wide service, so they must not
+    /// interleave — the same reason the audio tests serialize.
+    static FOCUS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// The contract in one test: what was written is what a reader sees, all
     /// four fields from the same instant, and a reset really rests.
     #[test]
     fn a_snapshot_is_one_coherent_instant() {
+        // Same lock as the focus tests: one process-wide service, so a test
+        // that writes to it cannot run beside another that reads it. (This
+        // test predates the lock and raced the moment a second writer existed.)
+        let _guard = FOCUS_TEST_LOCK.lock().unwrap();
         reset();
         set_keys(0b101);
         set_mouse(120, 64, 1);
