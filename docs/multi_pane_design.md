@@ -107,3 +107,73 @@ requires revisiting S6.
 
 The one thing to decide before starting: **focus semantics** (§2c). Everything
 else follows mechanically from it.
+
+---
+
+## 6. Verification pass, 2026-08-16 — and the thing §1 missed
+
+Re-read against the code as it stands after S6, the demo-VM arc and the
+frame-rate fix. Two outcomes: the table in §1 is **exact**, and it is
+**incomplete**.
+
+### Still true, verbatim
+
+Every singleton in §1 is where it said, unchanged:
+
+| claim | confirmed at |
+|---|---|
+| one `GAME` cell | `cocoa_gui/src/game.rs` — `static GAME: RefCell<Option<NativeGame>>` |
+| commands carry no destination | `src/embed.rs` — `enum GameCommand`, no pane field on any arm |
+| one published framebuffer | `src/embed.rs` — `SCREEN_PTRS` / `SCREEN_STRIDE` / `SCREEN_GENERATION` |
+| one session, one input | `game.rs` — `GAME_ACTIVE` / `SESSION_OPEN`; `runtime/game_input.rs` — `static STATE: Mutex<InputState>` |
+
+§2c is confirmed as the real decision rather than plumbing: **prim 279 takes
+no key at all**. `prim_game_input_state` reads `game_input::snapshot()` and
+hands the same four numbers to whichever VM asked. Two demos running today
+would both respond to the same keystrokes — not because anything routes
+wrongly, but because there is nothing to route *by*.
+
+### What §1 missed: sound is a queue, not a mixer
+
+The audio path was never in the table, and it turns out to have a
+single-instance of its own — a different shape from the video one.
+
+`Sfx` (MacGamePane `audio/src/playback.rs`) holds **64 buffers and ONE
+`AVAudioPlayerNode`**, attached once to the engine's main mixer. `play(id)`
+calls `scheduleBuffer:completionHandler:` on that one node, and a player node
+plays what it is handed **in order**. So sounds do not overlap: they queue.
+
+This is not only a multi-demo problem. It is already visible with one demo —
+galaxigans' own comment says running at the wrong rate "piles up sound
+triggers", which is this queue growing faster than it drains. (Read from the
+code and corroborated by that comment; not measured with an audio capture.)
+
+The fix is unlike the video one, and cheaper: **a voice pool**. Attach N
+player nodes to the main mixer and round-robin `play` across them, so
+overlapping triggers land on different voices and the mixer does what mixers
+do. Worth noting what this does *not* need:
+
+> **Audio needs no addressing.** A pane must know which window it belongs to;
+> a sound does not, because mixing IS the wanted semantic — when Breakout and
+> Galaxigans both play, you want to hear both. So sound needs no `PaneId`, no
+> focus rule and no ownership; it needs voices. That asymmetry is why it can
+> land first and independently.
+
+One shared slot does still need a decision: slot 16 is *the* parametric
+audition slot and auditions deliberately replace each other, which is right
+for one editor and wrong for two demos playing custom effects. A voice pool
+makes the natural answer available (allocate a slot per trigger, round-robin
+like the voices).
+
+### Revised order
+
+1. **Voice pool** — independent of everything else, fixes a defect that exists
+   today with a single demo, and needs no design decision.
+2. **Focus semantics** (§2c) — the one genuine call. Everything in §2 follows
+   from it mechanically.
+3. Then §2a → §2b → §2d → §2e as written.
+
+The two-live-sessions race found on 2026-08-15 (two launches slipping past
+`GAME_ACTIVE` before it flips) is a symptom of §2e rather than a separate bug:
+under per-pane state the check it races on stops existing. Worth leaving alone
+until then rather than growing a lock that step 2e deletes.
