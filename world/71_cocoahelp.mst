@@ -99,6 +99,17 @@ Object subclass: CocoaHelp [
             add: (Array with: 'Sprite Editor' with: #spriteEdText);
             add: (Array with: 'Sound Editor'  with: #soundEdText);
             yourself)).
+        "THE LAYER ABOVE THE VMs. One short article per service, because the
+         useful thing to know about each is small — what it is, which VM can
+         use it (all of them), and the one rule that makes it behave."
+        s add: (self section: 'Process Services' articles: (OrderedCollection new
+            add: (Array with: 'What They Are' with: #servicesText);
+            add: (Array with: 'Messaging'     with: #svcMessagingText);
+            add: (Array with: 'The Transcript' with: #svcTranscriptText);
+            add: (Array with: 'Timers'        with: #svcTimersText);
+            add: (Array with: 'Input'         with: #svcInputText);
+            add: (Array with: 'The Fleet'     with: #svcFleetText);
+            yourself)).
         s add: (self section: 'Reference' articles: (OrderedCollection new
             add: (Array with: 'Collections'     with: #collectionsText);
             add: (Array with: 'Numbers'         with: #numbersText);
@@ -2708,6 +2719,230 @@ Every other Smalltalk hands you an **image**: a frozen snapshot of a running hea
 This world is not that. It is a **database** — rows for classes, rows for methods, each one versioned, queryable, revertable, exportable, and readable by tools that know nothing about Smalltalk. That is why you can walk a single method back through its history, prune the past without touching the present, archive the lot into a file you can email, and have every one of those operations be an ordinary transaction rather than an act of faith.
 
 > The world is not a class Smalltalk image. It is a database — and that is what makes it safe to change.
+' ]
+
+    CocoaHelp class >> servicesText [ ^'# Process Services
+
+A VM in this system is a world of objects with its own heap, its own JIT and
+its own thread. Some things cannot live in a world like that — a clock, a
+keyboard, a log every VM writes to, the register of who is alive. They belong
+to the **process**, not to any one VM, and they are called **process
+services**.
+
+The test is simple and it is worth stating as a question you can ask of
+anything: *could this survive every VM in the process dying?* If yes, it is a
+service. If it would die with the heap it lives in, it is not.
+
+## The rules they obey
+
+- **VM-independent.** A service never holds a VM''s state, never needs a VM to
+  pump anything, and outlives all of them. The transcript is the model
+  citizen; a `isAlive` that read *true* for a worker that had been dead for an
+  hour was the model violation, and it was cured by moving the fact here.
+- **Delivery is by the door.** When a service needs a VM to *run* something it
+  sends an ordinary message. The VM dispatches it top-level like any other,
+  one thing at a time — no callbacks into a running VM, ever.
+- **Serialized or thread-owned, never both.** A passive store takes a lock (the
+  transcript). An active service owns a thread (timers). Each one says which
+  it is.
+- **Never join a VM thread.** Shutdown is a poison message and a bounded wait
+  on a liveness flag, then exit regardless. A VM that will not stop cannot
+  hold the process open.
+
+## Is the compiler one?
+
+It is a **boundary** question — where a VM ends and the process begins — and
+the answer is **no**: each VM includes its own compiler. The reason is more
+useful than the answer.
+
+The compiler produces `CompiledMethod` objects, and they live **in the heap of
+the VM that compiled them**. They are pointed at by that VM''s classes, patched
+by its inline caches, and collected by its GC. Nothing crossing a VM boundary
+here is shared: it is deep-copied. A compiled method cannot be shared, so a
+compiler cannot be a service — it is the most VM-bound thing in the system,
+because its product *is* the VM''s own objects. The same goes for the JIT: each
+VM warms its own code cache, which is why the Monitor shows compile counts per
+row.
+
+What *is* service-shaped nearby is the **image** — the SQLite database the
+world is loaded from and saved to. It sits outside every heap, survives every
+VM, and is reachable from all of them. So: compiling is per-VM; the *source of
+truth for code* is process-level. When you accept a method in the Browser, the
+compiler runs in a VM and the image write goes to something that outlives it.
+
+A sharper way to put the boundary: **a compiler is part of what a VM IS, not a
+facility it calls.** A Smalltalk system that cannot change itself while running
+is not this kind of system at all, and changing yourself means compiling into
+the heap you are already living in. Put the compiler outside and it would have
+to reach back inside a running VM to install its results — which is precisely
+the thing no service is allowed to do.
+
+Note what that implies about the output. A compiled method is *representable*
+as data, but it is not usefully *transferable*: it is wired into one heap''s
+classes, patched by that heap''s inline caches, and paired with code in that
+VM''s own cache. Ship it and it arrives pointing at copies. Objects whose value
+is their place in a particular heap cannot cross, and that is the boundary
+drawn from the other side.
+
+So the rule for a new candidate is: ask what it **holds**, not what it does.
+Timers hold deadlines and inboxes; the transcript holds text; input holds a
+snapshot — all process state. A compiler holds a heap.
+
+By that test there are services in this process that have not been *named* yet:
+the image is one, the sound device is another (one output, mixing whatever
+several VMs play), and the display itself is a third — the interface VM already
+behaves like a display server for windows other VMs own. Naming them would
+finish the layer rather than extend it.
+' ]
+
+    CocoaHelp class >> svcMessagingText [ ^'# Messaging
+
+**No thread, and none wanted.**
+
+Messages between VMs travel on ordinary channels, and delivery runs on the
+**receiver''s own thread** — which is precisely the one-thing-at-a-time rule
+every VM already lives by. A central router thread would add a hop and a
+second ordering domain to buy nothing.
+
+```
+| w |
+w := Worker spawn: ''Worker onMessage: [ :m | Worker reply: m payload ]''.
+w send: #(1 2 3) onReply: [ :r | Transcript showCr: r printString ].
+```
+
+Everything that crosses is a **deep copy**, carried as pickle bytes and rebuilt
+on the far side. There is no shared object and no identity across heaps, so
+there is nothing to lock. Blocks do not cross — which is why messages carry
+event *names* and payloads rather than code, and why classes never need to
+cross at all: every VM boots the same world.
+
+`send:` never waits. The reply arrives later as a **continuation**, matched by
+a correlation id, and runs as an ordinary message on your own thread.
+
+**Peer links** are the shape that matters for apps: a spawned VM is introduced
+to the display when it is born and talks to it directly afterwards. The
+primary is not in the path of a single frame or event — it spawns, and then it
+is out of the way.
+' ]
+
+    CocoaHelp class >> svcTranscriptText [ ^'# The Transcript
+
+**A passive store, serialized by a lock. The reference implementation.**
+
+Every VM writes to the transcript **directly**. There is no relay through the
+primary and no forwarding through the interface VM — those existed once, and
+losing them is what made the transcript trustworthy: a line from a worker that
+dies a moment later still arrives, because the buffer was never in the dying
+VM.
+
+Lines from workers arrive tagged with which VM wrote them, so a busy multi-VM
+session stays readable.
+
+The buffer is **bounded**. A program in a tight loop can out-write any
+consumer, so the oldest lines are dropped — and the loss is *counted and
+reported as a line of its own*. A transcript that silently lost the beginning
+of the story would be worse than one that admits it.
+
+```
+Transcript showCr: ''hello from wherever this is running''.
+```
+
+That is the whole interface, and it works identically in the primary, in the
+interface VM, in a demo VM and in an app VM.
+' ]
+
+    CocoaHelp class >> svcTimersText [ ^'# Timers
+
+**The one service that owns a thread.**
+
+A VM cannot wake itself: it is either running something or waiting for a
+message. So the timer service owns a thread whose only job is to sleep until
+the earliest deadline, wake, and **send an envelope** to whoever registered.
+The tick arrives down the ordinary inbox and dispatches top-level like any
+other message — a timer never interrupts a VM mid-thought.
+
+```
+Worker onTick: [ ''once a second, here'' ].
+Worker tickEvery: 1000.
+Worker stopTick.
+```
+
+**Any VM can be a target**, and that is the point. It is the frame clock for a
+demo running in a VM of its own, and it is the beat behind the Clock example
+in Tools — which asks for 1000ms and gets one wake a second on its own thread.
+The rate is measured from the *next* deadline rather than from when the work
+finished, so a slow tick does not make the clock drift late.
+
+A registration belongs to the VM that made it and goes away when that VM does.
+' ]
+
+    CocoaHelp class >> svcInputText [ ^'# Input
+
+**A snapshot, read rather than delivered.**
+
+The keyboard and the pointer belong to the process — there is one of each —
+so input is a service, and a demo running in a VM of its own **asks** for it
+rather than being sent it:
+
+```ref
+GamePane inputState.    "{keys. mouseX. mouseY. buttons. exitRequested}"
+```
+
+All the values come from **one snapshot**. A frame that mixed this tick''s keys
+with last tick''s mouse position would be a bug nobody would ever find, so the
+service hands over a consistent set or nothing.
+
+Two details worth knowing:
+
+- Buttons and keys are **held state**, not clicks. A demo that wants "the
+  moment it went down" compares against what it saw last frame. That is also
+  what lets Life paint a stroke while you drag, rather than one cell per click.
+- **The request to quit is an input too.** Escape and the close button set a
+  flag in the same snapshot, so a demo in its own VM reads it and ends
+  *itself*, running its own cleanup, rather than being killed from outside.
+
+One honest limitation: there is exactly **one** snapshot, with no addressing in
+it. Two demos running at once would both answer to the same keystrokes. Giving
+input a subject — the focused window owns the keyboard, the pointer belongs to
+the window under it — is the open design question behind running several demo
+windows at the same time.
+' ]
+
+    CocoaHelp class >> svcFleetText [ ^'# The Fleet
+
+**Who exists, who is alive, and who may spawn.**
+
+The fleet is the register of VMs, and it lives in the process because it has to
+answer questions about VMs that are no longer there.
+
+**A handle names a slot AND which occupant of it.** Ids are reused as VMs come
+and go, so a handle carries a generation with it. A message addressed to a
+handle whose generation has passed is refused rather than delivered to the
+stranger now living at that address — the same trick the interface uses to
+refuse callbacks minted against a VM that has since restarted.
+
+**Liveness is a fact, not an opinion.** It is recorded here by the process, not
+inferred by asking a VM whether it feels well. The bug that motivated it: a
+worker had been dead for an hour and `isAlive` still answered true, because the
+answer came from state the dead VM was supposed to update.
+
+**A death is a message.** When a VM ends, its spawner receives an ordinary
+message saying so — same inbox, same dispatch as everything else. Supervisors
+are built from nothing more than that.
+
+**An ending and a death are different.** `Worker exit:` is a VM deciding to
+stop: teardown runs, `ensure:` blocks fire, and it says goodbye on the way out.
+A death is anything else. Reporting a deliberate ending as a crash would make
+every ordinary window-close look alarming in the one place you go to find real
+crashes.
+
+**Spawning is granted, not assumed.** The right to spawn is held and passed on
+deliberately, which is how a demo VM can start without the primary being in the
+path of everything it does afterwards.
+
+Watch all of it live in the **Monitor** tab: one row per VM, and a VM that ends
+stays on the roster for a minute — marked — so a death is something you can
+see rather than a row that vanished.
 ' ]
 
     CocoaHelp class >> collectionsText [ ^'# Collections
