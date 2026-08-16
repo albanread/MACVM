@@ -2996,12 +2996,19 @@ belongs to; a sound must not — when two demos play at once you want to *hear*
 both. Mixing is the wanted answer, so there is nothing to route and no owner to
 track.
 
-> **A known limitation, stated plainly.** Today the effects reach the device
-> through a single player voice, so triggers arriving close together queue up
-> and play in turn rather than overlapping. One demo firing sounds faster than
-> they finish will hear them pile up. The fix is a pool of voices rather than
-> one — which is the shape a service serving every VM should have had from the
-> start, and it is the first item of the multiple-windows work.
+**Sounds overlap, because the device has a pool of voices.** Eight of them,
+all feeding one mixer, and each trigger takes the next in turn — so two sounds
+caused in the same frame are heard together rather than one after the other.
+Past eight the oldest voice is reused, which cuts the longest-running sound
+instead of delaying the new one: in a game the new sound is the one the player
+just caused.
+
+That was not always so. Until recently every effect went through a single
+voice, which plays what it is handed *in order* — so triggers queued, and a
+demo firing faster than its sounds finish heard them pile up and arrive late.
+It is the clearest example of why naming a service matters: reached through the
+game''s command queue, sound had inherited a game''s assumptions instead of a
+service''s, and no one had ever chosen the policy it ended up with.
 ' ]
 
     CocoaHelp class >> svcDisplayText [ ^'# The Display

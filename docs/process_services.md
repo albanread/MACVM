@@ -354,10 +354,13 @@ One audio output for the process, and the only reason it was not in the census
 is that it is reached *through the game command queue* — which is how it
 inherited the game's single-session assumptions rather than the layer's laws.
 
-Its current shape is a defect (§6): 64 buffers but ONE `AVAudioPlayerNode`, so
-`play` schedules onto a single node and sounds **queue instead of mixing**.
-Named as a service, the fix states itself — a service that serves every VM
-cannot serialize their sound behind one voice, so: a voice pool, round-robin.
+Its shape *was* a defect (§6): 64 buffers but ONE `AVAudioPlayerNode`, so
+`play` scheduled onto a single node and sounds **queued instead of mixing**.
+Naming it stated the fix — a service that serves every VM cannot serialize
+their sound behind one voice — and **it is now done** (MacGamePane `45c7d30`):
+eight voices on the main mixer, round-robin per trigger, oldest voice reused
+past eight so a new sound is never delayed by a long one. Policy, stated: a
+passive device, main-thread driven, no thread of its own.
 
 Note the asymmetry that makes it the easy one: **sound needs no addressing.**
 A pane must know its window; a sound must not, because mixing IS the wanted
