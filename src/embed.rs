@@ -30,7 +30,8 @@
 
 use std::cell::Cell;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::codecache::deopt_trap;
@@ -536,21 +537,58 @@ pub enum GameCommand {
 // ordered, so the two counts describe the same frame without either waiting on
 // the other.
 const MAX_SCREEN_BUFFERS: usize = 4;
-static SCREEN_PTRS: [AtomicUsize; MAX_SCREEN_BUFFERS] =
-    [const { AtomicUsize::new(0) }; MAX_SCREEN_BUFFERS];
-static SCREEN_NBUF: AtomicUsize = AtomicUsize::new(0);
-/// How many frames the VM has presented. Picks which buffer `screenMemory`
-/// hands out; the host's own count picks which one it renders.
-static SCREEN_FRAME: AtomicU64 = AtomicU64::new(0);
-static SCREEN_STRIDE: AtomicUsize = AtomicUsize::new(0);
-static SCREEN_HEIGHT: AtomicUsize = AtomicUsize::new(0);
-static SCREEN_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// One pane's directly-written memory: its rotating framebuffers, its text
+/// plane and its palette (`docs/multi_pane_design.md` §2d).
+///
+/// These were process-wide atomics, which is the same "there is only one of
+/// it" assumption the window and the input snapshot carried — and the same
+/// cure: key them by pane, so a demo writes ITS OWN pixels. Unlike input,
+/// there is no focus rule here. A framebuffer belongs to the VM that opened
+/// it whether or not its window is in front; an unfocused demo must go on
+/// drawing, it just must not read the keyboard.
+///
+/// A lock replaces the atomics, and the rotation argument above is untouched
+/// by that: what makes it correct is the two sides COUNTING THE SAME ORDERED
+/// EVENTS, not the counter being lock-free. Every access here is once per
+/// frame (a demo refetches `screenMemory` after each present, exactly as
+/// `45d_plasma.mst` documents), so a short critical section costs nothing —
+/// and nothing is called while the lock is held, per the layer's own law.
+#[derive(Default, Clone, Copy)]
+struct PaneMemory {
+    ptrs: [usize; MAX_SCREEN_BUFFERS],
+    nbuf: usize,
+    /// How many frames this pane's VM has presented. Picks which buffer
+    /// `screenMemory` hands out; the host's own count picks which it renders.
+    frame: u64,
+    stride: usize,
+    height: usize,
+    generation: u64,
+    text_ptr: usize,
+    text_cols: usize,
+    text_rows: usize,
+    palette_ptr: usize,
+    palette_entries: usize,
+    palette_base: usize,
+}
+
+static PANE_MEMORY: Mutex<BTreeMap<u32, PaneMemory>> = Mutex::new(BTreeMap::new());
+
+fn with_pane_memory<R>(pane: u32, f: impl FnOnce(&mut PaneMemory) -> R) -> R {
+    let mut guard = PANE_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.entry(pane).or_default())
+}
+
+fn read_pane_memory(pane: u32) -> PaneMemory {
+    let guard = PANE_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get(&pane).copied().unwrap_or_default()
+}
 
 /// Count a presented frame — called by the `present` primitive, so the VM's
 /// notion of "which buffer am I drawing into" advances at exactly the moment
 /// it finishes a frame, not whenever the host gets round to drawing it.
-pub(crate) fn advance_screen_frame() {
-    SCREEN_FRAME.fetch_add(1, Ordering::AcqRel);
+pub(crate) fn advance_screen_frame(pane: u32) {
+    with_pane_memory(pane, |m| m.frame = m.frame.wrapping_add(1));
 }
 
 /// Publish the direct framebuffer's ROTATING SET — every buffer, once, at pane
@@ -560,98 +598,94 @@ pub(crate) fn advance_screen_frame() {
 /// # Safety contract (not `unsafe`, but a contract all the same)
 /// Every pointer must stay valid and writable until [`clear_screen_memory`],
 /// and the host must stop the writing VM before freeing them.
-pub fn publish_screen_buffers(ptrs: &[*mut u8], stride: usize, height: usize) {
+pub fn publish_screen_buffers(pane: u32, ptrs: &[*mut u8], stride: usize, height: usize) {
     let n = ptrs.len().min(MAX_SCREEN_BUFFERS);
-    SCREEN_STRIDE.store(stride, Ordering::Relaxed);
-    SCREEN_HEIGHT.store(height, Ordering::Relaxed);
-    SCREEN_FRAME.store(0, Ordering::Relaxed);
-    for (i, p) in ptrs.iter().take(n).enumerate() {
-        SCREEN_PTRS[i].store(*p as usize, Ordering::Relaxed);
-    }
-    // Count last, with Release: a reader that sees a non-zero count is
-    // guaranteed to see the pointers, the stride and the height that go with it.
-    SCREEN_NBUF.store(n, Ordering::Release);
+    with_pane_memory(pane, |m| {
+        m.stride = stride;
+        m.height = height;
+        m.frame = 0;
+        m.ptrs = [0; MAX_SCREEN_BUFFERS];
+        for (i, p) in ptrs.iter().take(n).enumerate() {
+            m.ptrs[i] = *p as usize;
+        }
+        // Count last, as the atomic version did: a reader holding the lock
+        // sees the pointers, the stride and the height that go with it.
+        m.nbuf = n;
+    });
 }
 
 /// Publish a SINGLE buffer — the degenerate case, used by tests and by any
 /// host with nothing to rotate. Identical to a rotating set of one, which
 /// means no rotation and therefore no tear-freedom: fine when one writer
 /// finishes a whole frame between presents, which is exactly what a test does.
-pub fn publish_screen_memory(ptr: *mut u8, stride: usize, height: usize) {
-    publish_screen_buffers(&[ptr], stride, height);
+pub fn publish_screen_memory(pane: u32, ptr: *mut u8, stride: usize, height: usize) {
+    publish_screen_buffers(pane, &[ptr], stride, height);
 }
 
 /// Retract the framebuffer — the pane closed, or is being rebuilt. Bumps the
 /// generation so any Alien still held over the old memory is dead rather than
 /// dangling.
-pub fn clear_screen_memory() {
-    SCREEN_NBUF.store(0, Ordering::Release);
-    for p in SCREEN_PTRS.iter() {
-        p.store(0, Ordering::Relaxed);
-    }
-    SCREEN_STRIDE.store(0, Ordering::Relaxed);
-    SCREEN_HEIGHT.store(0, Ordering::Relaxed);
-    SCREEN_FRAME.store(0, Ordering::Relaxed);
-    SCREEN_GENERATION.fetch_add(1, Ordering::AcqRel);
+pub fn clear_screen_memory(pane: u32) {
+    with_pane_memory(pane, |m| {
+        m.nbuf = 0;
+        m.ptrs = [0; MAX_SCREEN_BUFFERS];
+        m.stride = 0;
+        m.height = 0;
+        m.frame = 0;
+        m.generation = m.generation.wrapping_add(1);
+    });
 }
 
 /// The published framebuffer as `(ptr, stride, height)`, or `None` when no
 /// direct pane is open.
-pub(crate) fn screen_memory() -> Option<(*mut u8, usize, usize)> {
-    let n = SCREEN_NBUF.load(Ordering::Acquire);
-    if n == 0 {
+pub(crate) fn screen_memory(pane: u32) -> Option<(*mut u8, usize, usize)> {
+    let m = read_pane_memory(pane);
+    if m.nbuf == 0 {
         return None;
     }
     // The buffer for the frame the VM is drawing NOW — its own present count,
     // not whatever the host last got round to rendering.
-    let slot = (SCREEN_FRAME.load(Ordering::Relaxed) as usize) % n;
-    let p = SCREEN_PTRS[slot].load(Ordering::Relaxed);
+    let slot = (m.frame as usize) % m.nbuf;
+    let p = m.ptrs[slot];
     if p == 0 {
         return None;
     }
-    Some((
-        p as *mut u8,
-        SCREEN_STRIDE.load(Ordering::Relaxed),
-        SCREEN_HEIGHT.load(Ordering::Relaxed),
-    ))
+    Some((p as *mut u8, m.stride, m.height))
 }
 
 // The TEXT plane, published exactly like the pixel one above (SM1). A grid of
 // four-byte cells — `[char, fg, bg, flags]` — that the VM writes with stores
 // instead of sending `Text` commands. Char 0 means an unused cell and draws
 // nothing, so the plane is invisible until something is put in it.
-static TEXT_PTR: AtomicUsize = AtomicUsize::new(0);
-static TEXT_COLS: AtomicUsize = AtomicUsize::new(0);
-static TEXT_ROWS: AtomicUsize = AtomicUsize::new(0);
 
 /// Publish the text cell grid. Unlike the framebuffer this does NOT rotate —
 /// there is one grid and it stays put — so the host publishes once when the
 /// pane is built and retracts on close.
-pub fn publish_text_memory(ptr: *mut u8, cols: usize, rows: usize) {
-    TEXT_COLS.store(cols, Ordering::Relaxed);
-    TEXT_ROWS.store(rows, Ordering::Relaxed);
-    TEXT_PTR.store(ptr as usize, Ordering::Release);
+pub fn publish_text_memory(pane: u32, ptr: *mut u8, cols: usize, rows: usize) {
+    with_pane_memory(pane, |m| {
+        m.text_cols = cols;
+        m.text_rows = rows;
+        m.text_ptr = ptr as usize;
+    });
 }
 
 /// Retract the text grid — the pane closed.
-pub fn clear_text_memory() {
-    TEXT_PTR.store(0, Ordering::Release);
-    TEXT_COLS.store(0, Ordering::Relaxed);
-    TEXT_ROWS.store(0, Ordering::Relaxed);
+pub fn clear_text_memory(pane: u32) {
+    with_pane_memory(pane, |m| {
+        m.text_ptr = 0;
+        m.text_cols = 0;
+        m.text_rows = 0;
+    });
 }
 
 /// The published text grid as `(ptr, cols, rows)`, or `None` when no pane is
 /// open.
-pub(crate) fn text_memory() -> Option<(*mut u8, usize, usize)> {
-    let p = TEXT_PTR.load(Ordering::Acquire);
-    if p == 0 {
+pub(crate) fn text_memory(pane: u32) -> Option<(*mut u8, usize, usize)> {
+    let m = read_pane_memory(pane);
+    if m.text_ptr == 0 {
         return None;
     }
-    Some((
-        p as *mut u8,
-        TEXT_COLS.load(Ordering::Relaxed),
-        TEXT_ROWS.load(Ordering::Relaxed),
-    ))
+    Some((m.text_ptr as *mut u8, m.text_cols, m.text_rows))
 }
 
 // The PALETTE, published like the two planes above (SM4). The last piece of
@@ -664,35 +698,32 @@ pub(crate) fn text_memory() -> Option<(*mut u8, usize, usize)> {
 // 16 PER-LINE entries first (line `y`, index `i` in 1..15, is entry
 // `y * 16 + i`), then 240 GLOBAL entries (index `c` in 16..255 is entry
 // `globalBase + c - 16`).
-static PALETTE_PTR: AtomicUsize = AtomicUsize::new(0);
-static PALETTE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
-static PALETTE_GLOBAL_BASE: AtomicUsize = AtomicUsize::new(0);
 
 /// Publish the palette buffer. The host also tells its pane that the guest now
 /// owns it, so the pane stops uploading a CPU copy over the guest's writes.
-pub fn publish_palette_memory(ptr: *mut u8, entries: usize, global_base: usize) {
-    PALETTE_ENTRIES.store(entries, Ordering::Relaxed);
-    PALETTE_GLOBAL_BASE.store(global_base, Ordering::Relaxed);
-    PALETTE_PTR.store(ptr as usize, Ordering::Release);
+pub fn publish_palette_memory(pane: u32, ptr: *mut u8, entries: usize, global_base: usize) {
+    with_pane_memory(pane, |m| {
+        m.palette_entries = entries;
+        m.palette_base = global_base;
+        m.palette_ptr = ptr as usize;
+    });
 }
 
-pub fn clear_palette_memory() {
-    PALETTE_PTR.store(0, Ordering::Release);
-    PALETTE_ENTRIES.store(0, Ordering::Relaxed);
-    PALETTE_GLOBAL_BASE.store(0, Ordering::Relaxed);
+pub fn clear_palette_memory(pane: u32) {
+    with_pane_memory(pane, |m| {
+        m.palette_ptr = 0;
+        m.palette_entries = 0;
+        m.palette_base = 0;
+    });
 }
 
-/// `(ptr, entries, global_base)`, or `None` when no pane is open.
-pub(crate) fn palette_memory() -> Option<(*mut u8, usize, usize)> {
-    let p = PALETTE_PTR.load(Ordering::Acquire);
-    if p == 0 {
+/// `(ptr, entries, global_base)`, or `None` when this pane has none.
+pub(crate) fn palette_memory(pane: u32) -> Option<(*mut u8, usize, usize)> {
+    let m = read_pane_memory(pane);
+    if m.palette_ptr == 0 {
         return None;
     }
-    Some((
-        p as *mut u8,
-        PALETTE_ENTRIES.load(Ordering::Relaxed),
-        PALETTE_GLOBAL_BASE.load(Ordering::Relaxed),
-    ))
+    Some((m.palette_ptr as *mut u8, m.palette_entries, m.palette_base))
 }
 
 /// Where game-primitive commands go — the game analogue of [`TranscriptSink`].
@@ -2860,8 +2891,8 @@ mod tests {
     struct PublishedMemory;
     impl Drop for PublishedMemory {
         fn drop(&mut self) {
-            crate::embed::clear_screen_memory();
-            crate::embed::clear_text_memory();
+            crate::embed::clear_screen_memory(0);
+            crate::embed::clear_text_memory(0);
         }
     }
 
@@ -2869,7 +2900,7 @@ mod tests {
     fn screen_memory_writes_land_in_the_hosts_buffer_with_no_commands() {
         let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _published = PublishedMemory;
-        crate::embed::clear_screen_memory();
+        crate::embed::clear_screen_memory(0);
         // SM0. The whole point of shared screen memory is that a pixel write
         // is a STORE, not a message — so this test asserts both halves: the
         // bytes really land in the host's buffer, and the game channel stays
@@ -2902,7 +2933,7 @@ mod tests {
         assert_eq!(vm.eval("GamePane new screenMemory.").unwrap(), "nil");
         assert_eq!(vm.eval("GamePane new screenStride.").unwrap(), "nil");
 
-        crate::embed::publish_screen_memory(host_buffer.as_mut_ptr(), STRIDE, H);
+        crate::embed::publish_screen_memory(0, host_buffer.as_mut_ptr(), STRIDE, H);
 
         assert_eq!(
             vm.eval("GamePane new screenStride.").unwrap(),
@@ -2971,7 +3002,7 @@ mod tests {
 
         // Retracting it makes every handle answer nil again rather than
         // dangling over memory the host is about to reclaim.
-        crate::embed::clear_screen_memory();
+        crate::embed::clear_screen_memory(0);
         assert_eq!(vm.eval("GamePane new screenMemory.").unwrap(), "nil");
         assert_eq!(vm.eval("GamePane new screenStride.").unwrap(), "nil");
     }
@@ -3139,7 +3170,7 @@ mod tests {
         vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
 
         assert_eq!(vm.eval("GamePane basicNew paletteMemory.").unwrap(), "nil");
-        crate::embed::publish_palette_memory(pal.as_mut_ptr(), ENTRIES, GLOBAL_BASE);
+        crate::embed::publish_palette_memory(0, pal.as_mut_ptr(), ENTRIES, GLOBAL_BASE);
         assert_eq!(
             vm.eval("GamePane basicNew paletteGlobalBase.").unwrap(),
             GLOBAL_BASE.to_string(),
@@ -3210,7 +3241,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut vm = boot_test_vm(JitMode::Threshold(10));
         vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
-        crate::embed::publish_text_memory(grid.as_mut_ptr(), COLS, ROWS);
+        crate::embed::publish_text_memory(0, grid.as_mut_ptr(), COLS, ROWS);
 
         // Compose a page and check it reads back. `lineAt:` is the readable
         // form, which is what makes a page assertable without a GPU.
@@ -3292,7 +3323,7 @@ mod tests {
         let b = leaked_screen(W * H);
         let c = leaked_screen(W * H);
         let (pa, pb, pc) = (a.as_mut_ptr(), b.as_mut_ptr(), c.as_mut_ptr());
-        crate::embed::publish_screen_buffers(&[pa, pb, pc], W, H);
+        crate::embed::publish_screen_buffers(0, &[pa, pb, pc], W, H);
 
         let mut vm = boot_test_vm(JitMode::Off);
         // Frame n writes n+1 into every byte, then presents.
@@ -3349,7 +3380,7 @@ mod tests {
         let host = leaked_screen(W * H);
 
         let mut vm = boot_worker_primary();
-        crate::embed::publish_screen_memory(host.as_mut_ptr(), W, H);
+        crate::embed::publish_screen_memory(0, host.as_mut_ptr(), W, H);
 
         // The band filler lives INSIDE the worker's init source: a worker
         // boots its own copy of world/, so a class defined only in the primary
@@ -3418,7 +3449,7 @@ mod tests {
         // about redrawing only when something changed.
         let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _published = PublishedMemory;
-        crate::embed::clear_text_memory();
+        crate::embed::clear_text_memory(0);
 
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
         impl GameSink for VecGameSink {
@@ -3438,7 +3469,7 @@ mod tests {
         assert_eq!(vm.eval("GamePane basicNew textMemory.").unwrap(), "nil");
         assert_eq!(vm.eval("GamePane basicNew textCols.").unwrap(), "nil");
 
-        crate::embed::publish_text_memory(grid.as_mut_ptr(), COLS, ROWS);
+        crate::embed::publish_text_memory(0, grid.as_mut_ptr(), COLS, ROWS);
         assert_eq!(vm.eval("GamePane basicNew textCols.").unwrap(), "53");
         assert_eq!(vm.eval("GamePane basicNew textRows.").unwrap(), "30");
 
@@ -3480,7 +3511,7 @@ mod tests {
             grid.iter().all(|&b| b == 0),
             "textClearPlane must blank every cell"
         );
-        crate::embed::clear_text_memory();
+        crate::embed::clear_text_memory(0);
     }
 
     #[test]
@@ -3496,7 +3527,7 @@ mod tests {
         // paragraph.
         let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _published = PublishedMemory;
-        crate::embed::clear_screen_memory();
+        crate::embed::clear_screen_memory(0);
 
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
         impl GameSink for VecGameSink {
@@ -3517,8 +3548,8 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut vm = boot_test_vm(JitMode::Threshold(10));
         vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
-        crate::embed::publish_screen_memory(host.as_mut_ptr(), W, H);
-        crate::embed::publish_text_memory(grid.as_mut_ptr(), COLS, ROWS);
+        crate::embed::publish_screen_memory(0, host.as_mut_ptr(), W, H);
+        crate::embed::publish_text_memory(0, grid.as_mut_ptr(), COLS, ROWS);
 
         vm.exec("Plasma launch.").expect("Plasma must launch");
 
@@ -3582,7 +3613,7 @@ mod tests {
     fn screen_memory_is_length_bounded_and_cannot_scribble_past_the_screen() {
         let _guard = SCREEN_MEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _published = PublishedMemory;
-        crate::embed::clear_screen_memory();
+        crate::embed::clear_screen_memory(0);
         // The safety property that justifies handing out an Alien instead of a
         // raw pointer: a demo with an off-by-one cannot corrupt whatever the
         // host put after the framebuffer. The write fails; it does not land.
@@ -3593,7 +3624,7 @@ mod tests {
         host[canary_at] = 0xAB;
 
         let mut vm = boot_test_vm(JitMode::Threshold(10));
-        crate::embed::publish_screen_memory(host.as_mut_ptr(), STRIDE, H);
+        crate::embed::publish_screen_memory(0, host.as_mut_ptr(), STRIDE, H);
 
         // The last legal byte is index STRIDE*H (1-based) and writes fine.
         vm.exec(&format!(
@@ -3625,7 +3656,7 @@ mod tests {
         vm.exec("GamePane new screenMemory byteAt: 100000 put: 7.")
             .expect("a wild write returns quietly");
         assert_eq!(host[canary_at], 0xAB, "a wild write must not land either");
-        crate::embed::clear_screen_memory();
+        crate::embed::clear_screen_memory(0);
     }
 
     #[test]
@@ -4368,7 +4399,7 @@ mod tests {
         const COLS: usize = 53;
         const ROWS: usize = 30;
         let grid = leaked_screen(COLS * ROWS * 4);
-        crate::embed::publish_text_memory(grid.as_mut_ptr(), COLS, ROWS);
+        crate::embed::publish_text_memory(0, grid.as_mut_ptr(), COLS, ROWS);
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut vm = boot_test_vm(JitMode::Threshold(10));
@@ -6263,7 +6294,7 @@ mod tests {
                 Path::new("world"),
             )
         }));
-        crate::embed::publish_screen_memory(host.as_mut_ptr(), W, H);
+        crate::embed::publish_screen_memory(0, host.as_mut_ptr(), W, H);
         vm.exec("ParallelMandel launch.")
             .expect("ParallelMandel launch must run cleanly");
         // Interleave ticks and dispatches (the GUI's timer + WorkerInbox), with

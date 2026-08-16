@@ -286,7 +286,12 @@ fn ensure_pane_for(id: PaneId) {
         let pane_palette_global_base = pane.palette_global_base();
         let text_plane = TextPlane::new(&win.device, w, h).ok();
         if let Some(tp) = text_plane.as_ref() {
-            macvm::embed::publish_text_memory(tp.cells_ptr(), tp.cols() as usize, tp.rows() as usize);
+            macvm::embed::publish_text_memory(
+                id.raw(),
+                tp.cells_ptr(),
+                tp.cols() as usize,
+                tp.rows() as usize,
+            );
         }
         // A NEW PANE TAKES THE KEYBOARD. That is what happens on screen — the
         // window opens in front and becomes key — and saying so here is what
@@ -316,6 +321,7 @@ fn ensure_pane_for(id: PaneId) {
         // could copy stale colours over a demo's work. Published at creation
         // because the buffer lives as long as the pane and never moves.
         macvm::embed::publish_palette_memory(
+            id.raw(),
             pane_palette_ptr,
             pane_palette_entries,
             pane_palette_global_base,
@@ -392,6 +398,9 @@ fn close_window() {
     // still be queued behind this stop, and the drain must NOT re-create the
     // window we're about to close (the "window reopens after stop" bug).
     SESSION_OPEN.store(false, Ordering::Release);
+    // Which pane is going: needed both to retract ITS memory below and to
+    // drop it from the map at the end.
+    let closing = current_pane();
     // THE PER-DEMO REQUESTS ARE RESET AT LAUNCH, NOT HERE (`request_launch`).
     // They used to be cleared on this path, and that handed galaxigans back
     // its 60fps default while it was still playing: a demo asks for a rate
@@ -410,13 +419,16 @@ fn close_window() {
     // Retract the framebuffer BEFORE the buffers are dropped below: any Alien
     // the demo still holds must read as "no screen" rather than as memory that
     // is about to be freed.
-    macvm::embed::clear_screen_memory();
-    macvm::embed::clear_text_memory();
-    macvm::embed::clear_palette_memory();
+    // Retract only the CLOSING pane's memory: another pane's Aliens must stay
+    // valid, which is the whole reason these became per-pane.
+    if let Some(id) = closing {
+        macvm::embed::clear_screen_memory(id.raw());
+        macvm::embed::clear_text_memory(id.raw());
+        macvm::embed::clear_palette_memory(id.raw());
+    }
     // Forget where the mouse was; the next demo's first frame should not see a
     // pointer position left behind by this one.
     game_input::clear_mouse();
-    let closing = current_pane();
     GAMES.with(|cell| {
         if let Some(g) = closing.and_then(|id| cell.borrow_mut().remove(&id)) {
             objc::send0(g.timer, objc::sel("invalidate"));
@@ -511,9 +523,11 @@ fn present(g: &mut NativeGame) {
 ///
 /// Publishing the set lets both sides pick `frame % count` from their own
 /// count of the same ordered events, and agree with no synchronisation.
-fn publish_direct(g: &NativeGame) {
+#[allow(dead_code)]
+fn publish_direct(id: PaneId, g: &NativeGame) {
     if let Some(d) = g.direct.as_ref() {
         macvm::embed::publish_screen_buffers(
+            id.raw(),
             &d.buffer_ptrs(),
             d.stride(),
             d.height() as usize,
@@ -682,6 +696,7 @@ pub fn drain() {
                         match DirectPane::new(&g.win.device, *w, *h) {
                             Ok(d) => {
                                 macvm::embed::publish_screen_buffers(
+                                    _pane.raw(),
                                     &d.buffer_ptrs(),
                                     d.stride(),
                                     d.height() as usize,

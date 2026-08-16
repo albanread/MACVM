@@ -1756,7 +1756,7 @@ fn prim_game_present(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     // the one just handed to the host — without waiting for the host to say it
     // is done, which is the wait that cannot be had here and the tear that
     // came of pretending otherwise.
-    crate::embed::advance_screen_frame();
+    crate::embed::advance_screen_frame(vm.game_sink.as_ref().map(|s| s.pane_id()).unwrap_or(0));
     PrimResult::Ok(args[0])
 }
 
@@ -2072,7 +2072,10 @@ fn prim_game_open_direct(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// is the write target, so yesterday's Alien names the buffer the GPU is
 /// reading.
 fn prim_game_screen_memory(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
-    let Some((ptr, stride, height)) = crate::embed::screen_memory() else {
+    // THIS VM'S OWN memory: a demo writes the pixels of the pane it opened,
+    // focused or not (docs/multi_pane_design.md §2d).
+    let pane = vm.game_sink.as_ref().map(|s| s.pane_id()).unwrap_or(0);
+    let Some((ptr, stride, height)) = crate::embed::screen_memory(pane) else {
         return PrimResult::Fail;
     };
     let bytes = stride.saturating_mul(height);
@@ -2091,8 +2094,9 @@ fn prim_game_screen_memory(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
 /// Assuming `y * width + x` draws a sheared picture — this is the single most
 /// likely mistake against this API, which is why the stride is a first-class
 /// question rather than something to infer.
-fn prim_game_screen_stride(_vm: &mut VmState, _args: &[Oop]) -> PrimResult {
-    let Some((_, stride, _)) = crate::embed::screen_memory() else {
+fn prim_game_screen_stride(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    let pane = vm.game_sink.as_ref().map(|s| s.pane_id()).unwrap_or(0);
+    let Some((_, stride, _)) = crate::embed::screen_memory(pane) else {
         return PrimResult::Fail;
     };
     PrimResult::Ok(SmallInt::new(stride as i64).oop())
@@ -2107,7 +2111,10 @@ fn prim_game_screen_stride(_vm: &mut VmState, _args: &[Oop]) -> PrimResult {
 /// Unlike `screenMemory` this does NOT rotate — one grid, in place — so an
 /// Alien may be kept for the life of the pane. Fails when no pane is open.
 fn prim_game_text_memory(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
-    let Some((ptr, cols, rows)) = crate::embed::text_memory() else {
+    // THIS VM'S OWN memory: a demo writes the pixels of the pane it opened,
+    // focused or not (docs/multi_pane_design.md §2d).
+    let pane = vm.game_sink.as_ref().map(|s| s.pane_id()).unwrap_or(0);
+    let Some((ptr, cols, rows)) = crate::embed::text_memory(pane) else {
         return PrimResult::Fail;
     };
     let bytes = cols.saturating_mul(rows).saturating_mul(4);
@@ -2121,15 +2128,17 @@ fn prim_game_text_memory(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
 
 /// `textCols` (272) / `textRows` (273): the text plane's grid size in cells.
 /// Cell `(col, row)` starts at byte `(row * cols + col) * 4`.
-fn prim_game_text_cols(_vm: &mut VmState, _args: &[Oop]) -> PrimResult {
-    let Some((_, cols, _)) = crate::embed::text_memory() else {
+fn prim_game_text_cols(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    let pane = vm.game_sink.as_ref().map(|s| s.pane_id()).unwrap_or(0);
+    let Some((_, cols, _)) = crate::embed::text_memory(pane) else {
         return PrimResult::Fail;
     };
     PrimResult::Ok(SmallInt::new(cols as i64).oop())
 }
 
-fn prim_game_text_rows(_vm: &mut VmState, _args: &[Oop]) -> PrimResult {
-    let Some((_, _, rows)) = crate::embed::text_memory() else {
+fn prim_game_text_rows(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    let pane = vm.game_sink.as_ref().map(|s| s.pane_id()).unwrap_or(0);
+    let Some((_, _, rows)) = crate::embed::text_memory(pane) else {
         return PrimResult::Fail;
     };
     PrimResult::Ok(SmallInt::new(rows as i64).oop())
@@ -2146,7 +2155,10 @@ fn prim_game_text_rows(_vm: &mut VmState, _args: &[Oop]) -> PrimResult {
 /// Entry `y * 16 + i` is line `y`'s colour `i` (1..15); entry
 /// `paletteGlobalBase + c - 16` is global colour `c` (16..255).
 fn prim_game_palette_memory(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
-    let Some((ptr, entries, _)) = crate::embed::palette_memory() else {
+    // THIS VM'S OWN memory: a demo writes the pixels of the pane it opened,
+    // focused or not (docs/multi_pane_design.md §2d).
+    let pane = vm.game_sink.as_ref().map(|s| s.pane_id()).unwrap_or(0);
+    let Some((ptr, entries, _)) = crate::embed::palette_memory(pane) else {
         return PrimResult::Fail;
     };
     let bytes = entries.saturating_mul(4);
@@ -2160,8 +2172,9 @@ fn prim_game_palette_memory(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
 
 /// `paletteGlobalBase` (276): the ENTRY index at which the 240 global colours
 /// begin — `viewportHeight * 16`, but a demo should ask rather than assume.
-fn prim_game_palette_global_base(_vm: &mut VmState, _args: &[Oop]) -> PrimResult {
-    let Some((_, _, base)) = crate::embed::palette_memory() else {
+fn prim_game_palette_global_base(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    let pane = vm.game_sink.as_ref().map(|s| s.pane_id()).unwrap_or(0);
+    let Some((_, _, base)) = crate::embed::palette_memory(pane) else {
         return PrimResult::Fail;
     };
     PrimResult::Ok(SmallInt::new(base as i64).oop())
