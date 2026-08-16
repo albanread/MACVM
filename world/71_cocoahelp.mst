@@ -109,6 +109,9 @@ Object subclass: CocoaHelp [
             add: (Array with: 'Timers'        with: #svcTimersText);
             add: (Array with: 'Input'         with: #svcInputText);
             add: (Array with: 'The Fleet'     with: #svcFleetText);
+            add: (Array with: 'The Image'     with: #svcImageText);
+            add: (Array with: 'Sound'         with: #svcSoundText);
+            add: (Array with: 'The Display'   with: #svcDisplayText);
             yourself)).
         s add: (self section: 'Reference' articles: (OrderedCollection new
             add: (Array with: 'Collections'     with: #collectionsText);
@@ -2943,6 +2946,89 @@ path of everything it does afterwards.
 Watch all of it live in the **Monitor** tab: one row per VM, and a VM that ends
 stays on the roster for a minute — marked — so a death is something you can
 see rather than a row that vanished.
+' ]
+
+    CocoaHelp class >> svcImageText [ ^'# The Image
+
+**The source of truth for code — a passive store, outside every heap.**
+
+The world is a **database**: versioned class and method *text*, plus a
+bytecode cache that can always be re-derived. It holds no objects and no heap
+pointers — booting from it is still booting by compiling source, only from a
+different container than the `.mst` files.
+
+It sits outside every VM, survives all of them, and every VM can reach it. That
+makes it the process-level half of the compiler story, and the clearest
+statement of where a VM ends:
+
+> **The compile happens in a VM; the write goes to something that outlives it.**
+
+Accept a method in the Browser and both halves run — the compiler installs it
+in the running world so the change is live *now*, and the image records it so
+the change is still there in a world booted tomorrow. That is why a Smalltalk
+here can be edited while it runs without the edit being a trick.
+
+Because it is a database rather than a memory dump, ordinary database things
+are available and safe: save a snapshot, revert the last change, revert the
+whole world to the shipped one, compact it. Those are the verbs in *Caring for
+Your World*, and they are scriptable.
+' ]
+
+    CocoaHelp class >> svcSoundText [ ^'# Sound
+
+**One device, shared by every VM.**
+
+There is one audio output in the process, so sound is a service: any VM can ask
+for a noise and the machine makes it. A demo playing in a VM of its own needs no
+permission and no route.
+
+```ref
+Sound coin play.
+Sound playEffect: aSoundDoc paramsList.
+```
+
+The parametric path is one flat array of numbers, decoded by a single shared
+decoder, which is what stops an effect sounding one way in the Sound Editor and
+another in a game.
+
+**What sound does not need is addressing.** A pane must know which window it
+belongs to; a sound must not — when two demos play at once you want to *hear*
+both. Mixing is the wanted answer, so there is nothing to route and no owner to
+track.
+
+> **A known limitation, stated plainly.** Today the effects reach the device
+> through a single player voice, so triggers arriving close together queue up
+> and play in turn rather than overlapping. One demo firing sounds faster than
+> they finish will hear them pile up. The fix is a pool of voices rather than
+> one — which is the shape a service serving every VM should have had from the
+> start, and it is the first item of the multiple-windows work.
+' ]
+
+    CocoaHelp class >> svcDisplayText [ ^'# The Display
+
+**The screen belongs to the process, and one VM tends it.**
+
+AppKit may only be touched from the main thread, so one VM — the *interface* VM
+— lives there and does all of it. Every other VM reaches the screen by asking
+it. That makes the display a service, and its own design record uses the honest
+word for what the interface VM is doing: a **display server**.
+
+What crosses is not drawing commands but whole descriptions. An app in a VM of
+its own answers a **spec** — a tree of data, pickled across as real objects —
+and receives **events** back. The two ends talk directly; the primary VM is not
+in the path of a single frame or click. Pixels for a pane travel beside the
+spec as bytes.
+
+That is why an app can be busy, or slow, or crash, without the window system
+noticing: the logic is on another thread, in another heap, and the display only
+ever holds the last frame it was given.
+
+> **Where the design is still open.** There is one game window and one input
+> snapshot, so demos take turns rather than running side by side. Giving panes
+> an address, and input a subject — the focused window owns the keyboard, the
+> pointer belongs to the window under it — is what would let Life, Breakout and
+> a Mandelbrot animate at once, each on its own core, each stoppable without
+> touching the others.
 ' ]
 
     CocoaHelp class >> collectionsText [ ^'# Collections

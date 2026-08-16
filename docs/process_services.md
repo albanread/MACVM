@@ -313,3 +313,71 @@ through the kernel with the primary uninvolved.
 | **S4** | fleet registry into process services | suite unchanged; UI spawns an app VM with the primary uninvolved |
 | **S5** | a VM exits itself and announces it (`Worker exit:`) | closing a window ends its app VM; relaunch is a fresh one |
 | **S6** | game input into the process layer; demos in their own VMs | an UNEDITED demo (Life) runs in a VM of its own, reads input, stops by its own exit |
+
+---
+
+## 7. Three services this layer already ran and had not named
+
+Added 2026-08-16, applying §1's own test — *could this survive every VM in the
+process dying, and what does it HOLD?* — to the things not in the original
+census. Three pass it, and calling them services is naming what exists rather
+than proposing anything new.
+
+The question that produced them was the compiler, and the answer is worth
+keeping because it draws the boundary from both sides. A compiler is **not** a
+service: each VM includes its own, because a compiler is part of what a VM *is*
+rather than a facility it calls — a system that changes itself while running
+compiles into the heap it lives in, and a service that reached back inside a
+running VM to install its results would break law 1. From the other side, a
+`CompiledMethod` is representable but not *transferable*: wired into one heap's
+classes, patched by its inline caches, paired with code in its own cache. Ship
+it and it arrives pointing at copies. **Ask what a thing holds, not what it
+does.** A compiler holds a heap. These three do not.
+
+### The image — the source of truth for code
+
+`image_store` (SQLite): versioned class/method **text**, plus a re-derivable
+bytecode cache. It sits outside every heap, survives every VM, and is reachable
+from all of them. Booting a world is reading it; accepting a method in the
+Browser writes to it; the snapshot / revert / compact verbs operate on it.
+
+This is the process-level half of the compiler story, and the pair is the
+clearest statement of the boundary in the system: **the compile happens in a
+VM; the write goes to something that outlives it.**
+
+Passive store, serialized by SQLite's own locking. Already obeys the laws;
+naming it is bookkeeping.
+
+### Sound — one device, and today a queue rather than a mixer
+
+One audio output for the process, and the only reason it was not in the census
+is that it is reached *through the game command queue* — which is how it
+inherited the game's single-session assumptions rather than the layer's laws.
+
+Its current shape is a defect (§6): 64 buffers but ONE `AVAudioPlayerNode`, so
+`play` schedules onto a single node and sounds **queue instead of mixing**.
+Named as a service, the fix states itself — a service that serves every VM
+cannot serialize their sound behind one voice, so: a voice pool, round-robin.
+
+Note the asymmetry that makes it the easy one: **sound needs no addressing.**
+A pane must know its window; a sound must not, because mixing IS the wanted
+semantic. No `PaneId`, no focus rule, no ownership — just voices.
+
+### The display — already a display server, by that name
+
+The interface VM realizes windows that **other VMs own**: an app in a VM of its
+own sends frames (whole specs, pickled) and receives events, and `docs/appspec.md`
+already calls the receiving side a *display server*. That is a service in
+everything but the naming.
+
+It is the one of the three with real design left in it, and §2 is that design:
+per-pane addressing, and a focus rule so input acquires a subject. Naming it
+does not change the plan; it explains why the plan looks like the others —
+`PaneId` is to the display what a generational handle is to the fleet.
+
+### What naming them changes
+
+Nothing at runtime, and two things in practice. It gives each a place to state
+its policy (§1 law 3: passive-and-locked, or thread-owned) — sound has never
+had one, which is how it ended up with a queue nobody chose. And it means a new
+candidate gets asked the same question these were: *what do you hold?*
