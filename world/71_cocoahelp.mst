@@ -1380,7 +1380,7 @@ Everything you see in this window is written in Smalltalk, running on that VM, i
 
 ## The one-minute tour
 
-The toolbar switches between views: the **Workspace** (a scratchpad for running code), two **Browsers** (the class library), the **Editor**, the **Outliner**, **Find**, the **Canvas**, this **Docs** view, and the **Debugger**. The **Transcript** — the system''s log — docks at the bottom of the window. The metrics at the right of the toolbar are the VM''s own live vital signs.
+The toolbar switches between views: the **Workspace** (a scratchpad for running code), **Browser V2** (the class library), the **Outliner**, **Find**, the **Editor**, the **Canvas**, this **Docs** view, the **Debugger**, **Tests** and the **Monitor**. The **Transcript** — the system''s log — docks at the bottom of the window. The metrics at the right of the toolbar are the VM''s own live vital signs.
 
 Welcome aboard. The system is yours.
 ' ]
@@ -1560,9 +1560,9 @@ The Workspace is where every experiment starts: `TestRunner start`, `1000 factor
 
 The system log, docked at the bottom of the window (drag the divider; it remembers). `Transcript showCr: ''hello''` writes to it from anywhere — worker output is forwarded here too.
 
-## The Browsers
+## The Browser
 
-Two ways into the class library. **Browser** is the direct pane: classes, variables, selectors, source. **Browser V2** is the classic Smalltalk-80 four-pane category browser — categories, classes, protocols, methods — with full write access: accept a method edit and it compiles into the running world *and* persists.
+**Browser V2** is the way into the class library: the classic Smalltalk-80 four-pane category browser — categories, classes, protocols, methods — with full write access. Accept a method edit and it compiles into the running world *and* persists. (An earlier V1 browser is still in the image and still scriptable, but it has no toolbar tab; V2 and the Outliner cover it between them.)
 
 ## Editor, Outliner, Find
 
@@ -1576,13 +1576,21 @@ The **Canvas** is an RGBA drawing surface driven from Smalltalk. Under the **Too
 
 When code halts — a breakpoint, an error with halt-on-error enabled, an explicit `halt` — the **Debugger** fronts itself with the stack, the source, and the frame; Step Into, Step Over, Finish, Continue, Abort.
 
+## Tests
+
+The **Tests** tab runs the SUnit suites in the image: **SUITES** on the left, **RESULTS** on the right, and the full text of whatever you select below them. *Run All* runs everything; *Run Selected* runs the suite or the single test you picked. They run on the persistent VM behind the window, not the one drawing it, so the interface stays live while they go. The whole story is *Guide: Test Your Code*.
+
+## Monitor
+
+The **Monitor** tab is the roster of running VMs — one row each, with its memory, GC and JIT counters, and the main thread''s own bridge counters in a band below. It has a page of its own: *The Monitor*.
+
 ## Appearance and type
 
 **View - Appearance**: System, Light or Dark. **A-** and **A+** in the toolbar scale every code surface together.
 
 ## Demos
 
-The **Demos** menu carries the show-offs: Breakout, MandelZoom, ParallelMandel, Worms, Galaxigans and friends — each one an ordinary Smalltalk class you can read in the Browser while it runs. The menu launches them **top-level on the primary** (`CocoaBrowser hostService onMain launchDemo:`), which is what a frame loop needs; **Escape** ends one.
+The **Demos** menu carries the show-offs: Breakout, Galaxigans, Game of Life, Minesweeper, FreeCell, Plasma, Text Pages, Copper Bars, Attractor, Julia, MandelZoom, Parallel Mandelbrot, Worms and the FFT Scope — each one an ordinary Smalltalk class you can read in the Browser while it runs. With **Debug ▸ Launch in own VM** on (the default) each starts in a **VM of its own**, beating off the timer service and reading the keyboard for itself, so a demo that hangs cannot hang this window; switch it off and the demo runs on the primary instead. **Escape** ends one, and one runs at a time.
 
 ## Automation
 
@@ -1622,7 +1630,7 @@ TestRunner start.
 TestRunner run: IntegerTests.
 ```
 
-The full suite — over **7,700 assertions** — runs in both the interpreter and the JIT, and the two transcripts must match *byte for byte*. That differential gate is the project''s spine: the JIT is not allowed to disagree with the interpreter, ever.
+The full suite — **666 tests across 73 suites** — runs in both the interpreter and the JIT, and the two transcripts must match *byte for byte*. That differential gate is the project''s spine: the JIT is not allowed to disagree with the interpreter, ever.
 
 ## The image
 
@@ -2196,13 +2204,17 @@ Sound jump play.
 Sound zap play.
 ```
 
-Sprites — small pictures that move without you repainting behind them. Each row is a line of pixels, each digit one of the sprite''s own colours:
+Sprites — small pictures that move without you repainting behind them. The art is **one string**: rows separated by `/`, one character per pixel, each a hex digit picking one of the sprite''s own sixteen colours — and `.` (or `0`) is see-through. Every row must be the same length. `defineSprite:` places it and hands you the sprite:
 
 ```ref
-| id |
-id := pane defineSprite: #(''00111100'' ''01222210'' ''12222221'' ''01222210'' ''00111100'').
-(Sprite pane: pane id: id) moveTo: 100 y: 80.
+| ball |
+ball := pane defineSprite: ''..1111../.122221./12222221/.122221./..1111..''.
+ball colorAt: 1 r: 255 g: 255 b: 255.
+ball colorAt: 2 r: 255 g: 200 b: 0.
+ball moveTo: 100 y: 80.
 ```
+
+`addFrame:` appends another frame and `moveTo:y:frame:` shows one — that is how a sprite animates.
 
 Cleanup, if your game starts anything that should stop with it:
 
@@ -2260,7 +2272,7 @@ the two can never drift.
 doc := SpriteDoc new.
 doc resizeTo: 16 by: 16.
 doc setPal: 1 r: 255 g: 80 b: 60.
-doc getPx: 3 y: 4.
+doc getPx: 0 x: 3 y: 4.   "frame 0 — frames are 0-based"
 doc codeSnippet.        "the class source this sheet would save as"
 ```
 
@@ -2599,7 +2611,7 @@ end tell
 
 `evaluate` runs a string of Smalltalk and hands back the result as text; if the code raises, that becomes a real AppleScript error you can catch with `try … on error`. It accepts an optional `time limit` in seconds, because it runs on the supervisor beat rather than blocking the window — the interface never freezes waiting on your expression.
 
-The properties are how a script *looks around*: `current view` (read-write — every tab name works: workspace, browser, browser2, outliner, editor, canvas, monitor, debugger, find, help), `appearance` (system, light, or dark), `workspace text` (read-write), `transcript` and `busy` (read-only), `transcript collapsed`, and the read-only selection trio `selected package`, `selected class`, `selected method` — whatever the Browser is pointed at right now.
+The properties are how a script *looks around*: `current view` (read-write — `workspace`, `browser`, `browser2`, `outliner`, `editor`, `canvas`, `monitor`, `debugger`, `find` and `help`; the Tests tab has no scripting name yet), `appearance` (system, light, or dark), `workspace text` (read-write), `transcript` and `busy` (read-only), `transcript collapsed`, and the read-only selection trio `selected package`, `selected class`, `selected method` — whatever the Browser is pointed at right now.
 
 ## Debug from a script
 
@@ -2663,7 +2675,7 @@ The world has a **source** and a **live copy**.
 
 The source is `world/*.mst` — ordinary text files, listed in `world/world.list`, loaded in order. That is where the system ships from.
 
-The live copy is `world/image.sqlite3`, a **database**. It is built (*seeded*) from the source once, and from then on it is what the app actually boots. A freshly seeded one holds about **191 classes and 3,273 methods** in roughly **2.5 MB**.
+The live copy is `world/image.sqlite3`, a **database**. It is built (*seeded*) from the source once, and from then on it is what the app actually boots. A freshly seeded one holds about **337 classes and 5,000 methods** in roughly **4.5 MB**.
 
 This is the fact everything else follows from: **when you Accept a method in the Browser or the Editor, it goes into the database — not into the source files.** Your work is real, saved, and survives restarts; it just does not live in `world/*.mst` unless you deliberately put it there.
 
@@ -2681,7 +2693,7 @@ There are exactly two doors, and they behave very differently.
 
 Everything you need to look after the world is in one place.
 
-- **Save Snapshot** — writes the whole world, compressed, to `~/Documents/macVM Snapshots`. About **0.8 MB**, a second or two, and stamped so saves never overwrite each other. This is your seatbelt.
+- **Save Snapshot** — writes the whole world, compressed, to `~/Documents/macVM Snapshots`. About **1.5 MB**, a second or two, and stamped so saves never overwrite each other. This is your seatbelt.
 - **Restore Latest Snapshot…** — puts the newest snapshot back and reloads. The archive is checked before anything is replaced, so a wrong or damaged file is refused with your world untouched.
 - **Revert to Previous Version and Reload** — walks the history back one step for the thing you edited most recently. Gentle: the older source returns *as a new version*, so the revert is itself revertable.
 - **Compact World (drop history)…** — throws away every version but the current one and reclaims the space. Use it when the image has grown; the live code is untouched, but its history is gone for good.
@@ -2691,7 +2703,7 @@ Each destructive item asks twice: the first click changes its title to say exact
 
 ## How to work safely
 
-**Snapshot before anything ambitious.** It costs a second and under a megabyte. Before a big refactor, before filing in someone else''s code, before an experiment you cannot describe in one sentence — take one.
+**Snapshot before anything ambitious.** It costs a second and a megabyte or two. Before a big refactor, before filing in someone else''s code, before an experiment you cannot describe in one sentence — take one.
 
 **Prefer Accept while you explore.** It is versioned; you can always step back. Reach for *Add to World* only when a class is finished enough to keep.
 
@@ -2888,7 +2900,8 @@ so input is a service, and a demo running in a VM of its own **asks** for it
 rather than being sent it:
 
 ```ref
-GamePane inputState.    "{keys. mouseX. mouseY. buttons. exitRequested}"
+GamePane inputState.
+"{keys. mouseX. mouseY. buttons. exitRequested. exitGeneration}"
 ```
 
 All the values come from **one snapshot**. A frame that mixed this tick''s keys
@@ -2904,11 +2917,21 @@ Two details worth knowing:
   flag in the same snapshot, so a demo in its own VM reads it and ends
   *itself*, running its own cleanup, rather than being killed from outside.
 
-One honest limitation: there is exactly **one** snapshot, with no addressing in
-it. Two demos running at once would both answer to the same keystrokes. Giving
-input a subject — the focused window owns the keyboard, the pointer belongs to
-the window under it — is the open design question behind running several demo
-windows at the same time.
+Input has a **subject**, and the rule is the one you would guess: the focused
+window owns the keyboard, and the pointer belongs to the window under it. An
+unfocused demo reads no keys and sees no pointer outside its own pane — a game
+in the background must not answer typing aimed at the Browser. A VM asks *as
+somebody*, and the pane it draws into is who it asks as; a pane nobody has
+claimed answers every asker in full, which is the headless and single-window
+case.
+
+The request to quit is deliberately **not** gated that way. `exitGeneration`
+only ever counts up, and blanking it for an unfocused pane would hand a demo a
+number that had gone backwards — the exact bug the generation exists to
+prevent. Escape stays session-wide until sessions themselves are per-pane.
+
+What is still open is not the rule but the **coexistence**: there is one game
+window, so demos take turns rather than running side by side.
 ' ]
 
     CocoaHelp class >> svcFleetText [ ^'# The Fleet
@@ -3030,12 +3053,12 @@ That is why an app can be busy, or slow, or crash, without the window system
 noticing: the logic is on another thread, in another heap, and the display only
 ever holds the last frame it was given.
 
-> **Where the design is still open.** There is one game window and one input
-> snapshot, so demos take turns rather than running side by side. Giving panes
-> an address, and input a subject — the focused window owns the keyboard, the
-> pointer belongs to the window under it — is what would let Life, Breakout and
-> a Mandelbrot animate at once, each on its own core, each stoppable without
-> touching the others.
+> **Where the design is still open.** Drawing commands now carry the pane they
+> are for, and input has a subject — the focused window owns the keyboard, the
+> pointer belongs to the window under it. What is left is the window itself:
+> there is still one game pane, so demos take turns. When that goes, Life,
+> Breakout and a Mandelbrot animate at once, each on its own core, each
+> stoppable without touching the others.
 ' ]
 
     CocoaHelp class >> collectionsText [ ^'# Collections
@@ -3074,7 +3097,7 @@ Transcript showCr: (words inject: 0 into: [ :sum :w | sum + w size ]) printStrin
 - `count:`, `anySatisfy:`, `allSatisfy:`, `sum`, `max` — the questions you would otherwise write loops for.
 - `with:do:` / `with:collect:` — walk two collections in lockstep.
 
-All of it works on **every** kind — `aSet count: [ :e | e odd ]`, `aBag select: […]`, `aDictionary collect: […]` — because anything that only needs `do:` is defined once, at the top. One species note to know: `select:` and `collect:` on a Dictionary enumerate its **values**, and filtering answers a sequenceable result (an OrderedCollection), so chains keep working.
+All of it works on **every** kind — `aSet count: [ :e | e odd ]`, `aBag select: […]`, `aDictionary collect: […]` — because anything that only needs `do:` is defined once, at the top. One species note to know: `select:` and `collect:` on a Dictionary enumerate its **values** — and they answer different species, deliberately. `collect:` has thrown the keys away, so it answers an OrderedCollection of the transformed values; `select:` has kept whole entries, so it answers a **Dictionary**, keys and all. Take `values` first when you want a plain sequence either way.
 
 ## Slicing and building
 
@@ -3245,7 +3268,7 @@ A short tour of the machine, for the curious. The deep versions live in `docs/` 
 
 Code starts in a fast **bytecode interpreter**. Methods that prove hot are compiled by the **tier-1 JIT** to native arm64, *customized* to the receiver class — the Self trick — with inline caches that graduate mono to polymorphic to megamorphic as call sites get promiscuous.
 
-The two engines are held to one law: across the entire 7,700-assertion world suite, interpreter output and JIT output must be **byte-identical**. Every compiler change runs that differential gate, plus GC stress (a scavenge before *every* allocation), plus deoptimization stress, plus the benchmark suite. What does not pay, does not land.
+The two engines are held to one law: across the entire 666-test world suite, interpreter output and JIT output must be **byte-identical**. Every compiler change runs that differential gate, plus GC stress (a scavenge before *every* allocation), plus deoptimization stress, plus the benchmark suite. What does not pay, does not land.
 
 ## Speculation and the way back
 
