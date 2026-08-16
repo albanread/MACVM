@@ -345,7 +345,7 @@ fn primary_generation_main(
     // compute workers ParallelMandel needs). Its GameCommands cross to the main
     // thread over the shared queue + run-loop wake — the same worker→main
     // transport everything else uses. Re-installed on every respawned generation.
-    primary.set_game_sink(Box::new(crate::game::PrimaryGameSink));
+    primary.set_game_sink(Box::new(crate::game::PrimaryGameSink::new()));
 
     // DBG4: the GUI debugger frontend — the halt loop publishes to the host
     // cell and blocks on the command channel; `ui_wake` rides along because

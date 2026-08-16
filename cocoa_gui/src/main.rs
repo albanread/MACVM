@@ -468,7 +468,7 @@ fn main() {
         // S6 found this the hard way — the sink was first added to the
         // HANDSHAKE path's closure (`boot.rs`), which the GUI's real primary
         // never uses ("the live primary is supervisor.rs's, per-generation").
-        vm.set_game_sink(Box::new(crate::game::PrimaryGameSink));
+        vm.set_game_sink(Box::new(crate::game::PrimaryGameSink::new()));
         Ok(vm)
     });
 

@@ -21,7 +21,7 @@
 //! and the frame's own `Present` shows it.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use macgamepane_graphics::direct_pane::DirectPane;
@@ -45,9 +45,37 @@ const KEY_ESCAPE: u16 = 53;
 
 // ── worker→main transport (the "report to main" protocol) ────────────────────
 
-/// Commands emitted by the primary's game sink, drained on main. A plain queue
-/// + the existing run-loop wake — the same shape as `ChannelGameSink`.
-static GAME_CMDS: Mutex<VecDeque<GameCommand>> = Mutex::new(VecDeque::new());
+/// Which pane a command is FOR (`docs/multi_pane_design.md` §2a).
+///
+/// Minted per game-sink grant, so it names the VM that opened the pane — the
+/// sink is already per-VM, which is why the id lives there rather than on
+/// every `GameCommand` variant as the design first sketched. That difference
+/// is the whole reason this step touches none of the thirty-one emit sites.
+///
+/// Monotonic and never reused: a stale id from a demo that has ended can
+/// therefore never address a live pane, which is the same safety the fleet's
+/// generational handles buy, for free.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct PaneId(u32);
+
+static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(1);
+
+impl PaneId {
+    fn mint() -> Self {
+        PaneId(NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed))
+    }
+    /// The pane every command addressed before there was addressing. Used
+    /// while the drain still routes everything to the one window; it is what
+    /// the next step replaces with a real lookup.
+    pub fn legacy() -> Self {
+        PaneId(0)
+    }
+}
+
+/// Commands emitted by the game sinks, drained on main. A plain queue + the
+/// existing run-loop wake — the same shape as `ChannelGameSink` — now carrying
+/// WHO each command is for beside it.
+static GAME_CMDS: Mutex<VecDeque<(PaneId, GameCommand)>> = Mutex::new(VecDeque::new());
 static GAME_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// A game SESSION is open — from the moment a demo is dispatched until its stop
 /// closes the window. Gates pane creation on draw commands: a demo paints its
@@ -83,11 +111,36 @@ static RESET_DUE: AtomicBool = AtomicBool::new(false);
 /// The primary's `GameSink`: push each command onto the shared queue and wake
 /// main. Runs on the PRIMARY's thread (`Send`); main drains. Installed by the
 /// supervisor after the primary boots.
-pub struct PrimaryGameSink;
+pub struct PrimaryGameSink {
+    /// The pane this VM draws into. Stamped on every command it emits, so the
+    /// drain can tell two demos apart without either of them saying so.
+    pane: PaneId,
+}
+
+impl PrimaryGameSink {
+    /// A sink for a VM that may draw. Each grant mints its own pane id — the
+    /// worker-boot fn hands one to every spawned VM, so a demo in a VM of its
+    /// own is addressable from the moment it can draw at all.
+    pub fn new() -> Self {
+        Self {
+            pane: PaneId::mint(),
+        }
+    }
+    pub fn pane(&self) -> PaneId {
+        self.pane
+    }
+}
+
+impl Default for PrimaryGameSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GameSink for PrimaryGameSink {
     fn emit(&mut self, cmd: GameCommand) {
         if let Ok(mut q) = GAME_CMDS.lock() {
-            q.push_back(cmd);
+            q.push_back((self.pane, cmd));
         }
         objc::wake_main_runloop();
     }
@@ -292,12 +345,21 @@ fn close_window() {
     // still be queued behind this stop, and the drain must NOT re-create the
     // window we're about to close (the "window reopens after stop" bug).
     SESSION_OPEN.store(false, Ordering::Release);
-    // The next demo starts from the default size unless IT requests otherwise
-    // — otherwise galaxigans' 640x360 would leak into the next Breakout launch.
-    REQ_W.store(PANE_W as i64, Ordering::Release);
-    REQ_H.store(PANE_H as i64, Ordering::Release);
-    REQ_FPS.store(DEFAULT_FPS, Ordering::Release);
-    REQ_OVERSCAN.store(0, Ordering::Release);
+    // THE PER-DEMO REQUESTS ARE RESET AT LAUNCH, NOT HERE (`request_launch`).
+    // They used to be cleared on this path, and that handed galaxigans back
+    // its 60fps default while it was still playing: a demo asks for a rate
+    // ONCE at startup, so anything that clears the request mid-run is
+    // unrecoverable. This runs on every teardown — including the transient
+    // ones — and a late frame arriving behind it reopens the session through
+    // the friendly-implicit path, which restarts the frame timer at whatever
+    // REQ_FPS then says. Cleared here, that is the DEFAULT, and a demo tuned
+    // for 30 runs at 60: twice too fast, with its sound triggers piling up
+    // (the exact symptom galaxigans' own comment warns about).
+    //
+    // Resetting at launch keeps the guarantee that motivated the clear —
+    // galaxigans' 640x360 must not leak into the next Breakout — because a
+    // launch is where the next demo actually begins, and its own requests land
+    // immediately after.
     // Retract the framebuffer BEFORE the buffers are dropped below: any Alien
     // the demo still holds must read as "no screen" rather than as memory that
     // is about to be freed.
@@ -517,14 +579,19 @@ fn apply(g: &mut NativeGame, cmd: &GameCommand) {
 /// Drain the game command queue and apply it (main thread, from `drain_perform`).
 /// Loop control and audio are handled here (they work regardless of pane state).
 pub fn drain() {
-    let cmds: Vec<GameCommand> = {
+    let cmds: Vec<(PaneId, GameCommand)> = {
         let Ok(mut q) = GAME_CMDS.lock() else { return };
         if q.is_empty() {
             return;
         }
         q.drain(..).collect()
     };
-    for cmd in &cmds {
+    // ROUTING, one step at a time (`docs/multi_pane_design.md` §2a): every
+    // command now says which pane it is for, and this drain still applies all
+    // of them to the one window. That is deliberate — addressing lands first,
+    // on its own, provably changing nothing — and `_pane` is where the lookup
+    // goes when `NativeGame` becomes a map.
+    for (_pane, cmd) in &cmds {
         match cmd {
             GameCommand::StartLoop => {
                 SESSION_OPEN.store(true, Ordering::Release);
@@ -676,6 +743,15 @@ pub fn service_stop_on_main() {
 pub fn request_launch(entry: String) {
     // A fresh session must not inherit the last one's Escape.
     game_input::reset();
+    // …nor its pane size, frame rate or overscan. This is the one boundary
+    // where "the last demo's requests no longer apply" is true: the next
+    // demo's own `resizeTo:`/`frameRate:`/`overscan:` land in the very next
+    // batch, so clearing here cannot strand a demo at a default it did not
+    // choose — which clearing at teardown demonstrably could.
+    REQ_W.store(PANE_W as i64, Ordering::Release);
+    REQ_H.store(PANE_H as i64, Ordering::Release);
+    REQ_FPS.store(DEFAULT_FPS, Ordering::Release);
+    REQ_OVERSCAN.store(0, Ordering::Release);
     if GAME_ACTIVE.load(Ordering::Acquire) {
         STOP_DUE.store(true, Ordering::Release); // stop the current demo first
     }

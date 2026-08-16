@@ -286,7 +286,7 @@ fn primary_thread_main(
     // have, add it there and mirror it here — never the other way round.
     primary.set_worker_boot(Arc::new(move || {
         let mut h = VmHandle::boot(vm_options(), &boot_world)?;
-        h.set_game_sink(Box::new(crate::game::PrimaryGameSink));
+        h.set_game_sink(Box::new(crate::game::PrimaryGameSink::new()));
         Ok(h)
     }));
 
