@@ -70,7 +70,31 @@ Object subclass: AppVmClient [
          which is shape-routed. The two halves of this file use different
          hooks for that reason and it is not an inconsistency."
         Worker onMessage: [ :m | AppVmClient handle: m payload ].
+        "A TOOL THAT MOVES ON ITS OWN NEEDS A CLOCK, AND IN HERE THAT IS THE
+         VM'S OWN. The interface VM drives `AppToolWindow tickAll` from the
+         4Hz metrics beat, but that beat runs THERE — a tool in a VM of its
+         own never sees it, which is why the clock example opened showing the
+         time it launched at and then sat still.
+         The timer service is the answer already used by every demo: it wakes
+         THIS VM, on its own thread, and the tick dispatches top-level like any
+         other message. The rate is the tool's own (`onTickEvery:do:`) — a
+         clock asks for 1000ms and gets one wake a second, not four.
+         The publish is what makes it visible: this VM holds the window model
+         and the pane pixels, so a tick that changed either has to ship the
+         frame."
+        self installTick.
         ^self publish
+    ]
+
+    AppVmClient class >> installTick [
+        | w |
+        w := self localWindow.
+        (w isNil or: [ w wantsTick not ]) ifTrue: [ ^self ].
+        Worker onTick: [
+            [ AppToolWindow tickAll. AppVmClient publish ]
+                on: Error do: [ :e | Transcript showCr: 'app tick: ' , e messageText ] ].
+        Worker tickEvery: w tickPeriod.
+        ^self
     ]
 
     "The local window, when the tool installed one under our id."

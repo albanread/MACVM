@@ -2434,7 +2434,7 @@ tool window visits its own tick on one shared clock — a registry with one beat
 not a timer per window:
 
 ```ref
-w onTick: [ AppClock beat: w ].
+w onTickEvery: 1000 do: [ AppClock beat: w ].
 
 AppClock class >> beat: tool [
     | s |
@@ -2446,11 +2446,17 @@ AppClock class >> beat: tool [
 ]
 ```
 
-The beat arrives about four times a second and the clock changes once a second,
-so **three ticks in four end on that second line**. That is the discipline
-worth taking away: the beat is *permission to look*, not an instruction to
-redraw. A tick block that repaints unconditionally would redraw 48000 pixels
-for nothing and hand the differ a spec to compare against its own twin.
+**There are two clocks that can drive it, and the tool says only how often.**
+Opened in this window, the tool rides the interface''s shared 4Hz beat and the
+declared period throttles it. Opened from the Tools menu it runs in a **VM of
+its own**, where that beat does not exist — so the app''s own timer service is
+set to the very same period and wakes that VM once a second, on its own thread.
+A tool asks for a rate; which clock delivers it is not its business.
+
+Either way the guard earns its keep: the beat is *permission to look*, not an
+instruction to redraw. A tick block that repaints unconditionally would redraw
+48000 pixels for nothing and hand the differ a spec to compare against its own
+twin.
 
 `invalidatePane:` says *these pixels are stale*; `rerender` produces the new
 spec, patches the two readouts, and runs the paint block for anything

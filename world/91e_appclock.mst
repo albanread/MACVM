@@ -230,7 +230,10 @@ Object subclass: AppClock [
         "Forget what we drew last time, or a reopened window shows the second
          it closed on until the next one arrives."
         Shown := nil.
-        w onTick: [ AppClock beat: w ].
+        "ONCE A SECOND. A clock has nothing to say in between, and in a VM of
+         its own this is the timer service's actual period — one wake a
+         second rather than four that mostly answer 'no change'."
+        w onTickEvery: 1000 do: [ AppClock beat: w ].
         ^self
     ]
 ]

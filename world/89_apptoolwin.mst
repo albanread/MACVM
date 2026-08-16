@@ -368,7 +368,7 @@ Object subclass: AppToolWindow [
 
     "── an instance ─────────────────────────────────────────────────────"
 
-    | id title width height renderBlock handlerBlock paintBlock realizer lastSpec damage closeBlock tickBlock |
+    | id title width height renderBlock handlerBlock paintBlock realizer lastSpec damage closeBlock tickBlock tickPeriod tickDue |
 
     setId: anId <Symbol> title: aTitle <String> width: w <Integer> height: h <Integer>
     render: r <Object> handler: hh <Object> paint: pp <Object> ^ <AppToolWindow> [
@@ -526,17 +526,40 @@ Object subclass: AppToolWindow [
      broken block on a 4Hz beat would otherwise fill the transcript several
      times a second and bury the first report, which is the one that says
      what went wrong."
-    onTick: aBlock <Object> [ tickBlock := aBlock. ^self ]
+    onTick: aBlock <Object> [ ^self onTickEvery: 250 do: aBlock ]
+
+    "HOW OFTEN, in milliseconds — because the two beats that can drive this
+     run at different rates and a tool should not have to care which one it
+     got. In the interface VM the shared 4Hz beat calls `tickAll` and the
+     period below throttles it; in a VM of its own the app's timer service is
+     set TO this period and every wake is a real one. A clock says 1000 and
+     ticks once a second either way."
+    onTickEvery: ms <Integer> do: aBlock <Object> [
+        tickBlock := aBlock.
+        tickPeriod := ms max: 1.
+        tickDue := nil.
+        ^self
+    ]
+
+    tickPeriod ^ <Integer> [ ^tickPeriod isNil ifTrue: [ 250 ] ifFalse: [ tickPeriod ] ]
+    wantsTick ^ <Boolean> [ ^tickBlock isNil not ]
 
     tick [
         self isOpen ifFalse: [ ^self ].
         AppToolWindow suppressing ifTrue: [ ^self ].
         tickBlock isNil ifFalse: [
-            [ tickBlock value ]
-                on: Error do: [ :e |
-                    tickBlock := nil.
-                    AppToolWindow report:
-                        'tool ' , id printString , ' tick disarmed: ' , e messageText ] ].
+            | now |
+            "Throttle to the declared period. `millisecondClockValue` is the
+             VM's own elapsed clock (not the calendar), which is exactly the
+             right one to measure an interval with."
+            now := Time millisecondClockValue.
+            (tickDue isNil or: [ now >= tickDue ]) ifTrue: [
+                tickDue := now + self tickPeriod.
+                [ tickBlock value ]
+                    on: Error do: [ :e |
+                        tickBlock := nil.
+                        AppToolWindow report:
+                            'tool ' , id printString , ' tick disarmed: ' , e messageText ] ] ].
         self realizer tick.
         ^self
     ]
