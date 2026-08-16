@@ -86,10 +86,18 @@ Object subclass: CocoaHelp [
         s add: (self section: 'Guides' articles: (OrderedCollection new
             add: (Array with: 'Build an App'   with: #appGuideText);
             add: (Array with: 'Build a Game'   with: #gameGuideText);
-            add: (Array with: 'Edit Sprites and Sounds' with: #assetEditorsText);
-            add: (Array with: 'A Little Weather App' with: #weatherGuideText);
             add: (Array with: 'Test Your Code' with: #testGuideText);
             add: (Array with: 'Automation'     with: #automationText);
+            yourself)).
+        "EXAMPLES ARE WHOLE PROGRAMS, one article each: what it does, then how
+         it works, and every one of them is a file you can open in the Browser
+         while it runs. The Guides above teach a technique; these take an app
+         that ships and take it apart."
+        s add: (self section: 'Examples' articles: (OrderedCollection new
+            add: (Array with: 'Weather'       with: #weatherGuideText);
+            add: (Array with: 'Clock'         with: #clockGuideText);
+            add: (Array with: 'Sprite Editor' with: #spriteEdText);
+            add: (Array with: 'Sound Editor'  with: #soundEdText);
             yourself)).
         s add: (self section: 'Reference' articles: (OrderedCollection new
             add: (Array with: 'Collections'     with: #collectionsText);
@@ -2209,104 +2217,254 @@ Each is one readable class, in the Browser:
 > Whole numbers are your friend: they behave predictably, and they run on the VM''s fastest path. Breakout''s physics is nothing but integer addition.
 ' ]
 
-    CocoaHelp class >> assetEditorsText [ ^'# Guide: Edit Sprites and Sounds
+    CocoaHelp class >> spriteEdText [ ^'# Sprite Editor
 
-The games in the **Demos** menu draw 16-colour sprites and play parametric sound effects — and both kinds of asset are **classes in the image**, editable like everything else. You could write them by hand. The two editors under **Tools** exist so you do not have to.
+**Tools ▸ Sprite Editor…** — draw the 16-colour sprites the game engine
+renders, animate them, and save them into the image as classes.
 
-## The Sprite Editor
+## What it does
 
-**Tools ▸ Sprite Editor…** opens a utility window: a big paint grid, the 16-colour palette with RGB sliders, and a frame strip.
+A paint grid, the 16-colour palette with RGB sliders, and a frame strip. Paint
+by dragging; **Fill** floods a region, **Pick** lifts a colour off the grid.
+Colour 0 is transparent. `<` and `>` step frames, **Add**/**Dup**/**Del**
+manage the strip, and the play switch animates at the FPS you choose.
+**Preview** relaunches the current demo with your sheet in place, so you judge
+the sprite at game scale, in motion, on the real engine.
 
-- **Paint** by clicking and dragging on the grid. **Fill** floods a region; **Pick** lifts a colour off the grid into the palette selection. Colour 0 is transparent.
-- **Frames** make animation: `<` and `>` step, **Add**/**Dup**/**Del** manage the strip, and the play switch runs the animation at the FPS you set — right in the editor.
-- **Resize** changes the grid; the name field names the sprite.
+## How it works
 
-**Preview** relaunches the current demo with your sheet in place, so you judge the sprite where it will actually live — at game scale, on the engine, in motion.
+**The document computes; the window does not.** `SpriteDoc`
+(`world/44a_spritedoc.mst`) is the whole model — frames of 4-bit pixels plus
+one 16-entry palette shared by every frame, which is the engine''s own shape.
+It is plain data and string work: no Cocoa and no primitives, so it loads and
+tests **headless** under `macvm run`. The window
+(`world/76_spriteed.mst`) drives it and computes nothing itself, which is why
+the two can never drift.
 
-**Save** compiles your work into the image as a **sheet class** — a small class whose methods are the hex rows of each frame, marked `isSpriteSheet`. **Sheets** lists every sheet in the image; **Load** brings one back to the grid. **Copy Code** puts the class source on the clipboard instead, ready to paste into a world file.
-
-## The Sound Editor
-
-**Tools ▸ Sound Editor…** is an instrument panel over the engine''s parametric synth — the sfxr idea, wired to the real thing.
-
-- Twelve **recipe sliders** shape the effect: envelope, pitch and sweep, and friends. The picture above them draws the envelope and sweep you have dialled.
-- **Osc +** adds up to four oscillator rows — wave, frequency, level per row.
-- **Play** auditions through the engine itself — the very synth the games use, so what you hear is what ships.
-- **Preset** cycles the classic starting points; **Random** rolls a fresh effect; **Mutate** nudges the current one. Roll, listen, keep.
-
-**Save**, **Load** and **Copy Code** work exactly as in the sprite editor — sound sheets are classes marked `isSoundSheet`.
-
-## Where assets live
-
-A sheet class is ordinary source **in the image**: it shows up in the Browser, survives with your world, and a demo uses it by name. That is the whole pipeline — no asset folders, no export step, no formats. Draw, save, and the class is already wherever the image goes.
-
-> Both editors keep their state when closed — the window hides rather than dies, so reopening is instant and your work-in-progress is still on the grid.
-' ]
-
-    CocoaHelp class >> weatherGuideText [ ^'# Guide: A Little Weather App
-
-The Sockets page taught the wire and Build an App taught reactive windows. This guide joins them: a real internet program — city in, forecast out — in one runnable block. It talks plain HTTP to `wttr.in`, a weather service that answers a single friendly line.
-
-> This one needs the network. Without it, the app still opens and tells you honestly that the fetch failed.
-
-## The whole app
-
-```ui
-| city report fetch |
-city := ''London''.
-report := ''Press Fetch.''.
-fetch := [ :place |
-    | crlf addrs v4 s rc req all mark i |
-    crlf := (String with: (Character value: 13)) , (String with: (Character value: 10)).
-    addrs := Dns blockingResolve: ''wttr.in''.
-    v4 := addrs detect: [ :a | (a includesSubstring: '':'') not ] ifNone: [ nil ].
-    v4 isNil
-        ifTrue: [ ''no address — is the network up?'' ]
-        ifFalse: [
-            s := Socket domain: Posix afInet type: Posix sockStream protocol: 0.
-            rc := s connectTo: (InetAddress fromString: v4) port: 80.
-            rc < 0
-                ifTrue: [ s close. ''connect failed (errno '' , Posix errno printString , '')'' ]
-                ifFalse: [
-                    req := ''GET /'' , place , ''?format=3 HTTP/1.1'' , crlf ,
-                           ''Host: wttr.in'' , crlf , ''User-Agent: curl'' , crlf ,
-                           ''Connection: close'' , crlf , crlf.
-                    s send: req.
-                    all := ''''.
-                    [ | chunk | chunk := s receiveUpTo: 4096.
-                      (chunk isNil or: [ chunk isEmpty ])
-                          ifTrue: [ false ]
-                          ifFalse: [ all := all , chunk. true ] ] whileTrue.
-                    s close.
-                    mark := crlf , crlf.
-                    i := all indexOfSubstring: mark startingAt: 1.
-                    i = 0 ifTrue: [ all ] ifFalse: [
-                        (all copyFrom: i + 4 to: all size) trimSeparators ] ] ] ].
-AppToolWindow register: #weather title: ''Weather''
-    width: 460 height: 220
-    render: [ AppSpec window: ''Weather'' id: #weatherWin body: (
-        AppSpec stack: (Array
-            with: (AppSpec heading: ''A little weather app'' id: #head)
-            with: (AppSpec input: ''City'' value: city event: #city id: #where)
-            with: (AppSpec button: ''Fetch'' event: #go id: #fetchBtn)
-            with: (AppSpec text: report id: #out))
-            id: #col) ]
-    handler: [ :e :v |
-        e == #city ifTrue: [ city := v ].
-        e == #go ifTrue: [ report := fetch value: city ].
-        (AppToolWindow named: #weather) rerender ].
-AppToolWindow open: #weather.
+```ref
+| doc |
+doc := SpriteDoc new.
+doc resizeTo: 16 by: 16.
+doc setPal: 1 r: 255 g: 80 b: 60.
+doc getPx: 3 y: 4.
+doc codeSnippet.        "the class source this sheet would save as"
 ```
 
-Type a city, press **Fetch**, and the last line becomes something like `London: 🌤 +26°C` — pulled off the wire by the same `Socket`, `Dns` and `InetAddress` you met on the Sockets page, and put on screen by the same reactive loop you met in Build an App.
+**The surface is a blast, not a patch.** Every edit redraws the whole grid
+image from the model and hands it over as one RGBA buffer — the *blast, don''t
+patch* rule the whole GUI follows. A sprite grid is a few thousand pixels;
+correctness is worth more than the arithmetic to update one cell.
 
-## What to notice
+**Painting needs a view that hears the mouse.** Ordinary controls reach world
+code through actions, but run-loop callbacks — gesture recognizers, timers —
+never arrive. The grid is a `MacvmMouseView`, minted from the `#mouseview`
+delegate role, whose `mouseDown:`/`mouseDragged:` overrides dispatch straight
+into a `CocoaMouseHandler` holding a block. One holder per view, so two
+surfaces on one editor never have to disambiguate.
 
-- **The whole HTTP client is visible.** Resolve the name, connect to port 80, write a request ending in a blank line, read until the connection closes, take what follows the header block. No library between you and the protocol — which is the point: when you can see the wire, you can speak anything over it.
-- **Two events, one loop.** Typing fires `#city` with the field''s text; the button fires `#go`. Both just change state and rerender — the reactive routine does not care whether an event came from a keystroke or a network round-trip.
-- **The fetch blocks, briefly.** This block runs in the interface VM, so the window holds its breath for the round-trip — fine for half a second. A grown-up version is exactly the Build an App step 5 move: put the tool in a class, run it in a VM of its own, and the interface never waits on the internet again.
-- **The forecast''s little cloud** arrives as UTF-8 bytes in an ordinary byte-String and renders fine — the boundary rules from Strings and Text at work.
-- It is plain HTTP on purpose: macVM speaks raw TCP, and `wttr.in` is one of the services that still answers it. TLS is a realizer-sized project for another day.
+**Saving writes source.** A sheet is an ordinary class in the image whose
+methods answer the art rows and the palette, marked `isSpriteSheet` — which is
+also how **Sheets** lists them (`implementorsOf:`). There is no asset format,
+no export step, and no folder: the art travels with the image because it *is*
+code. **Copy Code** puts the same source on the clipboard for a world file.
+
+> The model came across from MACDART''s `spriteed_model.dart` — the same
+> lineage both engines share — which is why its shape matches the engine''s
+> instead of the editor''s convenience.
+' ]
+
+    CocoaHelp class >> soundEdText [ ^'# Sound Editor
+
+**Tools ▸ Sound Editor…** — an instrument panel over the engine''s parametric
+synthesiser, for designing effects beyond the built-in arcade presets.
+
+## What it does
+
+Twelve recipe sliders shape the sound — envelope, pitch and sweep, distortion,
+echo — and the picture above them draws the envelope and sweep you have dialled
+in. **Osc +** adds up to four oscillator rows (wave, frequency, level each).
+**Play** auditions it. **Preset** cycles the classic starting points, **Random**
+rolls a fresh effect and **Mutate** nudges the current one: roll, listen, keep —
+the sfxr way of working.
+
+## How it works
+
+**One flat contract.** `SoundDoc` (`world/44b_sounddoc.mst`) holds the recipe
+and answers `paramsList` — a flat array of numbers. That array is the *only*
+thing that crosses into the engine, which is what keeps the editor, the saved
+sheet and the game all playing the same sound:
+
+```ref
+| doc |
+doc := SoundDoc new.
+doc attack: 0.01; decay: 0.25; distortion: 0.2.
+doc addOsc.
+doc paramsList.        "the flat params — the whole contract"
+Sound playEffect: doc paramsList.
+```
+
+`Sound playEffect:` is primitive 263, and the decoder on the other side is a
+single function shared by every front end, so an effect cannot sound one way in
+the editor and another in a game.
+
+**Audition crosses a VM boundary.** Only the *primary* VM holds a game sink, and
+the editor runs in the interface VM — so **Play** ships the flat params to the
+primary as a one-line doit and the drain plays it there. No game window is
+needed, and nothing about the sound depends on one being open.
+
+```ref
+Worker uiDoit: ''Sound playEffect: '' , Doc paramsList printString onReply: [ :r | nil ].
+```
+
+**The envelope picture is a canvas blast** — the same RGBA surface idiom the
+sprite editor''s grid uses, redrawn whole whenever a slider moves.
+
+**Saving writes source**, exactly as sprites do: a sound sheet is a class in the
+image marked `isSoundSheet`, whose `params` method answers the flat array and
+whose `play` method sends it to the engine. **Load** brings one back into the
+sliders; **Copy Code** puts it on the clipboard.
+
+> Both editors keep their state when closed — the window hides rather than
+> dies — so reopening is instant and your work-in-progress is still there.
+' ]
+
+    CocoaHelp class >> clockGuideText [ ^'# Guide: A Clock
+
+Open **Tools ▸ Clock…**, or press play:
+
+```ui
+AppClock install. AppToolWindow open: #clock.
+```
+
+An analogue face, a digital readout and today''s date in one small window. It
+is here because it is the example that mixes everything: **pixels the tool
+draws**, **controls the framework draws**, and **a beat that belongs to
+neither**. Every other tool in the Tools menu moves when you click it; this one
+moves because time does.
+
+The whole thing is `world/91e_appclock.mst` — open it in the Browser while it
+is running.
+
+## 1. Two controls and a surface
+
+The spec is four nodes. Two are ordinary controls, one is a pane the tool will
+fill with pixels, and one is a caption:
+
+```ref
+AppSpec window: ''Clock'' id: #clockWin body: (AppSpec stack: (Array
+    with: (AppSpec heading: self digitalString id: #digital)
+    with: (AppSpec text: self dateString id: #date)
+    with: (AppSpec rgbaPane: #face width: self size height: self size)
+    with: (AppSpec text: ''Face: pixels. Readouts: controls.'' id: #note))
+    id: #col)
+```
+
+`rgbaPane:width:height:` **places** a surface; it says nothing about what is on
+it. That split is the framework''s rule for pixels: the spec decides where a
+pane goes and how big it is, and a separate paint block decides what it shows —
+because no diff of a spec could ever express "these 48000 pixels changed".
+
+Because the two readouts are **named**, a new second patches their text in
+place. The window is never rebuilt, and the pane below them is not touched by
+that at all.
+
+## 2. The face is arithmetic
+
+Everything on the dial is drawn through one method — a radial line, given an
+angle, a start and end radius, a thickness and a colour:
+
+```ref
+AppClock class >> spoke: plane stride: stride angle: a
+                  from: r0 to: r1 width: w colour: word [
+    | c steps sa ca |
+    c := self centre.
+    steps := ((r1 - r0) * 2) rounded max: 1.
+    sa := a sin. ca := a cos.
+    0 to: steps do: [ :i |
+        | r x y |
+        r := r0 + ((r1 - r0) * i / steps).
+        x := c + (r * sa) rounded.
+        y := c - (r * ca) rounded.
+        ... put the pixel ... ]
+]
+```
+
+The hour marks are twelve of those, and so are the three hands — only the
+numbers differ. Two details are worth stealing:
+
+- `y := c - (r * ca)` **subtracts**, because screen y grows downward while a
+  clock face is measured upward from twelve.
+- `sin` and `cos` are sent to ordinary numbers. There is no vector type and no
+  native maths library in the middle: the whole face is integers, Doubles and
+  `Time now`.
+
+Each hand carries the ones below it — the hour hand moves *through* the hour,
+the minute hand through the minute:
+
+```ref
+angle: (hour + (minute / 60)) * turn / 12      "hour hand"
+angle: (minute + (second / 60)) * turn / 60    "minute hand"
+angle: second * turn / 60                      "second hand"
+```
+
+A clock whose hour hand jumps only on the hour is the tell-tale of a naive one.
+
+## 3. The pixels
+
+The paint block gets the pane''s handle from the tool, asks for its plane, and
+writes into it:
+
+```ref
+handle := tool paneHandle: #face.
+plane  := AppPixels planeFor: handle width: self size height: self size.
+stride := AppPixels strideFor: handle.
+self drawFaceOn: plane stride: stride.
+AppRender present: handle.
+```
+
+Four sentences, and they are the same four the sprite editor writes — and the
+same four the Windows port writes, which is why tools move between the two
+unedited. `bgraR:g:b:` packs a colour; `at:x:y:stride:put:` writes one pixel;
+`present:` shows the result.
+
+## 4. The beat
+
+A clock needs to move on its own, so it registers a **tick block**. Every open
+tool window visits its own tick on one shared clock — a registry with one beat,
+not a timer per window:
+
+```ref
+w onTick: [ AppClock beat: w ].
+
+AppClock class >> beat: tool [
+    | s |
+    s := Time now asSeconds.
+    Shown = s ifTrue: [ ^self ].    "nothing changed — stop here"
+    Shown := s.
+    tool invalidatePane: #face.
+    tool rerender.
+]
+```
+
+The beat arrives about four times a second and the clock changes once a second,
+so **three ticks in four end on that second line**. That is the discipline
+worth taking away: the beat is *permission to look*, not an instruction to
+redraw. A tick block that repaints unconditionally would redraw 48000 pixels
+for nothing and hand the differ a spec to compare against its own twin.
+
+`invalidatePane:` says *these pixels are stale*; `rerender` produces the new
+spec, patches the two readouts, and runs the paint block for anything
+invalidated. One second, one repaint.
+
+## 5. What it costs
+
+Nothing until you open it: a tool is a dictionary entry until its window is
+built, and a closed window''s tick never runs. Watch the **Monitor** while the
+clock ticks — a few thousand pixels a second is not something this VM notices.
+
+> Change something and see: make the second hand green, or draw sixty minute
+> marks instead of twelve. Accept the method in the Browser and the next tick
+> draws your version — the window never closed.
 ' ]
 
     CocoaHelp class >> testGuideText [ ^'# Guide: Test Your Code

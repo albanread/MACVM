@@ -1,0 +1,236 @@
+"91e_appclock.mst — A CLOCK: the mixed example, and the beat that moves it.
+
+ Every other AppSpec tool in this world moves when you click it. A clock moves
+ because TIME does, and that makes it the example that shows the last piece of
+ the framework: the registry's shared beat (world/89, `AppToolWindow>>onTick:`
+ / `tickAll`). One window, three things at once —
+
+   PIXELS the tool computes — the dial, the hour marks and three hands, drawn
+   into an `rgbaPane` a pixel at a time. No AppKit, no canvas library, no
+   drawing context: `AppPixels bgraR:g:b:` and `at:x:y:stride:put:`, the same
+   four sentences the sprite editor writes.
+
+   CONTROLS the framework computes — the digital readout and the date are
+   ordinary `heading:`/`text:` spec nodes. They are named, so the differ
+   PATCHES their text every second and never rebuilds the window; the pane
+   below them is not touched by that at all.
+
+   A BEAT that belongs to neither — the tick block asks what second it is and
+   does nothing at all unless the answer changed. Four beats a second, one
+   repaint: the beat is permission to look, not an instruction to redraw.
+
+ The trigonometry is deliberate too. `sin`/`cos` are defined on every Number
+ here (world/80), so the hands are computed from integers and Doubles in
+ ordinary Smalltalk — there is no vector type, no matrix, and nothing native
+ between this file and the pixels.
+
+ Time itself: `Time now` and `Date today` are the machine's real clock and
+ calendar, zone-aware (world/81)."
+
+Object subclass: AppClock [
+    "Shown is the second we last drew. It exists so the beat can be cheap:
+     three quarters of the ticks answer 'nothing changed' and stop."
+    <classVars: Shown>
+
+    "── geometry ─────────────────────────────────────────────────────────"
+
+    AppClock class >> size ^ <Integer> [ ^220 ]
+    AppClock class >> centre ^ <Integer> [ ^self size // 2 ]
+    AppClock class >> dialRadius ^ <Integer> [ ^(self size // 2) - 6 ]
+
+    "── the readouts ─────────────────────────────────────────────────────"
+
+    AppClock class >> pad: n <Integer> ^ <String> [
+        "Two digits, so the readout does not jump about as the numbers change
+         width — the same reason a digital clock shows 09 and not 9."
+        ^n < 10 ifTrue: [ '0' , n printString ] ifFalse: [ n printString ]
+    ]
+
+    AppClock class >> digitalString ^ <String> [
+        | t |
+        t := Time now.
+        ^(self pad: t hour) , ':' , (self pad: t minute) , ':' , (self pad: t second)
+    ]
+
+    AppClock class >> dateString ^ <String> [
+        | d |
+        d := Date today.
+        ^d dayOfWeek asString , ', ' , d dayOfMonth printString , ' '
+            , d month asString , ' ' , d year printString
+    ]
+
+    "── the spec: two controls and a surface ─────────────────────────────"
+
+    AppClock class >> spec ^ <AppNode> [
+        ^AppSpec window: 'Clock' id: #clockWin body: (AppSpec stack: (Array
+            with: (AppSpec heading: self digitalString id: #digital)
+            with: (AppSpec text: self dateString id: #date)
+            with: (AppSpec rgbaPane: #face width: self size height: self size)
+            with: (AppSpec text: 'Face: pixels. Readouts: controls.' id: #note))
+            id: #col)
+    ]
+
+    "── drawing ──────────────────────────────────────────────────────────
+
+     Every put goes through `at:x:y:stride:put:` below, which drops anything
+     outside the pane. A hand at 25 past reaches beyond the dial for a few
+     pixels at the wide end of its nib, and clipping here is cheaper to read
+     than arithmetic that proves it cannot."
+
+    AppClock class >> at: plane <Object> x: x <Integer> y: y <Integer>
+                      stride: stride <Integer> put: word <Integer> [
+        (x < 0 or: [ y < 0 or: [ x >= self size or: [ y >= self size ] ] ])
+            ifTrue: [ ^self ].
+        AppPixels at: plane x: x y: y stride: stride put: word.
+        ^self
+    ]
+
+    "A disc, drawn as rows of a circle rather than by testing every pixel of
+     the square — the dial is most of the window and this runs every second."
+    AppClock class >> disc: plane stride: stride radius: rad <Integer> colour: word [
+        | c |
+        c := self centre.
+        (0 - rad) to: rad do: [ :dy |
+            | half |
+            half := ((rad * rad) - (dy * dy)) sqrt truncated.
+            (0 - half) to: half do: [ :dx |
+                self at: plane x: c + dx y: c + dy stride: stride put: word ] ].
+        ^self
+    ]
+
+    AppClock class >> ring: plane stride: stride radius: rad <Integer> colour: word [
+        | steps c |
+        steps := 900.
+        c := self centre.
+        0 to: steps do: [ :i |
+            | a |
+            a := i * 2 * Double pi / steps.
+            self at: plane x: c + (rad * a sin) rounded
+                       y: c - (rad * a cos) rounded
+                  stride: stride put: word ].
+        ^self
+    ]
+
+    "A radial line from `from` to `to` along `angle`, `w` pixels thick. The
+     hands and the hour marks are both this; only the numbers differ."
+    AppClock class >> spoke: plane stride: stride angle: a <Number>
+                      from: r0 <Number> to: r1 <Number>
+                      width: w <Integer> colour: word [
+        | c steps sa ca |
+        c := self centre.
+        steps := ((r1 - r0) * 2) rounded max: 1.
+        sa := a sin. ca := a cos.
+        0 to: steps do: [ :i |
+            | r x y |
+            r := r0 + ((r1 - r0) * i / steps).
+            x := c + (r * sa) rounded.
+            y := c - (r * ca) rounded.
+            0 to: w - 1 do: [ :ox |
+                0 to: w - 1 do: [ :oy |
+                    self at: plane x: x + ox - (w // 2) y: y + oy - (w // 2)
+                          stride: stride put: word ] ] ].
+        ^self
+    ]
+
+    "The whole face, from the current time. Drawn back to front: dial, ring,
+     hour marks, then the three hands longest-lived first, so the second hand
+     is never buried under the hour hand."
+    AppClock class >> drawFaceOn: plane <Object> stride: stride <Integer> [
+        | t hour minute second turn face rim mark hourHand minuteHand secondHand rad |
+        t := Time now.
+        turn := 2 * Double pi.
+        rad := self dialRadius.
+        face := AppPixels bgraR: 24 g: 26 b: 33.
+        rim := AppPixels bgraR: 150 g: 160 b: 180.
+        mark := AppPixels bgraR: 200 g: 208 b: 224.
+        hourHand := AppPixels bgraR: 245 g: 226 b: 170.
+        minuteHand := AppPixels bgraR: 200 g: 210 b: 232.
+        secondHand := AppPixels bgraR: 225 g: 90 b: 80.
+
+        "Clear to the window's own dark, then the dial on top of it."
+        0 to: self size - 1 do: [ :y |
+            0 to: self size - 1 do: [ :x |
+                self at: plane x: x y: y stride: stride
+                      put: (AppPixels bgraR: 16 g: 17 b: 21) ] ].
+        self disc: plane stride: stride radius: rad colour: face.
+        self ring: plane stride: stride radius: rad colour: rim.
+
+        "Twelve marks; the quarters are longer and thicker, as on a real dial."
+        0 to: 11 do: [ :h |
+            | a long |
+            a := h * turn / 12.
+            long := h \\ 3 = 0.
+            self spoke: plane stride: stride angle: a
+                  from: rad - (long ifTrue: [ 16 ] ifFalse: [ 9 ])
+                  to: rad - 4
+                  width: (long ifTrue: [ 3 ] ifFalse: [ 2 ])
+                  colour: mark ].
+
+        "The hands. Each is a fraction of a turn from twelve o'clock, and each
+         carries the ones below it: the hour hand moves through the hour, the
+         minute hand through the minute. A clock whose hour hand jumps only on
+         the hour is the tell-tale of a naive one."
+        hour := t hour \\ 12.
+        minute := t minute.
+        second := t second.
+        self spoke: plane stride: stride
+              angle: (hour + (minute / 60)) * turn / 12
+              from: 0 to: rad * 0.5 width: 5 colour: hourHand.
+        self spoke: plane stride: stride
+              angle: (minute + (second / 60)) * turn / 60
+              from: 0 to: rad * 0.75 width: 3 colour: minuteHand.
+        self spoke: plane stride: stride
+              angle: second * turn / 60
+              from: 0 - (rad * 0.15) to: rad * 0.85 width: 1 colour: secondHand.
+
+        "The cap last, so all three hands disappear under one pin."
+        self disc: plane stride: stride radius: 4 colour: mark.
+        ^self
+    ]
+
+    AppClock class >> paint: paneId <Object> damage: region <Object> in: tool <Object> [
+        | handle plane stride |
+        paneId asString = 'face' ifFalse: [ ^self ].
+        handle := tool paneHandle: #face.
+        handle = 0 ifTrue: [ ^self ].
+        plane := AppPixels planeFor: handle width: self size height: self size.
+        stride := AppPixels strideFor: handle.
+        self drawFaceOn: plane stride: stride.
+        AppRender present: handle.
+        ^self
+    ]
+
+    "── the beat ─────────────────────────────────────────────────────────"
+
+    AppClock class >> beat: tool <Object> [
+        "THE BEAT IS PERMISSION TO LOOK. It arrives about four times a second;
+         a clock changes once a second, so three of those four end here. Doing
+         the work anyway would repaint 48000 pixels for nothing and make the
+         differ compare a spec to its twin."
+        | s |
+        s := Time now asSeconds.
+        Shown = s ifTrue: [ ^self ].
+        Shown := s.
+        tool invalidatePane: #face.
+        tool rerender.
+        ^self
+    ]
+
+    "── registration ─────────────────────────────────────────────────────"
+
+    AppClock class >> install [
+        | w |
+        AppToolWindow
+            register: #clock title: 'Clock' width: 300 height: 470
+            render: [ AppClock spec ]
+            handler: [ :event :value | (AppToolWindow named: #clock) rerender ]
+            paint: [ :tool :paneId :region |
+                AppClock paint: paneId damage: region in: tool ].
+        w := AppToolWindow named: #clock.
+        "Forget what we drew last time, or a reopened window shows the second
+         it closed on until the next one arrives."
+        Shown := nil.
+        w onTick: [ AppClock beat: w ].
+        ^self
+    ]
+]

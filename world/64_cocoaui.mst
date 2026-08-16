@@ -628,6 +628,11 @@ Object subclass: CocoaUI [
          Late-bound by name, the CG7/CG8 discipline."
         (Worker classNamed: #CocoaSpriteEditor) ifNotNil: [ :ed | ed previewTick ].
         (Worker classNamed: #CocoaMonitor) ifNotNil: [ :mc | mc beatTick ].
+        "Every open AppSpec tool window visits its own `tick` here — the
+         registry's one clock (world/89, `tickAll`), which was built with this
+         beat in mind and had nothing calling it until the clock example needed
+         to move on its own."
+        (Worker classNamed: #AppToolWindow) ifNotNil: [ :tw | tw tickAll ].
         (MetricLabels at: #MEM ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: memStr ].
         (MetricLabels at: #JIT ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: jitStr ].
         (MetricLabels at: #CODE ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: codeStr ].
@@ -1077,6 +1082,7 @@ Object subclass: CocoaUI [
         self appMenu: menu item: 'Sprite Editor (AppSpec)…' id: #spriteEd tool: 'WinSpriteEd' panes: true.
         self appMenu: menu item: 'Sound Editor (AppSpec)…' id: #soundEd tool: 'WinSoundEd' panes: true.
         self appMenu: menu item: 'Pane Demo…' id: #panedemo tool: 'AppDemoPane' panes: true.
+        self appMenu: menu item: 'Clock…' id: #clock tool: 'AppClock' panes: true.
         AppToolWindow onRegister: [ :id | CocoaUI appToolRegistered: id ].
         toolsItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
             initWithTitle: 'Tools' action: nil keyEquivalent: ''.

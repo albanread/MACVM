@@ -274,6 +274,10 @@
 # spec node except one foreignView hole the platform fills. Portable: names
 # the hole, never the view.
 91d_appmixed.mst
+# AppClock: the worked mixed example — a drawn analogue face in an rgbaPane
+# beside a digital readout and date in ordinary controls, moved by the
+# registry's shared beat (world/89 onTick:/tickAll). The Docs guide walks it.
+91e_appclock.mst
 # WINARMVM's world/126 and 127 — the sprite and sound editors, VENDORED BYTE
 # FOR BYTE. The acceptance test of docs/appspec.md: tools written for Win32,
 # never edited, running here on the Cocoa realizer.
