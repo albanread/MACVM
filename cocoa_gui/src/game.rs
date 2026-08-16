@@ -194,7 +194,36 @@ static REQ_FPS: AtomicI64 = AtomicI64::new(DEFAULT_FPS);
 static REQ_OVERSCAN: AtomicI64 = AtomicI64::new(0);
 
 thread_local! {
-    static GAME: std::cell::RefCell<Option<NativeGame>> = const { std::cell::RefCell::new(None) };
+    /// Every open pane, by id (`docs/multi_pane_design.md` §2b). Main-thread
+    /// and thread-local exactly as the single cell it replaces; only the
+    /// cardinality changed.
+    ///
+    /// It holds at most one entry today, because a launch still tears the
+    /// previous demo down (§2e, the last step) — but the *shape* is what the
+    /// rest of the design needs: a command routes to its own pane, and two
+    /// demos stop being a contradiction.
+    static GAMES: std::cell::RefCell<HashMap<PaneId, NativeGame>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// The pane the session-wide operations act on — the frame timer, Escape, the
+/// close button, scripted input, the screenshot verb.
+///
+/// These are the parts that have no command to carry an id: a keystroke does
+/// not say which window it is for, the timer belongs to no demo, and `snapgame`
+/// is asked from outside. Under the adopted focus rule the answer will be *the
+/// focused window*; until panes can coexist there is only ever one open, so
+/// "the one that exists" and "the focused one" are the same pane, and this
+/// helper is where that assumption is written down instead of being spread
+/// across ten call sites.
+fn current_pane() -> Option<PaneId> {
+    GAMES.with(|cell| cell.borrow().keys().copied().next())
+}
+
+/// Run `f` against the session's current pane, if there is one.
+fn with_current<R>(f: impl FnOnce(&mut NativeGame) -> R) -> Option<R> {
+    let id = current_pane()?;
+    GAMES.with(|cell| cell.borrow_mut().get_mut(&id).map(f))
 }
 
 /// Open the game window + pane once (main thread), lazily on the FIRST command
@@ -204,9 +233,9 @@ thread_local! {
 /// `GameWindow::create` does the whole NSWindow + CAMetalLayer + key-capable-view
 /// wiring we would otherwise hand-roll. The frame timer is NOT started here —
 /// only on StartLoop (`start_frame_timer`).
-fn ensure_pane() {
-    GAME.with(|cell| {
-        if cell.borrow().is_some() {
+fn ensure_pane_for(id: PaneId) {
+    GAMES.with(|cell| {
+        if cell.borrow().contains_key(&id) {
             return;
         }
         let w = REQ_W.load(Ordering::Acquire).clamp(1, 4096) as u32;
@@ -252,7 +281,8 @@ fn ensure_pane() {
         if let Some(tp) = text_plane.as_ref() {
             macvm::embed::publish_text_memory(tp.cells_ptr(), tp.cols() as usize, tp.rows() as usize);
         }
-        *cell.borrow_mut() = Some(NativeGame {
+        // `id` is the PaneId; the `pane` field below is the IndexedPane.
+        cell.borrow_mut().insert(id, NativeGame {
             win,
             pane,
             direct: None,
@@ -297,8 +327,12 @@ fn ensure_pane() {
 /// the frame timer if a loop was running. Only the rare mid-session
 /// `SetPaneSize` reaches here.
 fn rebuild_pane_at_requested_size() {
-    GAME.with(|cell| {
-        if let Some(g) = cell.borrow_mut().take() {
+    // Rebuild the SAME pane: drop its window and recreate under its own id, so
+    // a mid-session resize does not hand the demo a different pane than the one
+    // its commands are addressed to.
+    let Some(id) = current_pane() else { return };
+    GAMES.with(|cell| {
+        if let Some(g) = cell.borrow_mut().remove(&id) {
             objc::send0(g.timer, objc::sel("invalidate"));
             let w = objc::send0(g.win.view, objc::sel("window"));
             if !w.is_null() {
@@ -310,7 +344,7 @@ fn rebuild_pane_at_requested_size() {
             objc::send0(g.win.view, objc::sel("release"));
         }
     });
-    ensure_pane();
+    ensure_pane_for(id);
     if GAME_ACTIVE.load(Ordering::Acquire) {
         start_frame_timer();
     }
@@ -321,8 +355,8 @@ fn rebuild_pane_at_requested_size() {
 /// Its `gameTick:` flags a step due + reads keys; the primary's supervisor loop
 /// runs the step. Idempotent — invalidates any prior timer first.
 fn start_frame_timer() {
-    GAME.with(|cell| {
-        if let Some(g) = cell.borrow_mut().as_mut() {
+    with_current(|g| {
+        {
             if g.timer != objc::NIL {
                 objc::send0(g.timer, objc::sel("invalidate"));
             }
@@ -369,8 +403,9 @@ fn close_window() {
     // Forget where the mouse was; the next demo's first frame should not see a
     // pointer position left behind by this one.
     game_input::clear_mouse();
-    GAME.with(|cell| {
-        if let Some(g) = cell.borrow_mut().take() {
+    let closing = current_pane();
+    GAMES.with(|cell| {
+        if let Some(g) = closing.and_then(|id| cell.borrow_mut().remove(&id)) {
             objc::send0(g.timer, objc::sel("invalidate"));
             // Read the window via the view FIRST (removeFromSuperview would nil
             // view.window), detach the delegate so `close` can't re-fire our
@@ -595,7 +630,7 @@ pub fn drain() {
         match cmd {
             GameCommand::StartLoop => {
                 SESSION_OPEN.store(true, Ordering::Release);
-                ensure_pane();
+                ensure_pane_for(*_pane);
                 start_frame_timer();
                 GAME_ACTIVE.store(true, Ordering::Release);
             }
@@ -610,7 +645,7 @@ pub fn drain() {
             GameCommand::SetPaneSize { w, h } => {
                 REQ_W.store(*w as i64, Ordering::Release);
                 REQ_H.store(*h as i64, Ordering::Release);
-                let exists = GAME.with(|cell| cell.borrow().is_some());
+                let exists = current_pane().is_some();
                 if exists && SESSION_OPEN.load(Ordering::Acquire) {
                     rebuild_pane_at_requested_size();
                 }
@@ -628,9 +663,9 @@ pub fn drain() {
                 }
                 REQ_W.store(*w as i64, Ordering::Release);
                 REQ_H.store(*h as i64, Ordering::Release);
-                ensure_pane();
-                GAME.with(|cell| {
-                    if let Some(g) = cell.borrow_mut().as_mut() {
+                ensure_pane_for(*_pane);
+                GAMES.with(|cell| {
+                    if let Some(g) = cell.borrow_mut().get_mut(_pane) {
                         match DirectPane::new(&g.win.device, *w, *h) {
                             Ok(d) => {
                                 macvm::embed::publish_screen_buffers(
@@ -656,7 +691,7 @@ pub fn drain() {
             // arrive before the pane exists; a demo sends it during start.
             GameCommand::SetOverscan { margin } => {
                 REQ_OVERSCAN.store(*margin as i64, Ordering::Release);
-                let exists = GAME.with(|cell| cell.borrow().is_some());
+                let exists = current_pane().is_some();
                 if exists && SESSION_OPEN.load(Ordering::Acquire) {
                     rebuild_pane_at_requested_size();
                 }
@@ -667,9 +702,7 @@ pub fn drain() {
             // before StartLoop, where start_frame_timer picks it up directly.
             GameCommand::SetFrameRate { fps } => {
                 REQ_FPS.store(*fps as i64, Ordering::Release);
-                let running = GAME.with(|cell| {
-                    cell.borrow().as_ref().map(|g| g.timer != objc::NIL).unwrap_or(false)
-                });
+                let running = with_current(|g| g.timer != objc::NIL).unwrap_or(false);
                 if running && SESSION_OPEN.load(Ordering::Acquire) {
                     start_frame_timer();
                 }
@@ -700,14 +733,17 @@ pub fn drain() {
                 {
                     SESSION_OPEN.store(true, Ordering::Release);
                     GAME_ACTIVE.store(true, Ordering::Release);
-                    ensure_pane();
+                    ensure_pane_for(*_pane);
                     start_frame_timer();
                 }
                 if SESSION_OPEN.load(Ordering::Acquire) {
-                    ensure_pane();
+                    ensure_pane_for(*_pane);
                 }
-                GAME.with(|cell| {
-                    if let Some(g) = cell.borrow_mut().as_mut() {
+                // THE ROUTING, live: a command is applied to the pane it was
+                // addressed to, not to "the" pane. Two demos drawing at once
+                // reach two different NativeGames from here.
+                GAMES.with(|cell| {
+                    if let Some(g) = cell.borrow_mut().get_mut(_pane) {
                         apply(g, cmd);
                     }
                 });
@@ -778,8 +814,9 @@ pub fn request_stop() {
 /// firing our `windowWillClose:` delegate exactly as a click would. Main-thread
 /// only (the control drain calls this). Returns false if no window is open.
 pub fn press_close_button() -> bool {
-    GAME.with(|cell| {
-        if let Some(g) = cell.borrow().as_ref() {
+    GAMES.with(|cell| {
+        let borrowed = cell.borrow();
+        if let Some(g) = current_pane().and_then(|id| borrowed.get(&id)) {
             let w = objc::send0(g.win.view, objc::sel("window"));
             if !w.is_null() {
                 objc::send1_id(w, objc::sel("performClose:"), objc::NIL);
@@ -812,9 +849,9 @@ pub fn synth_mouse(pane_x: i64, pane_y: i64, button: i64, down: bool) -> bool {
         (_, true) => 3,
         (_, false) => 4,
     };
-    GAME.with(|cell| {
+    GAMES.with(|cell| {
         let borrowed = cell.borrow();
-        let Some(g) = borrowed.as_ref() else {
+        let Some(g) = current_pane().and_then(|id| borrowed.get(&id)) else {
             return false;
         };
         let window = objc::send0(g.win.view, objc::sel("window"));
@@ -866,9 +903,9 @@ pub fn synth_mouse(pane_x: i64, pane_y: i64, button: i64, down: bool) -> bool {
 /// (the IDE window is often still key, so `snapshot_client_area`'s `keyWindow`
 /// would photograph the wrong one). `None` if no game window is open.
 pub fn game_window_number() -> Option<i64> {
-    GAME.with(|cell| {
+    GAMES.with(|cell| {
         let borrowed = cell.borrow();
-        let g = borrowed.as_ref()?;
+        let g = current_pane().and_then(|id| borrowed.get(&id))?;
         let window = objc::send0(g.win.view, objc::sel("window"));
         if window.is_null() {
             return None;
@@ -884,9 +921,9 @@ pub fn game_window_number() -> Option<i64> {
 pub fn synth_key(key_code: u16, down: bool, characters: &str) -> bool {
     // NSEventType: KeyDown 10, KeyUp 11.
     let event_type: u64 = if down { 10 } else { 11 };
-    GAME.with(|cell| {
+    GAMES.with(|cell| {
         let borrowed = cell.borrow();
-        let Some(g) = borrowed.as_ref() else {
+        let Some(g) = current_pane().and_then(|id| borrowed.get(&id)) else {
             return false;
         };
         let window = objc::send0(g.win.view, objc::sel("window"));
@@ -1004,13 +1041,16 @@ extern "C" fn game_tick(_this: objc::Id, _cmd: objc::Sel, _timer: objc::Id) {
 /// otherwise index one past the last cell.
 fn read_mouse_into_pane_pixels() {
     let (fx, fy, left, right) = macgamepane_graphics::input::mouse_state();
-    let (px, py) = GAME.with(|cell| match cell.borrow().as_ref() {
-        Some(g) => (
-            ((fx * g.w as f64) as i64).min(g.w as i64 - 1),
-            ((fy * g.h as f64) as i64).min(g.h as i64 - 1),
+    // The pointer is reported in the CURRENT pane's pixels — under the focus
+    // rule that becomes "the window under the pointer", which is the same
+    // answer while only one pane can be open.
+    let (px, py) = match with_current(|g| (g.w, g.h)) {
+        Some((w, h)) => (
+            ((fx * w as f64) as i64).min(w as i64 - 1),
+            ((fy * h as f64) as i64).min(h as i64 - 1),
         ),
         None => (-1, -1),
-    });
+    };
     game_input::set_mouse(px, py, i64::from(left) | (i64::from(right) << 1));
 }
 
