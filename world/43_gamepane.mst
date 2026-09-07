@@ -131,7 +131,11 @@ Object subclass: GamePane [
      parameter: every class variable here has to survive the image's
      shell-merge on reseed, so the list should stop growing as the engine
      learns new inputs."
-    <classVars: StepBlock NextId ResetBlock Frame>
+    "ReqFps is CONFIGURATION, not an input — which is why it is here and not
+     in GameFrame, and why it does not contradict the note above: a demo asks
+     for its frame rate ONCE at startup, and the VM that will drive its steps
+     has to be able to read that answer back (world/94, DemoVmClient>>serve)."
+    <classVars: StepBlock NextId ResetBlock Frame ReqFps>
 
     "── palettes ─────────────────────────────────────────────────────────
      A fresh pane arrives with COLOURS ALREADY IN IT. Before this, a new
@@ -666,11 +670,34 @@ Object subclass: GamePane [
     ]
 
     frameRate: fps [
-        "Request the frame timer's rate in frames-per-second (1..120). The
-         default is 60; a demo whose logic was tuned for a slower rate asks for
-         it here (galaxigans uses 30). Resets to 60 when the window closes."
+        "Request the frame rate in frames-per-second (1..120). The default is
+         60; a demo whose logic was tuned for a slower rate asks for it here
+         (galaxigans uses 30). Resets to 60 when the window closes.
+
+         THERE ARE TWO CLOCKS AND THIS SETS BOTH. The host's frame timer
+         presents and reads input; the demo's OWN VM drives its steps (S6 —
+         `Worker tickEvery:`, world/94). The primitive only reaches the first,
+         so the rate is recorded here for `DemoVmClient>>serve` to read when it
+         arms the second. Before that, `serve` armed a hardcoded 60 AFTER the
+         demo had asked for 30 — the host timer obeyed, the VM tick did not,
+         and galaxigans played at exactly twice its intended speed with its
+         sound triggers piling up, which is the very thing its own comment
+         predicts."
+        ReqFps := fps.
+        ^self primFrameRate: fps
+    ]
+
+    primFrameRate: fps [
+        "The host frame timer alone. Send `frameRate:`, not this."
         <primitive: 262>
         ^self
+    ]
+
+    GamePane class >> requestedFrameRate [
+        "The rate the running demo asked for, or nil if it never said —
+         `DemoVmClient>>serve` reads this to arm the VM tick that actually
+         paces the game."
+        ^ReqFps
     ]
 
     "The topmost text overlay: a real 5x7 ASCII font drawn in RGB (not palette
@@ -814,6 +841,8 @@ Object subclass: GamePane [
          like any other guest error."
         ResetBlock ifNotNil: [ ResetBlock value. ResetBlock := nil ].
         StepBlock := nil.
+        "The next demo asks for its own rate, or takes the default."
+        ReqFps := nil.
         "Drop the frame entirely rather than zeroing fields one by one — the
          next session gets a fresh one, and this line does not need editing
          when the frame learns a new parameter."

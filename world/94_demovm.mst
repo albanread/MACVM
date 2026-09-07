@@ -38,7 +38,15 @@ Object subclass: DemoVmClient [
     "Installed by the init source `DemoVmHost` ships, AFTER the demo's own
      entry doit has run (so `GamePane onStep:` is already registered). From
      here the VM has exactly one job: step on the beat, and end when asked."
-    DemoVmClient class >> serve [ ^self serveAt: 60 ]
+    "60 UNLESS THE DEMO SAID OTHERWISE. The entry doit has already run by the
+     time this is sent (the init source is `[ <entry>. DemoVmClient serve. ]`),
+     so a demo that sent `GamePane>>frameRate:` during its start has recorded
+     the rate it wants and this honours it. Hardcoding 60 here was the bug that
+     made galaxigans play at double speed: it asked for 30, the host timer
+     obeyed, and then this armed the clock that actually paces the steps at 60."
+    DemoVmClient class >> serve [
+        ^self serveAt: (GamePane requestedFrameRate ifNil: [ 60 ])
+    ]
 
     "TAKES NO ENTRY DOIT, on purpose. The obvious version passed the demo's
      launch source along so the client could report what it was running — and
