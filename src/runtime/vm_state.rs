@@ -69,6 +69,12 @@ pub struct VmRegBlock {
     /// stores — never needs `#[repr(C)]` reasoning about a foreign enum's
     /// own representation).
     pub last_compiled_kind: u64,
+    /// Stage 4a: x0..x27 as they were at the most recent uncommon-trap `brk`,
+    /// spilled by the trampoline's first fourteen instructions
+    /// (`deopt_trap::build_uncommon_trampoline`). Read by the deopt
+    /// materializer for `ValueLoc::Reg` locations; meaningless at any other
+    /// time (`VMREG_TRAP_REGS_OFFSET`, `VMREG_TRAP_REGS_COUNT`).
+    pub trap_regs: [u64; crate::oops::layout::VMREG_TRAP_REGS_COUNT],
 }
 
 impl VmRegBlock {
@@ -83,6 +89,7 @@ impl VmRegBlock {
             last_compiled_fp: 0,
             last_compiled_pc: 0,
             last_compiled_kind: 0,
+            trap_regs: [0; crate::oops::layout::VMREG_TRAP_REGS_COUNT],
         }
     }
 }
@@ -1471,7 +1478,7 @@ mod tests {
             VMREG_BLOCK_SIZE, VMREG_CARD_BASE_BIASED_OFFSET, VMREG_EDEN_END_OFFSET,
             VMREG_EDEN_TOP_ADDR_OFFSET, VMREG_LAST_COMPILED_FP_OFFSET,
             VMREG_LAST_COMPILED_KIND_OFFSET, VMREG_LAST_COMPILED_PC_OFFSET, VMREG_OLD_START_OFFSET,
-            VMREG_POLL_FLAG_OFFSET,
+            VMREG_POLL_FLAG_OFFSET, VMREG_TRAP_REGS_OFFSET,
         };
         assert_eq!(
             std::mem::offset_of!(VmRegBlock, eden_top_addr),
@@ -1504,6 +1511,10 @@ mod tests {
         assert_eq!(
             std::mem::offset_of!(VmRegBlock, last_compiled_kind),
             VMREG_LAST_COMPILED_KIND_OFFSET
+        );
+        assert_eq!(
+            std::mem::offset_of!(VmRegBlock, trap_regs),
+            VMREG_TRAP_REGS_OFFSET
         );
         assert_eq!(std::mem::size_of::<VmRegBlock>(), VMREG_BLOCK_SIZE);
         // D6's other half: reg_block must sit at VmState's own offset 0, or

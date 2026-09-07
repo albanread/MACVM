@@ -139,6 +139,10 @@ materializer; `crosses_call`/`crosses_trap_only` split in `compute_intervals`;
 exempt F2-proven-smi trap-only intervals from spill-all; stop the write-through
 `stur`s for them in emit. Acceptance test: the arith listing loses its three
 dead stores. Expected: arith −15–20% alone.
+*Landed 2026-09-07 — `docs/reg_env_findings.md`. The listing lost all three
+stores (22 → 19 instructions, 568 → 464 bytes); interleaved A/B: arith −24.8%,
+fib −6.8%; everything else inside its noise on two A/Bs. Behind
+`MACVM_REG_ENV` (default on), census `MACVM_REG_ENV_COUNT=1`.*
 
 **4a′. Re-gate what the old substrate rejected**, exactly as
 `regalloc_findings.md` §Next says: `MACVM_PEEP_IMM=1` (landed, default-off,

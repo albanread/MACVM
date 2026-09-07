@@ -1780,7 +1780,7 @@ fn build_deopt_metadata(
                         iv.map(|i| (i.start, i.end, i.assignment, i.crosses_safepoint))
                     );
                 }
-                let root_slots = (0..n_slots)
+                let root_slots: Vec<crate::compiler::scopes::ValueLoc> = (0..n_slots)
                     .map(|i| {
                         resolve_frame_loc(
                             ir::VReg(i as u32 + 1),
@@ -1792,6 +1792,17 @@ fn build_deopt_metadata(
                         )
                     })
                     .collect();
+                debug_assert!(
+                    (matches!(raw.kind, crate::compiler::scopes::SafepointKind::UncommonTrap)
+                        && raw.inline.is_none())
+                        || !std::iter::once(&root_receiver)
+                            .chain(root_slots.iter())
+                            .any(|l| matches!(l, crate::compiler::scopes::ValueLoc::Reg(_))),
+                    "build_deopt_metadata: ValueLoc::Reg in a {:?} site's root scope at bci {} \
+                     (compiler bug — registers only survive to an uncommon trap)",
+                    raw.kind,
+                    raw.bci
+                );
                 let root_method_ix = ir_method
                     .method_pool_ix
                     .expect("a method with a deopt site interned its own method oop");
@@ -1949,6 +1960,21 @@ fn build_deopt_metadata(
                 for &(ix, pool_ix) in &raw.stack_closures {
                     stack[ix as usize] = crate::compiler::scopes::ValueLoc::ElidedClosure(pool_ix);
                 }
+                // Stage 4a: a register home is only sound at a ROOT uncommon
+                // trap (`ValueLoc::Reg`'s doc); regalloc's trap-only rule is
+                // what makes that hold, and this is its compile-time tripwire
+                // (the materializer has the deopt-time one).
+                debug_assert!(
+                    (matches!(raw.kind, crate::compiler::scopes::SafepointKind::UncommonTrap)
+                        && raw.inline.is_none())
+                        || !stack
+                            .iter()
+                            .any(|l| matches!(l, crate::compiler::scopes::ValueLoc::Reg(_))),
+                    "build_deopt_metadata: ValueLoc::Reg on a {:?} site's stack at bci {} \
+                     (compiler bug — registers only survive to an uncommon trap)",
+                    raw.kind,
+                    raw.bci
+                );
                 rec.record_site(
                     sp.pc_off,
                     SafepointState {

@@ -524,3 +524,28 @@ unchanged, drifted −16%…+23% between the two sessions). Warm JIT throughput 
 flat for the month; the 4–3 split by workload shape stands. What the compute
 rows are made of, instruction by instruction, and the plan to move them:
 `docs/perf_plan_2026-09.md`.
+
+## 2026-09-07, later — Stage 4a lands (register deopt environments)
+
+Same harness, same session, same MACDART/Cog builds as the board above; the
+only change is MACVM (`docs/reg_env_findings.md`). MACDART's column is again
+the noise check (arith 675 → 691, fib 6586 → 6535: ≤2.5%).
+
+| bench | MACVM | Cog | MACDART | vs Cog | vs MACDART |
+|---|--:|--:|--:|---|---|
+| arith | **998** | 4850 | **691** | **MACVM 4.9x** | Dart 1.4x |
+| fib | 8021 | 17648 | **6535** | **MACVM 2.2x** | Dart 1.2x |
+| **sieve** | **167** | 302 | 174 | **MACVM 1.8x** | MACVM 1.04x |
+| **dict** | **242** | 1146 | 543 | **MACVM 4.7x** | **MACVM 2.2x** |
+| alloc | 523 | 682 | **389** | **MACVM 1.3x** | Dart 1.3x |
+| richards | 985 | 2117 | **568** | **MACVM 2.1x** | Dart 1.7x |
+| **deltablue** | **130** | 251 | 252 | **MACVM 1.9x** | **MACVM 1.9x** |
+
+Against this morning's board: arith 1337 → 998 (−25%, the interleaved A/B's
+own number), fib 8495 → 8021 (−6%); everything else inside the session's
+noise, including alloc's 465 → 523, which both same-round A/Bs put at
+−2–4% and which drifted 465/499/522 across three runs of two binaries. The
+compute rows narrow: arith 2.0x → 1.4x, fib 1.3x → 1.2x. The 4–3 split by
+workload shape is unchanged, and it is the first time in a month the
+compute side of it moved.
+

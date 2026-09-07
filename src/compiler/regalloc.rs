@@ -137,6 +137,22 @@ pub(crate) fn fuse_cmp_br() -> bool {
     })
 }
 
+/// Stage 4a's switch (docs/perf_plan_2026-09.md §5), the repo's env-gate
+/// convention for a regalloc change: `MACVM_REG_ENV=0` restores the
+/// pre-4a allocation byte for byte (every trap-observed vreg spilled, dead
+/// blocks' facts kept), `1` keeps the hygiene half — no facts from
+/// unreachable fail blocks — but grants no registers, `2` (the default) is
+/// the whole thing. The A/B that decides the default runs the same binary at
+/// 0 and 2, interleaved; 1 is the bisect point.
+pub(crate) fn reg_env_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("MACVM_REG_ENV").ok().as_deref() {
+        Some("0") | Some("off") => 0,
+        Some("1") => 1,
+        _ => 2,
+    })
+}
+
 fn is_safepoint(ir: &Ir) -> bool {
     matches!(
         ir,
@@ -344,6 +360,7 @@ pub fn compute_intervals(
     Vec<u32>,
     std::collections::HashMap<u32, u32>,
     Vec<(VReg, u32)>,
+    Vec<(u32, Vec<u32>)>,
 ) {
     let block_order = reverse_postorder(method);
 
@@ -354,6 +371,47 @@ pub fn compute_intervals(
     let mut max_use: HashMap<u32, u32> = HashMap::new();
     let mut block_start_pos: HashMap<u32, u32> = HashMap::new();
     let mut block_end_pos: HashMap<u32, u32> = HashMap::new();
+    // Stage 4a (docs/perf_plan_2026-09.md §5): register deopt environments
+    // for trap-only smi temps. Three facts the walk gathers, folded after it:
+    //  - `trap_owner_pos[fail block]`: the position of the op whose fail edge
+    //    enters that block, so a value a trap records is kept live THROUGH
+    //    the op (env-liveness: `adds dst, a, b; b.vs` must never put `dst` in
+    //    `a`'s register — on the fail edge `a` is the value the interpreter
+    //    re-adds, and it has to still be somewhere).
+    //  - `trap_observed[v]`: the root `UncommonTrap` positions recording v.
+    //  - `nonreg_referenced`: every vreg some OTHER kind of site records (a
+    //    LoopPoll, an inlined site, a ctx temp) — those keep a slot.
+    // Task #94's earlier-safepoint facts are held in `earlier_facts` until
+    // eligibility is known: they are GC-visibility facts, and a smi in a
+    // register has nothing for the GC to see.
+    let mut trap_owner_pos: HashMap<u32, u32> = HashMap::new();
+    let mut trap_observed: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut nonreg_referenced: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut earlier_facts: Vec<(u32, u32)> = Vec::new();
+    // An UNREACHABLE block's trap can never fire, so its deopt facts are
+    // pure noise — and not harmless noise: `SmiArithNoOv`'s conversion leaves
+    // the original fail block behind, and its stale facts named benchArith's
+    // `s + i*i` at a trap no predecessor chain reaches, which failed the
+    // dominance check below and pinned the temp to a slot. Dead blocks keep
+    // their positions (emit still lays them out, and
+    // `unreachable_block_gets_a_position_not_a_panic` pins that); they just
+    // record nothing.
+    let reg_env = reg_env_level();
+    let reachable: std::collections::HashSet<u32> = {
+        let mut set = std::collections::HashSet::new();
+        if reg_env == 0 {
+            set.extend(method.blocks.iter().map(|b| b.id.0)); // pre-4a: every block records
+        }
+        if let Some(entry) = block_order.first() {
+            set.insert(entry.0);
+        }
+        for b in &method.blocks {
+            for succ in successors(b) {
+                set.insert(succ.0);
+            }
+        }
+        set
+    };
     // S13 step 7b: every vreg an UNCOMMON-TRAP deopt site reads must be LIVE
     // ACROSS its safepoint (spilled to a frame slot the materializer can
     // read), not merely live UP TO it. `driver::build_deopt_metadata` resolves,
@@ -409,8 +467,23 @@ pub fn compute_intervals(
             if matches!(ir, Ir::CallSend { .. } | Ir::CallRuntime { .. }) {
                 call_positions.push(pos);
             }
+            {
+                let mut succs = Vec::new();
+                op_successors(ir, &mut succs);
+                for succ in succs {
+                    let target = &method.blocks[succ.0 as usize];
+                    if matches!(target.code.first(), Some(Ir::UncommonTrap { .. })) {
+                        trap_owner_pos
+                            .entry(succ.0)
+                            .and_modify(|p| *p = (*p).max(pos))
+                            .or_insert(pos);
+                    }
+                }
+            }
+            let live_block = reachable.contains(&bid.0);
             if let Some((_, raw)) = block.deopt_sites.iter().find(|(ci, raw)| {
-                *ci == idx as u32
+                live_block
+                    && *ci == idx as u32
                     && matches!(
                         raw.kind,
                         SafepointKind::UncommonTrap | SafepointKind::LoopPoll
@@ -443,12 +516,19 @@ pub fn compute_intervals(
                 // path-insensitivity that made interval-widening UNSOUND
                 // (root cause 1/3's lesson) is made harmless by the fill,
                 // NOT by pretending liveness is linear.
+                let is_root_trap =
+                    matches!(raw.kind, SafepointKind::UncommonTrap) && raw.inline.is_none();
                 let mut record = |v: u32| {
                     deopt_live_exact.push((v, pos));
                     for &sp in &safepoint_positions {
                         if sp < pos {
-                            deopt_live_exact.push((v, sp));
+                            earlier_facts.push((v, sp));
                         }
+                    }
+                    if is_root_trap {
+                        trap_observed.entry(v).or_default().push(pos);
+                    } else {
+                        nonreg_referenced.insert(v);
                     }
                 };
                 record(0);
@@ -501,7 +581,7 @@ pub fn compute_intervals(
             if let Some((_, raw)) = block
                 .deopt_sites
                 .iter()
-                .find(|(ci, raw)| *ci == idx as u32 && raw.inline.is_some())
+                .find(|(ci, raw)| live_block && *ci == idx as u32 && raw.inline.is_some())
             {
                 // Same task-#94 earlier-safepoint coverage as the plain-trap
                 // arm above — an inlined site's rebuilt frames read the very
@@ -510,9 +590,10 @@ pub fn compute_intervals(
                     deopt_live_exact.push((v, pos));
                     for &sp in &safepoint_positions {
                         if sp < pos {
-                            deopt_live_exact.push((v, sp));
+                            earlier_facts.push((v, sp));
                         }
                     }
+                    nonreg_referenced.insert(v); // two frames rebuild from slots
                 };
                 // Caller (root) frame: receiver + every unified slot.
                 record(0);
@@ -546,11 +627,13 @@ pub fn compute_intervals(
             // emit), so natural liveness does NOT cover them — force each live
             // across so spill-all pins it to a frame slot the `CtxLoc::Elided`
             // materializer reads. Only for a `has_ctx` M (else `ctx_vregs` empty).
-            if !method.ctx_vregs.is_empty()
+            if live_block
+                && !method.ctx_vregs.is_empty()
                 && block.deopt_sites.iter().any(|(ci, _)| *ci == idx as u32)
             {
                 for &cv in &method.ctx_vregs {
                     deopt_live_widen.push((cv.0, pos));
+                    nonreg_referenced.insert(cv.0);
                 }
             }
             ir.uses(|v| {
@@ -577,6 +660,123 @@ pub fn compute_intervals(
     }
 
     // Back-edge loop-range widening (see this function's own doc above).
+    // Stage 4a: which trap-observed vregs may keep a REGISTER across their
+    // traps instead of a slot. Four conditions, each load-bearing:
+    //  1. known-smi — the register holds a tagged smi word the materializer
+    //     adopts as-is, and there is nothing for the GC to see (no oop-map
+    //     entry, no nil-fill, no write-through);
+    //  2. observed by root `UncommonTrap` sites ONLY — a poll's slow path and
+    //     a call clobber registers, and an inlined site rebuilds two frames
+    //     from slots;
+    //  3. crosses no safepoint organically — over the ENV-EXTENDED interval:
+    //     a value a trap records must stay live through the op that owns the
+    //     fail edge (`adds dst, a, b; b.vs` must not compute into `a`'s
+    //     register, and a slot the trap records must not have its register
+    //     reused between its last use and the `brk`), so the interval is
+    //     stretched to the owning op's position and must contain no
+    //     safepoint even then. The first cut stretched only the reexecute
+    //     STACK: a cold loop compiled as one trap behind a `Jump` recorded
+    //     the temp `t` from its SLOT, whose register had been handed to `i`
+    //     by the time the brk fired — the trap read 1 for 0
+    //     (`cocoa_c2_dnu_sends_survive_the_jit`, 301 for 300);
+    //  4. the first def dominates every observing trap, walked up the
+    //     single-predecessor chain from the trap block exactly as S2c does —
+    //     an unwritten slot reads the prologue nil, an unwritten register
+    //     reads garbage, so every path that can trap must have run a def.
+    // The extension is applied ONLY to vregs that pass: nothing else's
+    // interval moves, so no other allocation changes. The loop-widening
+    // fixpoint below never touches such an interval (no endpoint outside its
+    // loop), but condition 3 is re-checked after it anyway; that can only
+    // remove.
+    let mut reg_env_ok: std::collections::HashSet<u32> = if reg_env < 2 {
+        Default::default()
+    } else {
+        let known_smi = crate::compiler::ir::known_smi_vregs(method);
+        // A trap block is one `UncommonTrap` op, so its position is its start.
+        let owner_of_trap: HashMap<u32, u32> = block_order
+            .iter()
+            .filter_map(|bid| {
+                let owner = *trap_owner_pos.get(&bid.0)?;
+                Some((block_start_pos[&bid.0], owner))
+            })
+            .collect();
+        let mut preds: HashMap<u32, Vec<u32>> = HashMap::new();
+        for b in &method.blocks {
+            for succ in successors(b) {
+                preds.entry(succ.0).or_default().push(b.id.0);
+            }
+        }
+        let mut starts: Vec<(u32, u32)> =
+            block_start_pos.iter().map(|(&b, &p)| (p, b)).collect();
+        starts.sort_unstable();
+        let block_of = |p: u32| -> u32 {
+            match starts.binary_search_by_key(&p, |&(start, _)| start) {
+                Ok(i) => starts[i].1,
+                Err(0) => starts[0].1,
+                Err(i) => starts[i - 1].1,
+            }
+        };
+        let dominates = |def_block: u32, def_pos: u32, obs: u32| -> bool {
+            let mut cur = block_of(obs);
+            if cur == def_block {
+                return def_pos <= obs;
+            }
+            for _ in 0..64 {
+                match preds.get(&cur).map(Vec::as_slice) {
+                    Some([only]) => {
+                        if *only == def_block {
+                            return true;
+                        }
+                        cur = *only;
+                    }
+                    _ => return false,
+                }
+            }
+            false
+        };
+        let granted: Vec<(u32, u32)> = trap_observed
+            .iter()
+            .filter_map(|(v, traps)| {
+                let v = *v;
+                if !known_smi.contains(&v)
+                    || nonreg_referenced.contains(&v)
+                    || method.vregs[v as usize].is_fp
+                {
+                    return None;
+                }
+                let (Some(&s), Some(&e)) = (min_def.get(&v), max_use.get(&v)) else {
+                    return None;
+                };
+                // Condition 3 over the env-extended end (every trap must
+                // have a reachable owner, or it is not ours to reason about).
+                let mut e_ext = e;
+                for t in traps {
+                    e_ext = e_ext.max(*owner_of_trap.get(t)?);
+                }
+                if safepoint_positions.iter().any(|&sp| s <= sp && e_ext > sp) {
+                    return None;
+                }
+                let def_block = block_of(s);
+                traps
+                    .iter()
+                    .all(|&t| dominates(def_block, s, t))
+                    .then_some((v, e_ext))
+            })
+            .collect();
+        for &(v, e_ext) in &granted {
+            if let Some(e) = max_use.get_mut(&v) {
+                *e = (*e).max(e_ext);
+            }
+        }
+        granted.into_iter().map(|(v, _)| v).collect()
+    };
+    deopt_live_exact.extend(
+        earlier_facts
+            .iter()
+            .copied()
+            .filter(|(v, _)| !reg_env_ok.contains(v)),
+    );
+
     let mut loop_ranges: Vec<(u32, u32)> = Vec::new();
     for &bid in &block_order {
         let b = bid.0 as usize;
@@ -813,6 +1013,12 @@ pub fn compute_intervals(
     // spill decision is unaffected; `oopmap::build_for_position` checks
     // `extra_oop_live` as an ADDITIONAL, exact-position fact alongside the
     // (now unwidened) interval.
+    // Stage 4a: condition 3 again, over the post-fixpoint intervals.
+    reg_env_ok.retain(|&v| {
+        let s = *min_def.get(&v).unwrap_or(&u32::MAX);
+        let e = *max_use.get(&v).unwrap_or(&0);
+        !safepoint_positions.iter().any(|&sp| s <= sp && e > sp)
+    });
     let deopt_referenced: std::collections::HashSet<u32> = deopt_live_exact
         .iter()
         .map(|&(v, _)| v)
@@ -832,7 +1038,10 @@ pub fn compute_intervals(
         .filter_map(|vid| {
             let start = *min_def.get(&vid)?;
             let end = *max_use.get(&vid).unwrap_or(&start);
-            let crosses_safepoint = deopt_referenced.contains(&vid)
+            // Stage 4a: a trap-only smi temp is deopt-referenced yet keeps a
+            // register — its trap scope names the register (`ValueLoc::Reg`).
+            let crosses_safepoint = (deopt_referenced.contains(&vid)
+                && !reg_env_ok.contains(&vid))
                 || safepoint_positions
                     .iter()
                     .any(|&sp| start <= sp && end > sp);
@@ -851,12 +1060,17 @@ pub fn compute_intervals(
         })
         .collect();
 
+    let reg_env_vregs: Vec<(u32, Vec<u32>)> = reg_env_ok
+        .iter()
+        .map(|&v| (v, trap_observed.get(&v).cloned().unwrap_or_default()))
+        .collect();
     (
         block_order,
         intervals,
         safepoint_positions,
         block_start_pos,
         extra_oop_live,
+        reg_env_vregs,
     )
 }
 
@@ -1112,6 +1326,9 @@ pub struct RegallocResult {
     /// makes `extra_oop_live`'s earlier-safepoint facts sound without
     /// path-sensitive liveness. Sorted, deduplicated.
     pub deopt_nil_init_slots: Vec<SpillSlot>,
+    /// Stage 4a: the vregs granted a register across their uncommon traps
+    /// (`ValueLoc::Reg` in those trap scopes), each with its trap positions.
+    pub reg_env_vregs: Vec<(u32, Vec<u32>)>,
 }
 
 /// F3c S1 census (docs/f3c_design.md, WINVM): how many spilled intervals
@@ -1272,8 +1489,14 @@ pub(crate) fn f3c_census(method: &IrMethod, ra: &RegallocResult) -> (u32, u32, u
 }
 
 pub fn regalloc(method: &IrMethod) -> RegallocResult {
-    let (block_order, mut intervals, safepoint_positions, block_start_pos, extra_oop_live) =
-        compute_intervals(method);
+    let (
+        block_order,
+        mut intervals,
+        safepoint_positions,
+        block_start_pos,
+        extra_oop_live,
+        reg_env_vregs,
+    ) = compute_intervals(method);
     // S24 A1 (design Risk 1): PIN the block compilation's closure vreg live
     // for the whole method — the root deopt scope's receiver ValueLoc names
     // its spill slot, and `Ir::NlrReturn` reads it, at ANY safepoint. A
@@ -1339,6 +1562,19 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
     // S14 perf recovery: call-free spilled intervals also get a resident
     // register (slots stay canonical; see LiveInterval::resident_reg).
     assign_residents(&mut intervals);
+    // Stage 4a census (`MACVM_REG_ENV_COUNT=1`): every vreg granted a
+    // register across its traps, with the trap positions and what the scan
+    // actually gave it — the same family as `MACVM_S2_COUNT`.
+    if std::env::var_os("MACVM_REG_ENV_COUNT").is_some() {
+        for (v, traps) in &reg_env_vregs {
+            let iv = intervals.iter().find(|iv| iv.vreg.0 == *v);
+            eprintln!(
+                "regenv v{v} traps={traps:?} interval={:?} assignment={:?}",
+                iv.map(|iv| (iv.start, iv.end)),
+                iv.and_then(|iv| iv.assignment)
+            );
+        }
+    }
     // Task #94: the final spill slot of every deopt-referenced vreg (all are
     // spill-assigned — `crosses_safepoint` is forced for them). `emit`
     // nil-fills these in the prologue, which is what makes `extra_oop_live`'s
@@ -1452,6 +1688,7 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
         block_start_pos,
         extra_oop_live,
         deopt_nil_init_slots,
+        reg_env_vregs,
     }
 }
 
@@ -1649,7 +1886,7 @@ mod tests {
             vec![VRegInfo { is_oop: true, is_fp: false }, VRegInfo { is_oop: true, is_fp: false }],
         );
 
-        let (_order, intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
+        let (_order, intervals, _safepoints, _bsp, _extra, _regenv) = compute_intervals(&method);
         let iv = intervals
             .iter()
             .find(|iv| iv.vreg == v0)
@@ -1683,7 +1920,7 @@ mod tests {
         };
         let method = hand_method(vec![block0, block1], vec![VRegInfo { is_oop: true, is_fp: false }]);
 
-        let (order, intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
+        let (order, intervals, _safepoints, _bsp, _extra, _regenv) = compute_intervals(&method);
         assert_eq!(
             order,
             vec![BlockId(0), BlockId(1)],
@@ -1719,7 +1956,7 @@ mod tests {
         };
         let method = hand_method(vec![block], vec![VRegInfo { is_oop: true, is_fp: false }]);
 
-        let (_order, mut intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
+        let (_order, mut intervals, _safepoints, _bsp, _extra, _regenv) = compute_intervals(&method);
         assert!(
             intervals[0].crosses_safepoint,
             "v0 is defined before and used after the call"
@@ -1894,7 +2131,7 @@ mod tests {
             deopt_sites: Vec::new(),
         };
         let method = hand_method(vec![block0, dead], Vec::new());
-        let (order, _intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
+        let (order, _intervals, _safepoints, _bsp, _extra, _regenv) = compute_intervals(&method);
         assert_eq!(
             order.len(),
             2,
@@ -1935,6 +2172,290 @@ mod tests {
     /// accumulator — `sumTo: 10` returned 11 (the loop counter's own final
     /// value) instead of 55 the first time this ran through the real
     /// compiler, in `world/tests/tier1.mst`.
+    /// Stage 4a: a known-smi temp observed only by the overflow trap of the
+    /// op that consumes it keeps its REGISTER — no forced spill, so no
+    /// write-through — and the trap scope resolves it to `ValueLoc::Reg`.
+    /// `v1`'s last organic use is the `Move` BEFORE the trapping `+`, so the
+    /// env-liveness extension is what carries it through the op: its interval
+    /// ends at the `SmiArith`, not the `Move`, and the sum lands in a
+    /// different register.
+    #[test]
+    fn trap_observed_smi_temp_keeps_a_register() {
+        use crate::compiler::ir::{DeoptRaw, IrBlock};
+        use crate::compiler::scopes::{resolve_frame_loc, SafepointKind, ValueLoc};
+        let blocks = vec![
+            IrBlock {
+                id: BlockId(0),
+                bci: 0,
+                code: vec![
+                    Ir::Param { dst: VReg(0), index: 0 },
+                    Ir::ConstSmi { dst: VReg(1), value: 5 },
+                    Ir::ConstSmi { dst: VReg(2), value: 7 },
+                    Ir::Move { dst: VReg(4), src: VReg(1) },
+                    Ir::SmiArith {
+                        op: SmiOp::Add,
+                        dst: VReg(3),
+                        a: VReg(4),
+                        b: VReg(2),
+                        fail: BlockId(2),
+                    },
+                    Ir::Jump { target: BlockId(1) },
+                ],
+                entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
+            },
+            IrBlock {
+                id: BlockId(1),
+                bci: 5,
+                code: vec![Ir::Ret { val: VReg(3) }],
+                entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
+            },
+            IrBlock {
+                id: BlockId(2),
+                bci: 4,
+                code: vec![Ir::UncommonTrap { bci: 4 }],
+                entry_stack: Vec::new(),
+                deopt_sites: vec![(
+                    0,
+                    DeoptRaw {
+                        stack: vec![VReg(1), VReg(2)],
+                        bci: 4,
+                        kind: SafepointKind::UncommonTrap,
+                        reexecute: true,
+                        stack_closures: Vec::new(),
+                        inline: None,
+                    },
+                )],
+            },
+        ];
+        let vregs = vec![
+            VRegInfo { is_oop: true, is_fp: false },
+            VRegInfo { is_oop: false, is_fp: false },
+            VRegInfo { is_oop: false, is_fp: false },
+            VRegInfo { is_oop: false, is_fp: false },
+            VRegInfo { is_oop: false, is_fp: false },
+        ];
+        let m = hand_method(blocks, vregs);
+        let ra = regalloc(&m);
+        let iv = |v: u32| ra.intervals.iter().find(|iv| iv.vreg == VReg(v)).unwrap();
+        let owner_pos = ra.block_start_pos[&0] + 4; // the SmiArith
+        let trap_pos = ra.block_start_pos[&2];
+        for v in [1u32, 2] {
+            assert!(
+                matches!(iv(v).assignment, Some(Assignment::Reg(_))),
+                "v{v} is observed only by its own trap: it keeps a register, got {:?}",
+                iv(v).assignment
+            );
+            assert!(!iv(v).crosses_safepoint, "v{v} must not be force-spilled");
+        }
+        assert_eq!(
+            iv(1).end,
+            owner_pos,
+            "env-liveness: v1 (last used by the Move) stays live through the trapping op"
+        );
+        let r1 = match iv(1).assignment {
+            Some(Assignment::Reg(r)) => r,
+            _ => unreachable!(),
+        };
+        if let Some(Assignment::Reg(r3)) = iv(3).assignment {
+            assert_ne!(
+                r1, r3,
+                "the sum must not be computed into the re-executed operand's register"
+            );
+        }
+        assert!(
+            ra.extra_oop_live.contains(&(VReg(1), trap_pos)),
+            "the trap's own fact is what makes v1 resolvable at the brk"
+        );
+        assert_eq!(
+            resolve_frame_loc(
+                VReg(1),
+                trap_pos,
+                &ra.intervals,
+                &ra.extra_oop_live,
+                &Default::default(),
+                &Default::default()
+            ),
+            ValueLoc::Reg(r1),
+            "the trap scope names the register"
+        );
+    }
+
+    /// Stage 4a's boundary: a trap-observed temp that ALSO crosses a loop
+    /// poll — a loop-carried value, or one defined before the poll and
+    /// consumed after it — keeps the spill-all contract. A poll's slow path
+    /// calls, so a register is no home for it.
+    #[test]
+    fn trap_observed_temp_crossing_a_poll_stays_spilled() {
+        use crate::compiler::ir::{DeoptRaw, IrBlock};
+        use crate::compiler::scopes::SafepointKind;
+        let blocks = vec![
+            IrBlock {
+                id: BlockId(0),
+                bci: 0,
+                code: vec![
+                    Ir::Param { dst: VReg(0), index: 0 },
+                    Ir::ConstSmi { dst: VReg(1), value: 5 },
+                    Ir::Jump { target: BlockId(1) },
+                ],
+                entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
+            },
+            IrBlock {
+                id: BlockId(1),
+                bci: 2,
+                code: vec![
+                    Ir::Move { dst: VReg(2), src: VReg(1) },
+                    Ir::Poll,
+                    Ir::SmiArith {
+                        op: SmiOp::Add,
+                        dst: VReg(3),
+                        a: VReg(2),
+                        b: VReg(1),
+                        fail: BlockId(2),
+                    },
+                    Ir::Jump { target: BlockId(1) },
+                ],
+                entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
+            },
+            IrBlock {
+                id: BlockId(2),
+                bci: 4,
+                code: vec![Ir::UncommonTrap { bci: 4 }],
+                entry_stack: Vec::new(),
+                deopt_sites: vec![(
+                    0,
+                    DeoptRaw {
+                        stack: vec![VReg(2), VReg(1)],
+                        bci: 4,
+                        kind: SafepointKind::UncommonTrap,
+                        reexecute: true,
+                        stack_closures: Vec::new(),
+                        inline: None,
+                    },
+                )],
+            },
+        ];
+        let vregs = vec![
+            VRegInfo { is_oop: true, is_fp: false },
+            VRegInfo { is_oop: false, is_fp: false },
+            VRegInfo { is_oop: false, is_fp: false },
+            VRegInfo { is_oop: false, is_fp: false },
+        ];
+        let m = hand_method(blocks, vregs);
+        let ra = regalloc(&m);
+        for v in [1u32, 2] {
+            let iv = ra.intervals.iter().find(|iv| iv.vreg == VReg(v)).unwrap();
+            assert!(iv.crosses_safepoint, "v{v} crosses the poll");
+            assert!(
+                matches!(iv.assignment, Some(Assignment::Spill(_))),
+                "v{v} crosses the poll: spill-all still applies, got {:?}",
+                iv.assignment
+            );
+        }
+    }
+
+    /// Stage 4a's dominance condition: a temp defined on ONE arm and read
+    /// by a trap past the join keeps a slot — the other arm reaches the trap
+    /// without ever writing the register, and only the nil-filled slot has
+    /// a defined value there.
+    #[test]
+    fn trap_reached_around_the_def_keeps_a_slot() {
+        use crate::compiler::ir::{DeoptRaw, IrBlock};
+        use crate::compiler::scopes::SafepointKind;
+        let trap = |id: u32, bci: usize, stack: Vec<VReg>| IrBlock {
+            id: BlockId(id),
+            bci,
+            code: vec![Ir::UncommonTrap { bci }],
+            entry_stack: Vec::new(),
+            deopt_sites: vec![(
+                0,
+                DeoptRaw {
+                    stack,
+                    bci,
+                    kind: SafepointKind::UncommonTrap,
+                    reexecute: true,
+                    stack_closures: Vec::new(),
+                    inline: None,
+                },
+            )],
+        };
+        let blocks = vec![
+            IrBlock {
+                id: BlockId(0),
+                bci: 0,
+                code: vec![
+                    Ir::Param { dst: VReg(0), index: 0 },
+                    Ir::ConstSmi { dst: VReg(1), value: 0 },
+                    Ir::ConstSmi { dst: VReg(5), value: 1 },
+                    Ir::SmiCmpBr {
+                        op: CmpOp::Le,
+                        a: VReg(5),
+                        b: VReg(5),
+                        if_true: BlockId(1),
+                        if_false: BlockId(2),
+                        fail: BlockId(5),
+                    },
+                ],
+                entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
+            },
+            IrBlock {
+                id: BlockId(1),
+                bci: 4,
+                code: vec![
+                    Ir::ConstSmi { dst: VReg(2), value: 5 },
+                    Ir::Jump { target: BlockId(3) },
+                ],
+                entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
+            },
+            IrBlock {
+                id: BlockId(2),
+                bci: 6,
+                code: vec![Ir::Jump { target: BlockId(3) }],
+                entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
+            },
+            IrBlock {
+                id: BlockId(3),
+                bci: 7,
+                code: vec![
+                    Ir::SmiArith {
+                        op: SmiOp::Add,
+                        dst: VReg(3),
+                        a: VReg(1),
+                        b: VReg(1),
+                        fail: BlockId(4),
+                    },
+                    Ir::Ret { val: VReg(3) },
+                ],
+                entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
+            },
+            trap(4, 7, vec![VReg(2), VReg(1)]),
+            trap(5, 3, vec![]),
+        ];
+        let vregs = vec![
+            VRegInfo { is_oop: true, is_fp: false },
+            VRegInfo { is_oop: false, is_fp: false },
+            VRegInfo { is_oop: false, is_fp: false },
+            VRegInfo { is_oop: false, is_fp: false },
+            VRegInfo { is_oop: false, is_fp: false },
+            VRegInfo { is_oop: false, is_fp: false },
+        ];
+        let m = hand_method(blocks, vregs);
+        let ra = regalloc(&m);
+        let iv2 = ra.intervals.iter().find(|iv| iv.vreg == VReg(2)).unwrap();
+        assert!(
+            iv2.crosses_safepoint && matches!(iv2.assignment, Some(Assignment::Spill(_))),
+            "v2's def on one arm does not dominate the trap past the join: slot, got {:?}",
+            iv2.assignment
+        );
+    }
+
     #[test]
     fn loop_carried_vreg_interval_spans_whole_loop() {
         let s = VReg(0); // accumulator, live across the back edge
@@ -2026,7 +2547,7 @@ mod tests {
             vec![entry, header, body, exit, bailout],
             (0..6).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect(),
         );
-        let (order, intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
+        let (order, intervals, _safepoints, _bsp, _extra, _regenv) = compute_intervals(&method);
 
         // Confirms this hand-built shape actually reproduces the bug's own
         // precondition: the exit block linearized before the body block.

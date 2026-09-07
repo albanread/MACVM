@@ -415,7 +415,17 @@ pub const VMREG_LAST_COMPILED_PC_OFFSET: usize = 48;
 /// happen, but if it somehow did, clearing both make it fail loudly rather
 /// than plausibly).
 pub const VMREG_LAST_COMPILED_KIND_OFFSET: usize = 56;
-pub const VMREG_BLOCK_SIZE: usize = 64;
+// Stage 4a (docs/perf_plan_2026-09.md §5): the TRAP REGISTER FILE. The
+// uncommon-trap trampoline spills x0..x27 here, straight off the `brk`, before
+// it touches any register itself — so a deopt scope can name a REGISTER as a
+// value's location (`ValueLoc::Reg`) and the materializer reads it back from
+// this block instead of forcing the value through a frame slot. Only a
+// trap-only safepoint may do this (registers are intact at a `brk`; a call
+// clobbers them), which regalloc's eligibility rule guarantees at compile time
+// and `deoptimize_frame` re-checks at deopt time.
+pub const VMREG_TRAP_REGS_OFFSET: usize = 64;
+pub const VMREG_TRAP_REGS_COUNT: usize = 28;
+pub const VMREG_BLOCK_SIZE: usize = VMREG_TRAP_REGS_OFFSET + 8 * VMREG_TRAP_REGS_COUNT;
 
 /// S11 D4.1/D5/P8: the RootSpill area every runtime-reaching stub uses to
 /// park x0..x7 (receiver + up to 7 args) as GC roots while control is in

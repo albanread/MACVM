@@ -35,6 +35,7 @@ use crate::compiler::assembler::{imm, mem, mem_post, mem_pre, sp, x, Assembler, 
 use crate::compiler::jasm_assembler::JasmAssembler;
 use crate::oops::layout::{
     VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET, VMREG_LAST_COMPILED_PC_OFFSET,
+    VMREG_TRAP_REGS_COUNT, VMREG_TRAP_REGS_OFFSET,
 };
 use crate::oops::Oop;
 
@@ -1060,6 +1061,19 @@ impl DeoptTrampolines {
 fn build_uncommon_trampoline() -> crate::compiler::assembler::CodeBlob {
     let mut a = JasmAssembler::new();
 
+    // Stage 4a (docs/perf_plan_2026-09.md §5): spill x0..x27 into the VM's
+    // trap register file FIRST — before this trampoline touches a single
+    // register — so a deopt scope may name a register as a value's home
+    // (`ValueLoc::Reg`) and the materializer reads it back from
+    // `VmRegBlock::trap_regs`. Fourteen `stp`s off x28 (`&VmState`; the reg
+    // block is its first field, offsets within `stp`'s signed-7 range).
+    // Cold path: once per uncommon trap, never per iteration — the whole
+    // point is that the HOT path no longer writes these values to slots.
+    for pair in 0..(VMREG_TRAP_REGS_COUNT as u8 / 2) {
+        let off = VMREG_TRAP_REGS_OFFSET as i64 + 16 * pair as i64;
+        a.emit("stp", &[x(2 * pair), x(2 * pair + 1), mem(28, off)]);
+    }
+
     // saved-lr := trap_pc (in x16), so the walker sees pc = trap_pc.
     a.emit("mov", &[x(30), x(16)]);
     // Push { fp, lr(=trap_pc) } and re-root fp — a normal frame record.
@@ -1687,6 +1701,92 @@ mod tests {
     /// Deoptee: `push_smi_i8(0x2A); return_tos`; a re-execute uncommon-trap
     /// site at bci 0 with an empty operand stack, so the nested run starts at
     /// bci 0 and delivers the smi 42.
+    /// Stage 4a: the uncommon trampoline's first fourteen words are the
+    /// register-file spill — assembled the same way, word for word — before
+    /// it touches a single register. A deopt scope's `ValueLoc::Reg` is only
+    /// as good as this prologue.
+    #[test]
+    fn uncommon_trampoline_spills_the_register_file_first() {
+        let blob = build_uncommon_trampoline();
+        let mut expect = JasmAssembler::new();
+        for pair in 0..(VMREG_TRAP_REGS_COUNT as u8 / 2) {
+            let off = VMREG_TRAP_REGS_OFFSET as i64 + 16 * pair as i64;
+            expect.emit("stp", &[x(2 * pair), x(2 * pair + 1), mem(28, off)]);
+        }
+        let expect = expect.finish();
+        let n = 4 * (VMREG_TRAP_REGS_COUNT / 2);
+        assert_eq!(
+            &blob.code[..n],
+            &expect.code[..n],
+            "the trampoline must begin with the {} register-file stores",
+            VMREG_TRAP_REGS_COUNT / 2
+        );
+    }
+
+    /// Stage 4a end to end at the materializer: a reexecute site whose stack
+    /// names a REGISTER resolves through the trap register file. The deoptee
+    /// is `ret_tos` at bci 0, so the rebuilt frame's top of stack — the value
+    /// the trap left in x5 — is what comes back.
+    #[test]
+    fn rt_uncommon_trap_materializes_a_register_location() {
+        use crate::bytecode::BytecodeBuilder;
+        use crate::compiler::scopes::{
+            CtxLoc, SafepointKind, SafepointState, ScopeDescData, ValueLoc,
+        };
+        use crate::oops::smi::SmallInt;
+        use crate::runtime::deopt::test_support::install_deopt_nmethod;
+        use crate::runtime::vm_state::{VmOptions, VmState};
+
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
+        });
+        let method = {
+            let mut b = BytecodeBuilder::new();
+            b.push_smi_i8(42); // bci 0 — never re-run: the site resumes past it
+            b.ret_tos(); // bci 2: return the top of the rebuilt stack
+            let sel = vm.universe.intern(b"deoptee_reg_env");
+            b.finish(&mut vm, sel, 0, 0)
+        };
+        let nil = vm.universe.nil_obj;
+        let (_nm_id, pc) = install_deopt_nmethod(
+            &mut vm,
+            method,
+            nil,
+            ScopeDescData {
+                method_pool_ix: 0,
+                is_block: false,
+                sender: None,
+                receiver: ValueLoc::FrameSlot(-8),
+                slots: vec![],
+                ctx: CtxLoc::None,
+            },
+            0x8,
+            SafepointState {
+                scope: 0,
+                bci: 2, // the interpreter's stack is one deep here: our [x5]
+                kind: SafepointKind::UncommonTrap,
+                reexecute: true,
+                stack: vec![ValueLoc::Reg(5)],
+            },
+        );
+        // What the trampoline would have spilled from x5 at the brk.
+        vm.reg_block.trap_regs[5] = SmallInt::new(77).oop().raw();
+        let receiver_val = SmallInt::new(0x11).oop();
+        let phys: [u64; 2] = [receiver_val.raw(), 0];
+        let fp = (&phys[1]) as *const u64 as usize;
+        let raw = unsafe { rt_uncommon_trap(&mut vm as *mut VmState, pc as u64, fp as u64) };
+        assert_eq!(
+            raw,
+            SmallInt::new(77).oop().raw(),
+            "the register location must materialize from the trap register file"
+        );
+    }
+
     #[test]
     fn rt_uncommon_trap_runs_to_completion() {
         use crate::bytecode::BytecodeBuilder;

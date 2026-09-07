@@ -95,6 +95,16 @@ pub fn resolve_frame_loc(
                 }
                 return ValueLoc::FrameSlot(off);
             }
+            // Stage 4a: a register-resident value at a trap-only safepoint.
+            // Sound because regalloc never lets such an interval cross a
+            // call, poll or alloc (it would have been spilled — spill-all is
+            // untouched for those), so the only site that can resolve it is
+            // an uncommon trap, where the trampoline has already saved
+            // x0..x27. Before 4a this arm fell through to `Nil`, which is
+            // exactly why every deopt-referenced vreg had to be spilled.
+            if let Some(Assignment::Reg(r)) = iv.assignment {
+                return ValueLoc::Reg(r);
+            }
         }
     }
     ValueLoc::Nil
@@ -315,6 +325,18 @@ pub enum ValueLoc {
     /// (`alloc_double`) into the rebuilt interpreter frame; the oop map
     /// already marks the slot non-oop, so the GC never scans it.
     DoubleSlot(i32),
+    /// Stage 4a (docs/perf_plan_2026-09.md §5): the value is in general
+    /// register `n` (x0..x27) at the trap, read back from the VM's trap
+    /// register file, which the uncommon-trap trampoline fills before
+    /// anything else runs (`VmRegBlock::trap_regs`). Only a ROOT
+    /// `UncommonTrap` site may carry one: registers are intact at a `brk` and
+    /// nothing else can observe the frame there, whereas a call clobbers
+    /// them and a poll's slow path calls. Regalloc grants a register across a
+    /// trap only to a known-smi vreg that no other site observes
+    /// (`compute_intervals`' trap-only rule), `build_deopt_metadata` asserts
+    /// the site kind at compile time, and `deoptimize_frame` refuses one
+    /// anywhere else at deopt time.
+    Reg(u8),
 }
 
 impl ValueLoc {
@@ -341,6 +363,10 @@ impl ValueLoc {
                 out.push(5);
                 write_sleb(out, off as i64);
             }
+            ValueLoc::Reg(n) => {
+                out.push(6);
+                out.push(n);
+            }
         }
     }
 
@@ -354,6 +380,11 @@ impl ValueLoc {
             3 => ValueLoc::Nil,
             4 => ValueLoc::ElidedClosure(read_uleb(buf, pos) as u32),
             5 => ValueLoc::DoubleSlot(read_sleb(buf, pos) as i32),
+            6 => {
+                let n = buf[*pos];
+                *pos += 1;
+                ValueLoc::Reg(n)
+            }
             other => panic!("ValueLoc::read: bad tag {other}"),
         }
     }
@@ -918,6 +949,8 @@ mod tests {
             ValueLoc::Nil,
             ValueLoc::ElidedClosure(0),
             ValueLoc::ElidedClosure(777),
+            ValueLoc::Reg(0),
+            ValueLoc::Reg(27),
         ] {
             let mut out = Vec::new();
             loc.write(&mut out);
