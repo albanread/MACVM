@@ -8662,7 +8662,19 @@ pub(crate) fn fuse_ref_cmp_br(m: &mut IrMethod) {
 }
 
 
-pub(crate) fn copy_propagate(m: &mut IrMethod) {
+pub(crate) fn copy_propagate(m: &mut IrMethod) -> usize {
+    copy_propagate_with(m, peep4_enabled())
+}
+
+/// The body of [`copy_propagate`]; `carry` is 4a′ rung 2 — an alias map
+/// that survives to the end of a block is handed to the single-predecessor
+/// target of that block's `Jump`. That is precisely the shape a fail-edge
+/// split leaves behind (`Move v11 <- s; i*i; Jump` / `s + i*i` in the next
+/// block), and why benchArith's copy of `s` outlived the per-block window
+/// for a month. A target with two predecessors is a merge and gets nothing;
+/// a fail block gets its rewrite from `fail_rewrites` at the failing op, as
+/// before. Answers how many aliases were carried.
+pub(crate) fn copy_propagate_with(m: &mut IrMethod, carry: bool) -> usize {
     let n = m.vregs.len();
     let mut def_count = vec![0u32; n];
     let mut use_count = vec![0u32; n];
@@ -8744,6 +8756,20 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
     //    fail-block references and nothing ever deletes. ──────────────────
     let mut rewrites = vec![0u32; n];
     let mut fail_rewrites: Vec<(BlockId, HashMap<u32, VReg>)> = Vec::new();
+    // 4a′ rung 2: predecessor counts (any edge kind), and the alias maps
+    // waiting for a later block. Blocks are visited in id order, which is
+    // creation order, and a split's continuation is always created after
+    // the block it continues — so a carried map is always consumed.
+    let mut pred_count: HashMap<u32, usize> = HashMap::new();
+    if carry {
+        for b in &m.blocks {
+            for succ in crate::compiler::regalloc::successors(b) {
+                *pred_count.entry(succ.0).or_default() += 1;
+            }
+        }
+    }
+    let mut carried_maps: HashMap<u32, HashMap<u32, VReg>> = HashMap::new();
+    let mut carried = 0usize;
     // L1 (docs/range_analysis_design.md's sibling — load forwarding, dart124
     // item 7): redundant `LoadField`/`GuardKlass` positions to delete in
     // phase C. A redundant load is aliased through the SAME `alias` map (so
@@ -8757,7 +8783,18 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
     let mut guard_deletes: std::collections::HashSet<(usize, usize)> =
         std::collections::HashSet::new();
     for (bi, b) in m.blocks.iter_mut().enumerate() {
-        let mut alias: HashMap<u32, VReg> = HashMap::new();
+        let mut alias: HashMap<u32, VReg> = carried_maps.remove(&b.id.0).unwrap_or_default();
+        if !alias.is_empty() {
+            carried += alias.len();
+            // The inherited operand stack names the copies too.
+            for v in b.entry_stack.iter_mut() {
+                let r = resolve(&alias, *v);
+                if r != *v {
+                    rewrites[v.0 as usize] += 1;
+                    *v = r;
+                }
+            }
+        }
         // (canonical obj, byte_off) -> canonical dst of an AVAILABLE field
         // value; the same klass-guarded obj -> its proven klass raw. Guards
         // never die on a call (no `become:`: a live object's klass is fixed
@@ -8856,6 +8893,13 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
                 _ => {}
             }
         }
+        if carry && !alias.is_empty() {
+            if let Some(Ir::Jump { target }) = b.code.last() {
+                if pred_count.get(&target.0) == Some(&1) && target.0 as usize > bi {
+                    carried_maps.insert(target.0, alias.clone());
+                }
+            }
+        }
     }
 
     // L1 census (behavior-free): how often does intra-block forwarding fire?
@@ -8921,12 +8965,284 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
             *ci -= removed_before[*ci as usize];
         }
     }
+    carried
 }
 
 /// `MACVM_SPLICE_PROMOTE=1` selects [`promote_float_temps_spliced`] (the
 /// dormant generalized promotion) over the default root-temp-only pass.
 /// Read once per process — a compile-path check, but cached anyway per the
 /// standing env-var-cost lesson.
+/// 4a′ (docs/perf_plan_2026-09.md §5, docs/reg_env_findings.md): the
+/// instruction-level rungs that only make sense once a value lives in a
+/// register across its traps — the add/sub/mul-immediate fold, copy
+/// propagation carried across a single-predecessor `Jump` (the shape a
+/// fail-edge split leaves behind), and folding `x := <no-overflow op>` into
+/// the op itself. `MACVM_PEEP4=1` turns them on; default OFF until the
+/// interleaved A/B says otherwise (the inliner-gating policy). The removal
+/// commit's matrix (`214aae9`) is the null hypothesis: on the spill-all
+/// substrate none of this was measurable.
+pub(crate) fn peep4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MACVM_PEEP4").map(|v| v == "1").unwrap_or(false))
+}
+
+/// `MACVM_PEEP4_COUNT=1`: one line per compile that any 4a′ rung touched.
+pub(crate) fn peep4_count() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MACVM_PEEP4_COUNT").is_some())
+}
+
+/// 4a′ rung 1 (restored from `2e35705`, extended to `Mul`): fold a
+/// block-local `ConstSmi` operand of a range-proven `SmiArithNoOv` into an
+/// immediate form. benchArith re-materialized `movz #4` for `i := i + 1`
+/// and `movz #12` for `i * 3` every iteration; folded, the increment is one
+/// `add`, and the product needs no untag at all — `tagged(a) * k` IS
+/// `tagged(a*k)` for a raw small `k`, so the `asr` goes with the `movz`. The
+/// tagged addend (`value << 2`) must fit a64 imm12 and the multiplier a
+/// `movz`, so `0 <= value <= 1023` for both. The feeding `ConstSmi` is left
+/// in place (deopt metadata may name its vreg; if dead it is one `movz` off
+/// the chain). Runs AFTER `range_reduce`, the only producer of
+/// `SmiArithNoOv`; tracking is per block with non-SSA redefinition kills.
+/// Answers (add/sub folded, mul folded).
+pub(crate) fn fold_noov_imm(m: &mut IrMethod) -> (usize, usize) {
+    let mut addsub = 0usize;
+    let mut mul = 0usize;
+    for b in m.blocks.iter_mut() {
+        let mut known: HashMap<u32, i64> = HashMap::new();
+        for op in b.code.iter_mut() {
+            if let Ir::SmiArithNoOv { op: sop, dst, a, b: rhs } = *op {
+                // Add and Mul commute: a constant LEFT operand folds too.
+                let (var, imm) = match (known.get(&rhs.0), known.get(&a.0)) {
+                    (Some(&v), _) => (a, Some(v)),
+                    (None, Some(&v)) if matches!(sop, SmiOp::Add | SmiOp::Mul) => (rhs, Some(v)),
+                    _ => (a, None),
+                };
+                if let Some(v) = imm {
+                    if (0..=1023).contains(&v) {
+                        match sop {
+                            SmiOp::Add | SmiOp::Sub => {
+                                *op = Ir::SmiArithNoOvImm { op: sop, dst, a: var, imm: v };
+                                addsub += 1;
+                            }
+                            SmiOp::Mul => {
+                                *op = Ir::SmiArithNoOvImm { op: sop, dst, a: var, imm: v };
+                                mul += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let mut defined: Option<VReg> = None;
+            op.defs(|v| defined = Some(v));
+            if let Some(d) = defined {
+                known.remove(&d.0);
+                if let Ir::ConstSmi { dst, value } = op {
+                    known.insert(dst.0, *value);
+                }
+            }
+        }
+    }
+    // A constant whose only consumer was just folded is dead — and it was
+    // still a `movz` per iteration in benchArith's loop. Delete a `ConstSmi`
+    // nothing references any more: no op, no deopt site (a trap that names
+    // the vreg rematerializes it through F3's `ConstSmi` location, which is
+    // a use), no inherited stack. A constant has no side effect to keep.
+    if addsub + mul > 0 {
+        let n = m.vregs.len();
+        let mut used = vec![false; n];
+        // An unreachable block (the fail block a NoOv conversion left behind)
+        // can never run, and its stale facts must not keep a constant alive
+        // — that is exactly what kept benchArith's `movz #12` and `movz #4`.
+        let mut reachable = vec![false; m.blocks.len()];
+        reachable[0] = true;
+        for b in &m.blocks {
+            for succ in crate::compiler::regalloc::successors(b) {
+                reachable[succ.0 as usize] = true;
+            }
+        }
+        for b in m.blocks.iter().filter(|b| reachable[b.id.0 as usize]) {
+            for op in &b.code {
+                op.uses(|v| used[v.0 as usize] = true);
+            }
+            for (_, raw) in &b.deopt_sites {
+                for v in &raw.stack {
+                    used[v.0 as usize] = true;
+                }
+                let mut lvl = raw.inline.as_ref();
+                while let Some(site) = lvl {
+                    used[site.receiver.0 as usize] = true;
+                    for v in &site.slots {
+                        used[v.0 as usize] = true;
+                    }
+                    for v in &site.caller_pending_stack {
+                        used[v.0 as usize] = true;
+                    }
+                    lvl = site.parent.as_deref();
+                }
+            }
+            for v in &b.entry_stack {
+                used[v.0 as usize] = true;
+            }
+        }
+        for b in m.blocks.iter_mut() {
+            let mut removed_before = vec![0u32; b.code.len() + 1];
+            let mut removed = 0u32;
+            let mut keep = Vec::with_capacity(b.code.len());
+            for (i, op) in b.code.iter().enumerate() {
+                removed_before[i] = removed;
+                let dead = matches!(op, Ir::ConstSmi { dst, .. } if !used[dst.0 as usize]);
+                keep.push(!dead);
+                if dead {
+                    removed += 1;
+                }
+            }
+            if removed == 0 {
+                continue;
+            }
+            let mut it = keep.iter();
+            b.code.retain(|_| *it.next().unwrap());
+            for (ci, _) in b.deopt_sites.iter_mut() {
+                *ci -= removed_before[*ci as usize];
+            }
+        }
+    }
+    (addsub, mul)
+}
+
+/// 4a′ rung 4: `x := <no-overflow op>` where the op's result feeds NOTHING
+/// but that assignment becomes the op writing `x` directly — the `Move` was
+/// a register copy, and under 4a its source was a register. Sound only for
+/// ops that cannot trap: a trapping op's environment records `x`'s OLD
+/// value (the slot the interpreter would re-execute against), so computing
+/// into `x` before the `b.vs` would hand the deopt a clobbered slot — which
+/// is exactly why `SmiArith` is not in the pattern. `y` must have one def
+/// and one use (that use the `Move` — deopt sites and entry stacks count as
+/// uses), so nothing else can ever look for `y`. Answers the number folded.
+pub(crate) fn coalesce_noov_dst(m: &mut IrMethod) -> usize {
+    let n = m.vregs.len();
+    let mut def_count = vec![0u32; n];
+    let mut use_count = vec![0u32; n];
+    for b in &m.blocks {
+        for op in &b.code {
+            op.defs(|v| def_count[v.0 as usize] += 1);
+            op.uses(|v| use_count[v.0 as usize] += 1);
+        }
+        for (_, raw) in &b.deopt_sites {
+            for v in &raw.stack {
+                use_count[v.0 as usize] += 1;
+            }
+            let mut lvl = raw.inline.as_ref();
+            while let Some(site) = lvl {
+                use_count[site.receiver.0 as usize] += 1;
+                for v in &site.slots {
+                    use_count[v.0 as usize] += 1;
+                }
+                for v in &site.caller_pending_stack {
+                    use_count[v.0 as usize] += 1;
+                }
+                lvl = site.parent.as_deref();
+            }
+        }
+        for v in &b.entry_stack {
+            use_count[v.0 as usize] += 1;
+        }
+    }
+    let mut folded = 0usize;
+    // The cross-block form first: `[.., op(y), Jump B]` with B's single
+    // predecessor being this block and B opening with `Move x <- y`. The
+    // operand stack carries `y` across the edge, so B's inherited entry
+    // stack names it too — that is one more use, and it is rewritten to `x`
+    // along with the op. This is `to:do:`'s own shape: the increment ends
+    // one block and `i :=` opens the back-edge block.
+    let mut pred_count: HashMap<u32, usize> = HashMap::new();
+    for b in &m.blocks {
+        for succ in crate::compiler::regalloc::successors(b) {
+            *pred_count.entry(succ.0).or_default() += 1;
+        }
+    }
+    let nb = m.blocks.len();
+    for bi in 0..nb {
+        let (y, target) = match m.blocks[bi].code.as_slice() {
+            [.., Ir::SmiArithNoOv { dst, .. }, Ir::Jump { target }]
+            | [.., Ir::SmiArithNoOvImm { dst, .. }, Ir::Jump { target }] => (*dst, *target),
+            _ => continue,
+        };
+        let ti = target.0 as usize;
+        if ti == bi || ti >= nb || pred_count.get(&target.0) != Some(&1) {
+            continue;
+        }
+        let x = match m.blocks[ti].code.first() {
+            Some(Ir::Move { dst: x, src }) if *src == y && *x != y => *x,
+            _ => continue,
+        };
+        let stack_mentions = m.blocks[ti].entry_stack.iter().filter(|v| **v == y).count() as u32;
+        if def_count[y.0 as usize] != 1
+            || use_count[y.0 as usize] != 1 + stack_mentions
+            || m.vregs[x.0 as usize].is_fp
+            || m.vregs[y.0 as usize].is_fp
+            || m.blocks[ti].deopt_sites.iter().any(|(ci, _)| *ci == 0)
+        {
+            continue;
+        }
+        let last = m.blocks[bi].code.len() - 2;
+        match &mut m.blocks[bi].code[last] {
+            Ir::SmiArithNoOv { dst, .. } | Ir::SmiArithNoOvImm { dst, .. } => *dst = x,
+            _ => unreachable!("matched above"),
+        }
+        let tb = &mut m.blocks[ti];
+        for v in tb.entry_stack.iter_mut() {
+            if *v == y {
+                *v = x;
+            }
+        }
+        tb.code.remove(0);
+        for (ci, _) in tb.deopt_sites.iter_mut() {
+            *ci -= 1;
+        }
+        folded += 1;
+    }
+    for b in m.blocks.iter_mut() {
+        let mut i = 0usize;
+        while i + 1 < b.code.len() {
+            let y = match b.code[i] {
+                Ir::SmiArithNoOv { dst, .. } | Ir::SmiArithNoOvImm { dst, .. } => Some(dst),
+                _ => None,
+            };
+            let hit = match (y, &b.code[i + 1]) {
+                (Some(y), Ir::Move { dst: x, src })
+                    if *src == y
+                        && *x != y
+                        && def_count[y.0 as usize] == 1
+                        && use_count[y.0 as usize] == 1
+                        && !m.vregs[x.0 as usize].is_fp
+                        && !m.vregs[y.0 as usize].is_fp
+                        && b.deopt_sites.iter().all(|(ci, _)| *ci != (i + 1) as u32) =>
+                {
+                    Some(*x)
+                }
+                _ => None,
+            };
+            if let Some(x) = hit {
+                match &mut b.code[i] {
+                    Ir::SmiArithNoOv { dst, .. } | Ir::SmiArithNoOvImm { dst, .. } => *dst = x,
+                    _ => unreachable!("matched above"),
+                }
+                b.code.remove(i + 1);
+                for (ci, _) in b.deopt_sites.iter_mut() {
+                    if *ci > (i + 1) as u32 {
+                        *ci -= 1;
+                    }
+                }
+                folded += 1;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    folded
+}
+
 fn splice_promote_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -10539,7 +10855,8 @@ pub(crate) fn known_smi_vregs(m: &IrMethod) -> HashSet<u32> {
             match op {
                 Ir::ConstSmi { dst, .. }
                 | Ir::SmiArith { dst, .. }
-                | Ir::SmiArithNoOv { dst, .. } => {
+                | Ir::SmiArithNoOv { dst, .. }
+                | Ir::SmiArithNoOvImm { dst, .. } => {
                     has_def.insert(dst.0);
                 }
                 Ir::ConstPool { dst, lit } => {
@@ -11782,7 +12099,7 @@ pub fn convert(
         method_pool_ix,
         deopt_live_slots: None,
     };
-    copy_propagate(&mut irm);
+    let peep4_carried = copy_propagate(&mut irm);
     reduce_float_boxes(&mut irm, osr_bci);
     // R2 provenance license: the Array METACLASS — a `GuardKlass` against it
     // proves a `new:` receiver IS the Array class, whose postcondition
@@ -11797,6 +12114,18 @@ pub fn convert(
             crate::compiler::driver::selector_string(method),
             if osr { " OSR" } else { "" }
         );
+    }
+    if peep4_enabled() {
+        let (fa, fm) = fold_noov_imm(&mut irm);
+        let nc = coalesce_noov_dst(&mut irm);
+        if (fa + fm + nc + peep4_carried) > 0 && peep4_count() {
+            eprintln!(
+                "peep4: {fa} add/sub-imm, {fm} mul-imm, {nc} dst-coalesced, {peep4_carried} \
+                 copies carried  [{}{}]",
+                crate::compiler::driver::selector_string(method),
+                if osr { " OSR" } else { "" }
+            );
+        }
     }
     if crate::compiler::regalloc::fuse_cmp_br() {
         fuse_ref_cmp_br(&mut irm);
@@ -12064,6 +12393,241 @@ mod tests {
     /// anywhere targets `BlockId(0)` (a back edge landing on the entry label
     /// re-executed the param spills from dead argument registers — self and
     /// every arg went nil/garbage on the second iteration).
+    fn peep_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>) -> IrMethod {
+        IrMethod {
+            osr_cold_sends: 0,
+            is_osr: false,
+            blocks,
+            vregs,
+            pool: vec![PoolEntry { value: 0, kind: None }],
+            argc: 0,
+            ntemps: 0,
+            ctx_vregs: Vec::new(),
+            block_closure_vreg: None,
+            entry_split_header: None,
+            method_ctx_vreg: None,
+            spliced_nlr: 0,
+            spliced_multibb: 0,
+            splice_declined_budget: 0,
+            safepoints: Vec::new(),
+            true_lit: PoolLit(0),
+            false_lit: PoolLit(0),
+            nil_lit: PoolLit(0),
+            mark_slots_lit: PoolLit(0),
+            mark_double_lit: PoolLit(0),
+            double_klass_lit: PoolLit(0),
+            float64x2_klass_lit: PoolLit(0),
+            float32x4_klass_lit: PoolLit(0),
+            int32x4_klass_lit: PoolLit(0),
+            call_sites: Vec::new(),
+            site_feedback: Vec::new(),
+            inline_deps: Vec::new(),
+            self_devirt: false,
+            method_pool_ix: None,
+            deopt_live_slots: None,
+        }
+    }
+    fn smi_vregs(n: usize) -> Vec<VRegInfo> {
+        (0..n).map(|i| VRegInfo { is_oop: i == 0, is_fp: false }).collect()
+    }
+    fn plain_block(id: u32, code: Vec<Ir>) -> IrBlock {
+        IrBlock { id: BlockId(id), bci: 0, code, entry_stack: Vec::new(), deopt_sites: Vec::new() }
+    }
+
+    /// 4a′ rung 1: a block-local constant operand of a proven no-overflow
+    /// add/sub/mul folds into the immediate form — on either side for the
+    /// commutative ops, never when out of imm range, never across a
+    /// redefinition of the constant's vreg.
+    #[test]
+    fn fold_noov_imm_folds_add_sub_and_mul_constants() {
+        let mut m = peep_method(
+            vec![plain_block(
+                0,
+                vec![
+                    Ir::Param { dst: VReg(1), index: 0 },
+                    Ir::ConstSmi { dst: VReg(2), value: 4 },
+                    Ir::SmiArithNoOv { op: SmiOp::Add, dst: VReg(3), a: VReg(1), b: VReg(2) },
+                    Ir::ConstSmi { dst: VReg(4), value: 3 },
+                    Ir::SmiArithNoOv { op: SmiOp::Mul, dst: VReg(5), a: VReg(4), b: VReg(1) },
+                    Ir::ConstSmi { dst: VReg(6), value: 5000 },
+                    Ir::SmiArithNoOv { op: SmiOp::Sub, dst: VReg(7), a: VReg(1), b: VReg(6) },
+                    Ir::Ret { val: VReg(7) },
+                ],
+            )],
+            smi_vregs(8),
+        );
+        assert_eq!(fold_noov_imm(&mut m), (1, 1));
+        let code = &m.blocks[0].code;
+        assert!(code.iter().any(|op| matches!(
+            op,
+            Ir::SmiArithNoOvImm { op: SmiOp::Add, dst: VReg(3), a: VReg(1), imm: 4 }
+        )));
+        assert!(
+            code.iter().any(|op| matches!(
+                op,
+                Ir::SmiArithNoOvImm { op: SmiOp::Mul, dst: VReg(5), a: VReg(1), imm: 3 }
+            )),
+            "a constant LEFT operand of a Mul folds (commutative): {code:?}"
+        );
+        assert!(
+            code.iter().any(|op| matches!(op, Ir::SmiArithNoOv { op: SmiOp::Sub, .. })),
+            "5000 is past the imm12-after-tagging range: stays a register op"
+        );
+        let consts: Vec<i64> = code
+            .iter()
+            .filter_map(|op| if let Ir::ConstSmi { value, .. } = op { Some(*value) } else { None })
+            .collect();
+        assert_eq!(consts, vec![5000], "the two folded constants are dead and deleted");
+        let smi = known_smi_vregs(&m);
+        assert!(smi.contains(&3) && smi.contains(&5), "folded results are as smi as their ops");
+    }
+
+    /// 4a′ rung 2: a copy made in one block and consumed in the single-
+    /// predecessor block its `Jump` reaches is propagated — uses and the
+    /// inherited entry stack rewritten, the `Move` gone. With the carry off
+    /// (the pre-4a′ per-block window) the copy survives.
+    #[test]
+    fn copy_propagate_carries_a_copy_across_a_single_pred_jump() {
+        let build = || {
+            let mut b1 = plain_block(
+                1,
+                vec![
+                    Ir::SmiArithNoOv { op: SmiOp::Add, dst: VReg(3), a: VReg(2), b: VReg(2) },
+                    Ir::Ret { val: VReg(3) },
+                ],
+            );
+            b1.entry_stack = vec![VReg(2)];
+            peep_method(
+                vec![
+                    plain_block(
+                        0,
+                        vec![
+                            Ir::Param { dst: VReg(1), index: 0 },
+                            Ir::Move { dst: VReg(2), src: VReg(1) },
+                            Ir::Jump { target: BlockId(1) },
+                        ],
+                    ),
+                    b1,
+                ],
+                smi_vregs(4),
+            )
+        };
+        let mut off = build();
+        assert_eq!(copy_propagate_with(&mut off, false), 0);
+        assert!(matches!(off.blocks[0].code[1], Ir::Move { .. }), "per-block window: the copy stays");
+
+        let mut on = build();
+        assert_eq!(copy_propagate_with(&mut on, true), 1, "one alias carried into block 1");
+        assert!(
+            !on.blocks[0].code.iter().any(|op| matches!(op, Ir::Move { .. })),
+            "the copy is gone: {:?}",
+            on.blocks[0].code
+        );
+        assert!(matches!(
+            on.blocks[1].code[0],
+            Ir::SmiArithNoOv { a: VReg(1), b: VReg(1), .. }
+        ));
+        assert_eq!(on.blocks[1].entry_stack, vec![VReg(1)], "the inherited stack names the source");
+    }
+
+    /// 4a′ rung 4: `x := <no-overflow op>` becomes the op writing `x`; the
+    /// `Move` goes and a later deopt site's index follows the deletion. A
+    /// temp the trap's environment records keeps its `Move` — the op may
+    /// not write `x` before a trap that wants `x`'s old value.
+    #[test]
+    fn coalesce_noov_dst_folds_the_assignment_and_respects_deopt_uses() {
+        let site = |stack: Vec<VReg>| DeoptRaw {
+            stack,
+            bci: 9,
+            kind: crate::compiler::scopes::SafepointKind::LoopPoll,
+            reexecute: true,
+            stack_closures: Vec::new(),
+            inline: None,
+        };
+        let build = |trap_stack: Vec<VReg>| {
+            let mut b = plain_block(
+                0,
+                vec![
+                    Ir::Param { dst: VReg(1), index: 0 },
+                    Ir::SmiArithNoOv { op: SmiOp::Add, dst: VReg(3), a: VReg(1), b: VReg(1) },
+                    Ir::Move { dst: VReg(1), src: VReg(3) },
+                    Ir::Poll,
+                    Ir::Ret { val: VReg(1) },
+                ],
+            );
+            b.deopt_sites = vec![(3, site(trap_stack))];
+            peep_method(vec![b], smi_vregs(4))
+        };
+        let mut m = build(vec![]);
+        assert_eq!(coalesce_noov_dst(&mut m), 1);
+        assert!(matches!(
+            m.blocks[0].code[1],
+            Ir::SmiArithNoOv { dst: VReg(1), a: VReg(1), b: VReg(1), .. }
+        ));
+        assert!(matches!(m.blocks[0].code[2], Ir::Poll), "the Move is gone");
+        assert_eq!(m.blocks[0].deopt_sites[0].0, 2, "the poll's site index followed the deletion");
+
+        let mut kept = build(vec![VReg(3)]);
+        assert_eq!(coalesce_noov_dst(&mut kept), 0, "a temp the site records is left alone");
+        assert!(matches!(kept.blocks[0].code[2], Ir::Move { .. }));
+    }
+
+    /// 4a′ rungs 1b and 4 across a split: the constant a fold consumed is
+    /// deleted, and `i := i + 1` whose `Move` opens the next block is
+    /// folded into the increment, the inherited stack following.
+    #[test]
+    fn fold_drops_the_dead_constant_and_coalesce_crosses_the_jump() {
+        let mut b1 = plain_block(
+            1,
+            vec![
+                Ir::Move { dst: VReg(1), src: VReg(3) },
+                Ir::Poll,
+                Ir::Ret { val: VReg(1) },
+            ],
+        );
+        b1.entry_stack = vec![VReg(3)];
+        b1.deopt_sites = vec![(
+            1,
+            DeoptRaw {
+                stack: vec![],
+                bci: 9,
+                kind: crate::compiler::scopes::SafepointKind::LoopPoll,
+                reexecute: true,
+                stack_closures: Vec::new(),
+                inline: None,
+            },
+        )];
+        let mut m = peep_method(
+            vec![
+                plain_block(
+                    0,
+                    vec![
+                        Ir::Param { dst: VReg(1), index: 0 },
+                        Ir::ConstSmi { dst: VReg(2), value: 1 },
+                        Ir::SmiArithNoOv { op: SmiOp::Add, dst: VReg(3), a: VReg(1), b: VReg(2) },
+                        Ir::Jump { target: BlockId(1) },
+                    ],
+                ),
+                b1,
+            ],
+            smi_vregs(4),
+        );
+        assert_eq!(fold_noov_imm(&mut m), (1, 0));
+        assert!(
+            !m.blocks[0].code.iter().any(|op| matches!(op, Ir::ConstSmi { .. })),
+            "the folded constant is dead and gone: {:?}",
+            m.blocks[0].code
+        );
+        assert_eq!(coalesce_noov_dst(&mut m), 1);
+        assert!(matches!(
+            m.blocks[0].code[1],
+            Ir::SmiArithNoOvImm { dst: VReg(1), a: VReg(1), imm: 1, .. }
+        ));
+        assert!(matches!(m.blocks[1].code[0], Ir::Poll), "the opening Move is gone");
+        assert_eq!(m.blocks[1].entry_stack, vec![VReg(1)]);
+        assert_eq!(m.blocks[1].deopt_sites[0].0, 0, "the poll's site index followed");
+    }
+
     #[test]
     fn bci0_loop_header_splits_entry_preamble() {
         let mut vm = test_vm();

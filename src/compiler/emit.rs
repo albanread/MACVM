@@ -3477,16 +3477,35 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             e.commit(dst, d);
         }
         Ir::SmiArithNoOvImm { op, dst, a, imm: addend } => {
-            // The peephole's add/sub-immediate: proven-in-range (same license
-            // as SmiArithNoOv), tagged addend = value << 2, guaranteed to fit
-            // imm12 by fold_noov_imm's 0..=1023 guard.
+            // The peephole's immediate forms: proven-in-range (same license
+            // as SmiArithNoOv). Add/Sub: tagged addend = value << 2, fits
+            // imm12 by fold_noov_imm's 0..=1023 guard. Mul (4a′): the
+            // multiplier is a RAW small int and the operand stays tagged —
+            // `tagged(a) * k == tagged(a*k)` — so no untag at all; a power
+            // of two is one shift. Single-instruction writes, so `d`
+            // aliasing `ra` is hazard-free; x17 is emit's own scratch.
             let ra = e.resolve(a, 16);
             let d = e.dest_target_direct(dst);
-            let mnem = if matches!(op, SmiOp::Add) { "add" } else { "sub" };
-            e.asm.emit(
-                mnem,
-                &[Operand::Reg(d), Operand::Reg(ra), imm(addend << 2)],
-            );
+            match op {
+                SmiOp::Mul => {
+                    if addend > 0 && (addend & (addend - 1)) == 0 {
+                        e.asm.emit(
+                            "lsl",
+                            &[Operand::Reg(d), Operand::Reg(ra), imm(addend.trailing_zeros() as i64)],
+                        );
+                    } else {
+                        e.asm.emit("movz", &[x(17), imm(addend)]);
+                        e.asm.emit("mul", &[Operand::Reg(d), Operand::Reg(ra), x(17)]);
+                    }
+                }
+                _ => {
+                    let mnem = if matches!(op, SmiOp::Add) { "add" } else { "sub" };
+                    e.asm.emit(
+                        mnem,
+                        &[Operand::Reg(d), Operand::Reg(ra), imm(addend << 2)],
+                    );
+                }
+            }
             e.commit(dst, d);
         }
         Ir::ArrayAt {
