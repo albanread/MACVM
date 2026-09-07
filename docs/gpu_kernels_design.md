@@ -193,6 +193,12 @@ and AST→MSL as the primary compiled path (forfeits feedback and inlining).
 
 ## 5. Surface sketch (illustrative, not a commitment)
 
+One spelling **is** decided (2026-09-07): **code to be lowered to the GPU is
+marked in a method with the `<gpu>` pragma** — the same method-pragma family
+as `<primitive:>`, parsed by machinery that already exists. A method carrying
+`<gpu>` compiles under the kernel dialect below. Everything else in this
+section stays illustrative.
+
 ```smalltalk
 | saxpy |
 saxpy := GPU kernel: [:i | y at: i put: a * (x at: i) + (y at: i)].
