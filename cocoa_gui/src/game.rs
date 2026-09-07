@@ -79,6 +79,61 @@ impl PaneId {
 /// existing run-loop wake — the same shape as `ChannelGameSink` — now carrying
 /// WHO each command is for beside it.
 static GAME_CMDS: Mutex<VecDeque<(PaneId, GameCommand)>> = Mutex::new(VecDeque::new());
+/// Panes with a frame loop running (`StartLoop` seen, no stop yet), and panes
+/// whose session is open at all (`docs/multi_pane_design.md` §2e).
+///
+/// These were two process-wide booleans, and they are what made the Demos menu
+/// behave like radio buttons: one game "active" meant a second launch had to
+/// tear the first down. Per pane the contradiction dissolves — several demos
+/// are simply several entries.
+///
+/// The aggregate reads survive as helpers because some questions really are
+/// about the process ("is any demo running?"), and answering them by asking
+/// the set is honest where a global boolean was a guess.
+static ACTIVE_PANES: Mutex<std::collections::BTreeSet<u32>> =
+    Mutex::new(std::collections::BTreeSet::new());
+static OPEN_SESSIONS: Mutex<std::collections::BTreeSet<u32>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+fn set_active(pane: PaneId, on: bool) {
+    let mut g = ACTIVE_PANES.lock().unwrap_or_else(|e| e.into_inner());
+    if on {
+        g.insert(pane.raw());
+    } else {
+        g.remove(&pane.raw());
+    }
+}
+
+fn pane_is_active(pane: PaneId) -> bool {
+    ACTIVE_PANES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&pane.raw())
+}
+
+fn any_active() -> bool {
+    !ACTIVE_PANES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+}
+
+fn set_session(pane: PaneId, on: bool) {
+    let mut g = OPEN_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if on {
+        g.insert(pane.raw());
+    } else {
+        g.remove(&pane.raw());
+    }
+}
+
+fn session_open(pane: PaneId) -> bool {
+    OPEN_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&pane.raw())
+}
+
 static GAME_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// A game SESSION is open — from the moment a demo is dispatched until its stop
 /// closes the window. Gates pane creation on draw commands: a demo paints its
@@ -364,7 +419,7 @@ fn rebuild_pane_at_requested_size() {
         }
     });
     ensure_pane_for(id);
-    if GAME_ACTIVE.load(Ordering::Acquire) {
+    if pane_is_active(id) {
         start_frame_timer();
     }
 }
@@ -397,10 +452,13 @@ fn close_window() {
     // Close the SESSION first: a Blit/Present from the last in-flight frame may
     // still be queued behind this stop, and the drain must NOT re-create the
     // window we're about to close (the "window reopens after stop" bug).
-    SESSION_OPEN.store(false, Ordering::Release);
-    // Which pane is going: needed both to retract ITS memory below and to
-    // drop it from the map at the end.
+    // Which pane is going: needed to close ITS session, retract ITS memory,
+    // and drop it from the map at the end. Another demo's session is none of
+    // this one's business.
     let closing = current_pane();
+    if let Some(id) = closing {
+        set_session(id, false);
+    }
     // THE PER-DEMO REQUESTS ARE RESET AT LAUNCH, NOT HERE (`request_launch`).
     // They used to be cleared on this path, and that handed galaxigans back
     // its 60fps default while it was still playing: a demo asks for a rate
@@ -457,7 +515,10 @@ fn close_window() {
             objc::send0(g.win.view, objc::sel("release"));
         }
     });
-    GAME_ACTIVE.store(false, Ordering::Release);
+    if let Some(id) = closing {
+        set_active(id, false);
+        game_input::forget_pane(id.raw());
+    }
 }
 
 /// Upload + present one frame into the layer's next drawable (main thread).
@@ -656,10 +717,10 @@ pub fn drain() {
     for (_pane, cmd) in &cmds {
         match cmd {
             GameCommand::StartLoop => {
-                SESSION_OPEN.store(true, Ordering::Release);
+                set_session(*_pane, true);
                 ensure_pane_for(*_pane);
                 start_frame_timer();
-                GAME_ACTIVE.store(true, Ordering::Release);
+                set_active(*_pane, true);
             }
             GameCommand::StopLoop => close_window(),
             GameCommand::PlaySound { preset } => audio::play_sound(*preset),
@@ -673,7 +734,7 @@ pub fn drain() {
                 REQ_W.store(*w as i64, Ordering::Release);
                 REQ_H.store(*h as i64, Ordering::Release);
                 let exists = current_pane().is_some();
-                if exists && SESSION_OPEN.load(Ordering::Acquire) {
+                if exists && session_open(*_pane) {
                     rebuild_pane_at_requested_size();
                 }
             }
@@ -681,12 +742,12 @@ pub fn drain() {
             // (and window) must exist first — a demo may send this as its very
             // first command, before anything has drawn.
             GameCommand::OpenDirect { w, h } => {
-                if !SESSION_OPEN.load(Ordering::Acquire)
+                if !session_open(*_pane)
                     && !STOP_DUE.load(Ordering::Acquire)
                     && !RESET_DUE.load(Ordering::Acquire)
                 {
-                    SESSION_OPEN.store(true, Ordering::Release);
-                    GAME_ACTIVE.store(true, Ordering::Release);
+                    set_session(*_pane, true);
+                    set_active(*_pane, true);
                 }
                 REQ_W.store(*w as i64, Ordering::Release);
                 REQ_H.store(*h as i64, Ordering::Release);
@@ -720,7 +781,7 @@ pub fn drain() {
             GameCommand::SetOverscan { margin } => {
                 REQ_OVERSCAN.store(*margin as i64, Ordering::Release);
                 let exists = current_pane().is_some();
-                if exists && SESSION_OPEN.load(Ordering::Acquire) {
+                if exists && session_open(*_pane) {
                     rebuild_pane_at_requested_size();
                 }
             }
@@ -731,7 +792,7 @@ pub fn drain() {
             GameCommand::SetFrameRate { fps } => {
                 REQ_FPS.store(*fps as i64, Ordering::Release);
                 let running = with_current(|g| g.timer != objc::NIL).unwrap_or(false);
-                if running && SESSION_OPEN.load(Ordering::Acquire) {
+                if running && session_open(*_pane) {
                     start_frame_timer();
                 }
             }
@@ -755,16 +816,16 @@ pub fn drain() {
                 // Guarded on STOP_DUE/RESET_DUE so the older hazard stays
                 // fixed: a stray frame from a demo that was just stopped must
                 // NOT resurrect the window it was closing.
-                if !SESSION_OPEN.load(Ordering::Acquire)
+                if !session_open(*_pane)
                     && !STOP_DUE.load(Ordering::Acquire)
                     && !RESET_DUE.load(Ordering::Acquire)
                 {
-                    SESSION_OPEN.store(true, Ordering::Release);
-                    GAME_ACTIVE.store(true, Ordering::Release);
+                    set_session(*_pane, true);
+                    set_active(*_pane, true);
                     ensure_pane_for(*_pane);
                     start_frame_timer();
                 }
-                if SESSION_OPEN.load(Ordering::Acquire) {
+                if session_open(*_pane) {
                     ensure_pane_for(*_pane);
                 }
                 // THE ROUTING, live: a command is applied to the pane it was
@@ -784,7 +845,7 @@ pub fn drain() {
 /// supervisor loop uses this to spin fast (so band replies + frame steps flow
 /// at ~60Hz) instead of parking in its idle metrics beat.
 pub fn is_active() -> bool {
-    GAME_ACTIVE.load(Ordering::Acquire)
+    any_active()
         || RESET_DUE.load(Ordering::Acquire)
         || PENDING_LAUNCH.lock().map(|g| g.is_some()).unwrap_or(false)
 }
@@ -816,9 +877,11 @@ pub fn request_launch(entry: String) {
     REQ_H.store(PANE_H as i64, Ordering::Release);
     REQ_FPS.store(DEFAULT_FPS, Ordering::Release);
     REQ_OVERSCAN.store(0, Ordering::Release);
-    if GAME_ACTIVE.load(Ordering::Acquire) {
-        STOP_DUE.store(true, Ordering::Release); // stop the current demo first
-    }
+    // §2e: A LAUNCH NO LONGER STOPS WHAT IS RUNNING. This was the whole of the
+    // one-at-a-time policy — the line that made the Demos menu behave like
+    // radio buttons — and with per-pane state there is nothing left for it to
+    // protect: the new demo gets its own pane, its own session and its own
+    // framebuffers, and the running one keeps all of its own.
     if let Ok(mut slot) = PENDING_LAUNCH.lock() {
         *slot = Some(entry);
     }
@@ -832,7 +895,13 @@ pub fn request_stop() {
     // DemoVmClient's tick) — a demo in a VM of its own is asked to quit, not
     // shot. The host-side close below still runs for the IN-PROCESS path,
     // whose demo has no VM of its own to do the asking to.
-    game_input::request_exit();
+    // ASKED OF ONE DEMO, not of all of them. Escape belongs to the focused
+    // window like every other key (§2c), so with several panes open the
+    // request is recorded against the focused one and only that demo sees its
+    // own count move. With one pane — or none — this is the process-wide
+    // request it always was.
+    let target = game_input::focused_pane();
+    game_input::request_exit_for(target);
     STOP_DUE.store(true, Ordering::Release);
     objc::wake_main_runloop();
 }
@@ -1007,17 +1076,19 @@ pub fn poll_primary_step() -> Option<String> {
         // it stops its clock, resets its own pane and announces its exit
         // (docs/process_services.md S5/S6). With no demo VMs it is a no-op,
         // so the in-process path is unchanged.
-        return Some("GamePane reset. DemoVmHost stopAll".to_string());
+        // ONLY the in-process demo is reset here. `DemoVmHost stopAll` used to
+        // ride along, which was right while one demo could exist and is a
+        // sledgehammer now: a stop aimed at one window would end every demo in
+        // the process. A demo in its own VM ends ITSELF, because the stop was
+        // recorded against its pane and its own tick reads it.
+        return Some("GamePane reset".to_string());
     }
-    // Launch only when no game is active — i.e. the prior demo was torn down,
-    // so one runs at a time. Opening the session here (before the demo paints
-    // its first scene) lets the drain create the pane on that first command.
-    if !GAME_ACTIVE.load(Ordering::Acquire) {
-        let launch = PENDING_LAUNCH.lock().ok().and_then(|mut g| g.take());
-        if launch.is_some() {
-            SESSION_OPEN.store(true, Ordering::Release);
-        }
-        return launch;
+    // A pending launch goes NOW, whether or not something is already running.
+    // The session is opened by the launched demo's own first command (it
+    // carries the pane id this one does not know yet), which is why nothing is
+    // stored here any more.
+    if let Some(entry) = PENDING_LAUNCH.lock().ok().and_then(|mut g| g.take()) {
+        return Some(entry);
     }
     if !STEP_DUE.swap(false, Ordering::AcqRel) {
         return None;

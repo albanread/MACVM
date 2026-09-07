@@ -25,6 +25,7 @@
 //! `format!`. A mutex rather than four atomics for the same reason: the
 //! coherence IS the contract.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
@@ -102,15 +103,29 @@ pub fn focused_pane() -> u32 {
 pub fn snapshot_for(pane: u32) -> InputState {
     let live = snapshot();
     let focus = focused_pane();
+    // THE STOP IS THIS PANE'S OWN. Once several demos can be open, a stop
+    // aimed at one of them must not end all of them, so a pane reports the
+    // count at which IT was asked — 0 until it ever is. Pane 0 (headless, or a
+    // VM with no sink) keeps the process-wide answer it always had.
+    let mine = if pane == 0 {
+        live
+    } else {
+        let gen = pane_exit_generation(pane);
+        InputState {
+            exit_requested: gen > 0,
+            exit_generation: gen,
+            ..live
+        }
+    };
     if pane == 0 || focus == 0 || pane == focus {
-        return live;
+        return mine;
     }
     InputState {
         keys: 0,
         mouse_x: -1,
         mouse_y: -1,
         buttons: 0,
-        ..live
+        ..mine
     }
 }
 
@@ -149,6 +164,43 @@ pub fn request_exit() {
         s.exit_requested = true;
         s.exit_generation += 1;
     });
+}
+
+/// WHICH PANE HAS BEEN ASKED TO STOP, and at which count.
+///
+/// Escape belongs to the focused window like every other key, so with several
+/// demos open a stop must reach ONE of them. The global count above still only
+/// ever rises (it is the process's tally of stop requests); this records the
+/// value at which a particular pane was asked, and `snapshot_for` reports that
+/// pane's own number.
+///
+/// A demo reads its birth value — 0, "never asked" — and reacts when it moves,
+/// exactly as before. Per pane the sequence is still monotonic, which is the
+/// property the whole design rests on.
+static PANE_EXIT: Mutex<BTreeMap<u32, u64>> = Mutex::new(BTreeMap::new());
+
+/// Ask ONE pane to stop. `0` means "whatever is running" and behaves as the
+/// process-wide request always did — the headless and single-window case.
+pub fn request_exit_for(pane: u32) {
+    request_exit();
+    if pane != 0 {
+        let gen = snapshot().exit_generation;
+        let mut guard = PANE_EXIT.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(pane, gen);
+    }
+}
+
+fn pane_exit_generation(pane: u32) -> u64 {
+    let guard = PANE_EXIT.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get(&pane).copied().unwrap_or(0)
+}
+
+/// Forget a pane's stop record — it has gone, and a later pane must not
+/// inherit an answer meant for it. (Ids are never reused, so this is hygiene
+/// rather than correctness, but an unbounded map is its own defect.)
+pub fn forget_pane(pane: u32) {
+    let mut guard = PANE_EXIT.lock().unwrap_or_else(|e| e.into_inner());
+    guard.remove(&pane);
 }
 
 /// No pane, no pointer — what a closed session reports.
@@ -196,11 +248,16 @@ mod tests {
         set_keys(0b1011);
         set_mouse(120, 64, 1);
 
-        // Nobody has claimed focus: every asker is answered in full. This is
-        // the headless and single-window case, and why the rule can land
-        // without disturbing anything that already worked.
+        // Nobody has claimed focus: every asker reads the keyboard and the
+        // pointer in full. This is the headless and single-window case, and
+        // why the rule can land without disturbing anything that worked.
+        // (The exit half is compared separately below — it became PER PANE
+        // when Escape learned to target one demo.)
         assert_eq!(snapshot_for(0), snapshot());
-        assert_eq!(snapshot_for(9), snapshot());
+        let unfocused = snapshot_for(9);
+        assert_eq!(unfocused.keys, snapshot().keys);
+        assert_eq!(unfocused.mouse_x, snapshot().mouse_x);
+        assert_eq!(unfocused.buttons, snapshot().buttons);
 
         set_focus(7);
         let mine = snapshot_for(7);
@@ -223,24 +280,50 @@ mod tests {
         set_focus(0);
     }
 
-    /// The stop request is NOT gated by focus, deliberately: `exit_generation`
-    /// only ever counts up, and handing an unfocused demo a number that had
-    /// gone backwards is the bug its own doc comment warns about. Escape stays
-    /// session-wide until sessions themselves are per-pane.
+    /// A STOP REACHES ONE DEMO. Escape belongs to the focused window like any
+    /// other key, so with several panes open the demo that was asked must end
+    /// and the others must not notice.
+    ///
+    /// This replaces an earlier test that pinned the opposite — that every
+    /// pane saw the process-wide count — which was the honest contract while
+    /// only one demo could exist, and said so. Per-pane sessions changed it.
     #[test]
-    fn a_stop_request_survives_being_unfocused() {
+    fn a_stop_reaches_only_the_pane_it_was_asked_of() {
         let _guard = FOCUS_TEST_LOCK.lock().unwrap();
         reset();
+        forget_pane(7);
+        forget_pane(8);
         set_focus(7);
-        request_exit();
-        let live = snapshot();
-        let theirs = snapshot_for(8);
-        assert_eq!(theirs.keys, 0, "still silenced for the keyboard");
-        assert_eq!(
-            theirs.exit_generation, live.exit_generation,
-            "but the generation must never appear to move backwards"
+
+        // Nobody has been asked yet: every pane's own count is at rest, which
+        // is what a demo records at birth.
+        assert_eq!(snapshot_for(7).exit_generation, 0);
+        assert_eq!(snapshot_for(8).exit_generation, 0);
+        assert!(!snapshot_for(7).exit_requested);
+
+        request_exit_for(7);
+
+        let asked = snapshot_for(7);
+        assert!(asked.exit_requested, "the pane asked to stop knows it");
+        assert!(
+            asked.exit_generation > 0,
+            "and its own count moved, which is what a demo watches"
         );
-        assert_eq!(theirs.exit_requested, live.exit_requested);
+
+        let bystander = snapshot_for(8);
+        assert!(
+            !bystander.exit_requested,
+            "a demo nobody asked must keep running"
+        );
+        assert_eq!(
+            bystander.exit_generation, 0,
+            "its count has not moved — and per pane it only ever rises"
+        );
+
+        // Pane 0 — headless, or a VM with no sink — keeps the process-wide
+        // answer it always had.
+        assert!(snapshot_for(0).exit_requested);
+        forget_pane(7);
         set_focus(0);
     }
 
@@ -257,6 +340,13 @@ mod tests {
         // test predates the lock and raced the moment a second writer existed.)
         let _guard = FOCUS_TEST_LOCK.lock().unwrap();
         reset();
+        // The generation is the PROCESS's tally and `reset` deliberately keeps
+        // it (see the assertion at the end of this test). It is therefore
+        // whatever earlier stops left behind — not zero — so the coherent
+        // instant below is compared against the count as it stands. Hard-coding
+        // 0 here only ever held while this test happened to run first, which is
+        // an order dependency rather than a contract.
+        let carried = snapshot().exit_generation;
         set_keys(0b101);
         set_mouse(120, 64, 1);
         let s = snapshot();
@@ -268,7 +358,7 @@ mod tests {
                 mouse_y: 64,
                 buttons: 1,
                 exit_requested: false,
-                exit_generation: 0
+                exit_generation: carried
             }
         );
         reset();

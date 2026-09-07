@@ -129,12 +129,18 @@ Object subclass: DemoVmHost [
     ]
 
     "Start `anEntry` (a demo's launch doit, e.g. 'Breakout launch') in a VM of
-     its own. ONE AT A TIME, because one Metal pane: any demo already running
-     is asked to end first, and its own exit tears the pane down."
+     its own — AS MANY AT A TIME AS YOU LIKE.
+
+     This used to ask any running demo to end first, and said why: `ONE AT A
+     TIME, because one Metal pane`. That premise is gone
+     (docs/multi_pane_design.md §2e). Commands carry the pane they are for,
+     the panes are a map, input has a subject and the framebuffers are
+     per-pane, so a second demo is simply a second entry rather than a
+     contradiction — each with its own window, its own core and its own
+     framebuffers, and each stoppable without touching the others."
     DemoVmHost class >> start: anEntry <String> ^ <Object> [
         | w |
         self watchExits.
-        self stopAll.
         "GRANTED (S6): a demo may spawn its own compute workers —
          ParallelMandel is a shipped demo that does exactly that, and a demo
          that cannot use the machine's cores would be a downgrade from the
