@@ -340,6 +340,13 @@ struct Emitter<'a> {
     /// CallRuntime/Alloc's slow edge) emitted so far — see
     /// [`SafepointPc`]'s own doc.
     safepoints: Vec<SafepointPc>,
+    /// `MACVM_ROTATE>=1`: each poll's slow path (spill residents, `bl
+    /// stub_poll`, reload) is emitted AFTER the epilogue behind a not-taken
+    /// `cbnz`, instead of inline behind a taken `cbz` — one taken branch
+    /// fewer per loop iteration. (slow label, join label, IR position, bci):
+    /// the position keys the S2 stores, the resident reloads and the
+    /// safepoint exactly as the inline form did.
+    deferred_polls: Vec<(Label, Label, u32, usize)>,
     /// S14 perf recovery: per-vreg RESIDENT register (x21–x23) — the
     /// register the value ALSO lives in besides its canonical slot
     /// (`LiveInterval::resident_reg`). Reads prefer it; every def
@@ -2277,6 +2284,15 @@ impl<'a> Emitter<'a> {
                 mem(28, crate::oops::layout::VMREG_POLL_FLAG_OFFSET as i64),
             ],
         );
+        if crate::compiler::ir::rotate_level() >= 1 {
+            // Rotation: the common case falls through; the slow path lives
+            // after the epilogue (see the flush in `emit`) and jumps back here.
+            let slow = self.asm.new_label();
+            self.asm.cbnz(xr(16), slow);
+            self.asm.bind(skip);
+            self.deferred_polls.push((slow, skip, self.pos, self.current_bci));
+            return;
+        }
         self.asm.cbz(xr(16), skip);
         // S2: the poll-taken path is where a known-smi resident's slot is
         // brought current — the fast fall-through writes nothing.
@@ -3056,6 +3072,7 @@ pub fn emit(
         pos: 0,
         current_bci: 0,
         safepoints: Vec::new(),
+        deferred_polls: Vec::new(),
         resident: {
             let mut r: Vec<Option<u8>> = vec![None; method.vregs.len()];
             for iv in &regalloc.intervals {
@@ -3232,6 +3249,30 @@ pub fn emit(
         );
         e.asm.emit("ret", &[]);
     }
+
+    // Rotation: the polls' slow paths, out of line. Each is emitted at ITS
+    // poll's IR position so the S2 slot stores, the resident reloads and
+    // the recorded safepoint are byte-for-byte what the inline form wrote;
+    // `rt_poll` keys the LoopPoll scope on the `bl`'s return address, which
+    // is now inside this stub — that address is all it ever needed.
+    let deferred = std::mem::take(&mut e.deferred_polls);
+    let (saved_pos, saved_bci) = (e.pos, e.current_bci);
+    for (slow, join, pos, bci) in deferred {
+        e.pos = pos;
+        e.current_bci = bci;
+        e.asm.bind(slow);
+        e.emit_s2_spill_stores();
+        e.asm.call_far(e.stub_poll_lit);
+        e.safepoints.push(SafepointPc {
+            pc_off: e.asm.offset(),
+            bci,
+            position: pos,
+        });
+        e.emit_resident_reloads_at(pos);
+        e.asm.b(join);
+    }
+    e.pos = saved_pos;
+    e.current_bci = saved_bci;
 
     // S15 A2 step 4: the synthetic OSR entry block, emitted AFTER the whole
     // body (a cold tail — it runs exactly once per OSR transition). Shape:

@@ -9243,6 +9243,115 @@ pub(crate) fn coalesce_noov_dst(m: &mut IrMethod) -> usize {
     folded
 }
 
+/// Loop rotation (docs/reg_env_findings.md — the diagnosis that the arith
+/// loop was bound by TAKEN BRANCHES, not instructions): level `1` moves each
+/// poll's slow path out of line behind a not-taken `cbnz`; `2` also
+/// duplicates a compare-only loop header's test onto the latch, so the back
+/// edge IS the conditional branch and the header runs once as the entry
+/// test. Three taken branches per iteration become one. **Default ON (2)**
+/// since the interleaved A/B read arith −33% and sieve −38% with no row
+/// worse; `MACVM_ROTATE=0` turns it off, `1` keeps only the poll half
+/// (the bisect point). Census `MACVM_ROTATE_COUNT=1`; `=2` also says why a
+/// latch was left alone.
+pub(crate) fn rotate_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("MACVM_ROTATE").ok().as_deref() {
+        Some("0") | Some("off") => 0,
+        Some("1") => 1,
+        _ => 2,
+    })
+}
+
+/// Rotate every loop whose header is exactly one `SmiCmpBr` and whose latch
+/// polls: the latch's `Jump header` becomes a copy of the header's compare
+/// (own fresh fail block, cloned trap site) branching straight to the body or
+/// the exit, and the header keeps its compare as the once-only entry test.
+/// Conditions, each load-bearing: both header exits inherit the header's
+/// own entry stack (the same vregs — the latch's merge moves already write
+/// them before its `Jump`, so it can branch straight to either exit; a
+/// `to:do:` loop carries one merged entry this way); the header carries no deopt
+/// site of its own; the fail block is the plain one-op trap; block 0 and a
+/// split bci-0 header (`entry_split_header`, BUG E's shape) are left alone.
+/// The interpreter semantics are unchanged — a poll deopt still resumes at
+/// the header's bci and re-runs the compare, and the new trap re-executes
+/// the compare at the same bci with the same stack. Answers loops rotated.
+pub(crate) fn rotate_loops(m: &mut IrMethod) -> usize {
+    if m.entry_split_header.is_some() {
+        if std::env::var("MACVM_ROTATE_COUNT").ok().as_deref() == Some("2") {
+            eprintln!("rotate: skipped, split bci-0 header");
+        }
+        return 0;
+    }
+    let nb = m.blocks.len();
+    let mut rotated = 0usize;
+    let why = std::env::var("MACVM_ROTATE_COUNT").ok().as_deref() == Some("2");
+    for li in 0..nb {
+        let h = match m.blocks[li].code.last() {
+            Some(Ir::Jump { target }) if (target.0 as usize) < li => target.0 as usize,
+            _ => continue,
+        };
+        let skip = |reason: &str| {
+            if why {
+                eprintln!("rotate: latch b{li} -> header b{h} skipped: {reason}");
+            }
+        };
+        if h == 0 {
+            skip("header is block 0");
+            continue;
+        }
+        if !m.blocks[li].code.iter().any(|op| matches!(op, Ir::Poll)) {
+            skip("latch has no Poll");
+            continue;
+        }
+        let (op, a, b, if_true, if_false, fail) = match m.blocks[h].code.as_slice() {
+            [Ir::SmiCmpBr { op, a, b, if_true, if_false, fail }] => {
+                (*op, *a, *b, *if_true, *if_false, *fail)
+            }
+            _ => {
+                skip("header is not exactly one SmiCmpBr");
+                continue;
+            }
+        };
+        if !m.blocks[h].deopt_sites.is_empty() {
+            skip("header carries a deopt site");
+            continue;
+        }
+        // The stack the header's exits inherit must be the header's own —
+        // the same vregs, so the latch (which already writes them: its merge
+        // moves precede the Jump) can branch straight to either exit. A
+        // `to:do:` loop carries one merged entry this way; a body that
+        // leaves something new on the stack for the header to merge does
+        // not qualify.
+        if m.blocks[if_true.0 as usize].entry_stack != m.blocks[h].entry_stack
+            || m.blocks[if_false.0 as usize].entry_stack != m.blocks[h].entry_stack
+        {
+            skip("a header exit does not inherit the header's own stack");
+            continue;
+        }
+        let fb = &m.blocks[fail.0 as usize];
+        let trap_bci = match fb.code.as_slice() {
+            [Ir::UncommonTrap { bci }] => *bci,
+            _ => {
+                skip("fail block is not the plain one-op trap");
+                continue;
+            }
+        };
+        let new_fail = IrBlock {
+            id: BlockId(m.blocks.len() as u32),
+            bci: fb.bci,
+            code: vec![Ir::UncommonTrap { bci: trap_bci }],
+            entry_stack: fb.entry_stack.clone(),
+            deopt_sites: fb.deopt_sites.clone(),
+        };
+        let new_fail_id = new_fail.id;
+        let last = m.blocks[li].code.len() - 1;
+        m.blocks[li].code[last] = Ir::SmiCmpBr { op, a, b, if_true, if_false, fail: new_fail_id };
+        m.blocks.push(new_fail);
+        rotated += 1;
+    }
+    rotated
+}
+
 fn splice_promote_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -12115,6 +12224,16 @@ pub fn convert(
             if osr { " OSR" } else { "" }
         );
     }
+    if rotate_level() >= 2 {
+        let n = rotate_loops(&mut irm);
+        if n > 0 && std::env::var_os("MACVM_ROTATE_COUNT").is_some() {
+            eprintln!(
+                "rotate: {n} loop(s)  [{}{}]",
+                crate::compiler::driver::selector_string(method),
+                if osr { " OSR" } else { "" }
+            );
+        }
+    }
     if peep4_enabled() {
         let (fa, fm) = fold_noov_imm(&mut irm);
         let nc = coalesce_noov_dst(&mut irm);
@@ -12626,6 +12745,124 @@ mod tests {
         assert!(matches!(m.blocks[1].code[0], Ir::Poll), "the opening Move is gone");
         assert_eq!(m.blocks[1].entry_stack, vec![VReg(1)]);
         assert_eq!(m.blocks[1].deopt_sites[0].0, 0, "the poll's site index followed");
+    }
+
+    /// Loop rotation: a compare-only header with a polling latch gets its
+    /// test duplicated onto the latch (fresh fail block, cloned trap site),
+    /// and the header stays as the once-only entry test.
+    #[test]
+    fn rotate_loops_moves_the_compare_to_the_latch() {
+        let trap_site = DeoptRaw {
+            stack: vec![VReg(1), VReg(2)],
+            bci: 3,
+            kind: crate::compiler::scopes::SafepointKind::UncommonTrap,
+            reexecute: true,
+            stack_closures: Vec::new(),
+            inline: None,
+        };
+        let mut f = plain_block(4, vec![Ir::UncommonTrap { bci: 3 }]);
+        f.deopt_sites = vec![(0, trap_site)];
+        let mut m = peep_method(
+            vec![
+                plain_block(
+                    0,
+                    vec![
+                        Ir::Param { dst: VReg(1), index: 0 },
+                        Ir::ConstSmi { dst: VReg(2), value: 10 },
+                        Ir::Jump { target: BlockId(1) },
+                    ],
+                ),
+                plain_block(
+                    1,
+                    vec![Ir::SmiCmpBr {
+                        op: CmpOp::Le,
+                        a: VReg(1),
+                        b: VReg(2),
+                        if_true: BlockId(2),
+                        if_false: BlockId(3),
+                        fail: BlockId(4),
+                    }],
+                ),
+                plain_block(
+                    2,
+                    vec![
+                        Ir::SmiArithNoOv { op: SmiOp::Add, dst: VReg(1), a: VReg(1), b: VReg(2) },
+                        Ir::Poll,
+                        Ir::Jump { target: BlockId(1) },
+                    ],
+                ),
+                plain_block(3, vec![Ir::Ret { val: VReg(1) }]),
+                f,
+            ],
+            smi_vregs(3),
+        );
+        assert_eq!(rotate_loops(&mut m), 1);
+        assert_eq!(m.blocks.len(), 6, "one fresh fail block");
+        assert!(matches!(
+            m.blocks[2].code.last(),
+            Some(Ir::SmiCmpBr { op: CmpOp::Le, a: VReg(1), b: VReg(2), if_true: BlockId(2), if_false: BlockId(3), fail: BlockId(5) })
+        ));
+        assert!(matches!(m.blocks[1].code.as_slice(), [Ir::SmiCmpBr { .. }]), "the header keeps its test");
+        assert!(matches!(m.blocks[5].code.as_slice(), [Ir::UncommonTrap { bci: 3 }]));
+        assert_eq!(m.blocks[5].deopt_sites.len(), 1, "the trap site is cloned onto the new fail block");
+        assert_eq!(rotate_loops(&mut m), 0, "idempotent: the latch no longer ends in a Jump");
+
+        // The `to:do:` shape: one merged stack entry (v2) carried around the
+        // loop — header and both exits inherit it, the latch re-merges it
+        // with a self-move before the Jump. Rotates.
+        let mut f = plain_block(4, vec![Ir::UncommonTrap { bci: 3 }]);
+        f.deopt_sites = vec![(
+            0,
+            DeoptRaw {
+                stack: vec![VReg(2), VReg(1), VReg(2)],
+                bci: 3,
+                kind: crate::compiler::scopes::SafepointKind::UncommonTrap,
+                reexecute: true,
+                stack_closures: Vec::new(),
+                inline: None,
+            },
+        )];
+        let carried = |mut b: IrBlock| {
+            b.entry_stack = vec![VReg(2)];
+            b
+        };
+        let mut m = peep_method(
+            vec![
+                plain_block(
+                    0,
+                    vec![
+                        Ir::Param { dst: VReg(1), index: 0 },
+                        Ir::ConstSmi { dst: VReg(2), value: 10 },
+                        Ir::Jump { target: BlockId(1) },
+                    ],
+                ),
+                carried(plain_block(
+                    1,
+                    vec![Ir::SmiCmpBr {
+                        op: CmpOp::Le,
+                        a: VReg(1),
+                        b: VReg(2),
+                        if_true: BlockId(2),
+                        if_false: BlockId(3),
+                        fail: BlockId(4),
+                    }],
+                )),
+                carried(plain_block(
+                    2,
+                    vec![
+                        Ir::SmiArithNoOv { op: SmiOp::Add, dst: VReg(1), a: VReg(1), b: VReg(2) },
+                        Ir::Poll,
+                        Ir::Move { dst: VReg(2), src: VReg(2) },
+                        Ir::Jump { target: BlockId(1) },
+                    ],
+                )),
+                carried(plain_block(3, vec![Ir::Ret { val: VReg(1) }])),
+                f,
+            ],
+            smi_vregs(3),
+        );
+        assert_eq!(rotate_loops(&mut m), 1, "one carried stack entry, same vregs on every edge: rotates");
+        assert!(matches!(m.blocks[2].code.last(), Some(Ir::SmiCmpBr { fail: BlockId(5), .. })));
     }
 
     #[test]

@@ -201,3 +201,102 @@ thing today's listings say might actually move arith again. Everything
 on the 4a′ list stays behind `MACVM_PEEP4`, default off, per the gating
 policy: correct, measured, and not earning its gate — a candidate for the
 next `214aae9`-style prune if rotation does not change the picture.
+
+## Loop rotation — the branch floor, tested (2026-09-07, same day)
+
+§4a′ ended on a hypothesis: the arith loop was bound by three taken
+branches per iteration, not by its instruction count. Rotation is the
+experiment that tests it, behind `MACVM_ROTATE` (census
+`MACVM_ROTATE_COUNT=1`; `=2` also says why a latch was left alone):
+
+- **Level 1, emit:** each poll's slow path (S2 spill stores, `bl stub_poll`,
+  resident reloads) is emitted after the epilogue behind a not-taken
+  `cbnz`, instead of inline behind a taken `cbz`. `rt_poll` keys the
+  LoopPoll scope on the `bl`'s return address, which is all it ever needed;
+  the S2 stores and reloads are emitted at the poll's own IR position, so
+  they are byte-for-byte the inline form's.
+- **Level 2, IR (`rotate_loops`):** a loop whose header is exactly one
+  `SmiCmpBr` and whose latch polls has the compare duplicated onto the latch
+  (fresh fail block, cloned trap site) so the back edge IS the conditional
+  branch; the header stays as the once-only entry test. Both header exits
+  must inherit the header's own entry stack — `to:do:` carries one merged
+  entry around the loop, re-merged by a self-move in the latch, and that
+  qualifies; a body that leaves something new for the header to merge does
+  not. A poll deopt still resumes at the header's bci and re-runs the
+  compare, and the new trap re-executes it at the same bci with the same
+  stack.
+
+The loop, one iteration, `MACVM_ROTATE=2`:
+
+```
+mov  x1, x22 ; asr ; mul ; adds ; b.vs ; movz ; asr ; mul ; subs ; b.vs
+mov  x22, x0 ; movz ; add ; mov x23, x1
+ldr  w16, [x28, #32] ; cbnz x16, slow      not taken
+cmp  x23, x24 ; b.le body                  the one taken branch
+b    exit                                  behind it
+```
+
+Three taken branches became one (`b.le` header→body, `cbz` over the poll,
+`b` back edge → `b.le` back edge alone). Same binary, interleaved, 7 rounds:
+
+| bench | off µs | on µs | delta | noise |
+|---|--:|--:|--:|--:|
+| **arith** | 1003 | **673** | **−32.9%** | 5% |
+| fib | 7917 | 8015 | +1.2% | 2% |
+| **sieve** | 165 | **103** | **−37.6%** | 10% |
+| dict | 243 | 231 | −4.9% | 4% |
+| alloc | 527 | 504 | −4.4% | 7% |
+| richards | 1037 | 1003 | −3.3% | 4% |
+| deltablue | 129 | 127 | −1.6% | 6% |
+
+**The hypothesis was right, and it moves.** arith at 673 µs is MACDART's
+691: parity, from 1.98× behind this morning — 4a took a quarter off, and
+rotation a third of what was left, while the four instruction-level rungs
+in between took nothing. sieve is the same `to:do:` shape and lost a third
+too (its noise is high, 10%, but the effect is four times that). fib has no
+loop and did not move. The other four are inside their noise and all
+slightly negative — plausibly real, small, and not claimable.
+
+A win of this size flips the default under the gating policy:
+`MACVM_ROTATE` is **on (2)** from this commit; `0` turns it off, `1` keeps
+only the poll half.
+
+And with rotation on, the 4a′ rungs off vs on, 5 rounds — does instruction
+count start to matter once the branch floor is gone?
+
+| bench | rungs off | rungs on | delta | noise |
+|---|--:|--:|--:|--:|
+| arith | 676 | 698 | +3.3% | 3% |
+| fib | 8118 | 8079 | −0.5% | 2% |
+| sieve | 105 | 108 | +2.9% | 6% |
+| dict | 240 | 233 | −2.9% | 4% |
+| alloc | 509 | 513 | +0.8% | 9% |
+| richards | 993 | 1007 | +1.4% | 2% |
+| deltablue | 122 | 125 | +2.5% | 5% |
+
+**No.** With the branch floor gone, four fewer instructions in the loop
+are still worth nothing — arith reads slightly *worse*, inside its noise.
+That settles it twice over: at this loop's width the instruction count is
+not what the machine is waiting on, and the 4a′ rungs stay default-off, a
+prune candidate. The order of what mattered today, for the record: values
+in registers across their traps (−25%), then the shape of the control flow
+(−33%), and instruction-level cleanup (0%) — the reverse of how a
+peephole-first instinct would have ranked them.
+
+The three-way afterwards (`scripts/xvm-bench.sh`, 7 interleaved rounds, worst
+per-row MAD 1–5%, rotation on by default):
+
+| bench | MACDART | Cog | MACVM | vs MACDART |
+|---|--:|--:|--:|---|
+| **arith** | 698 µs | 4868 | **687** | **MACVM 1.02× — parity** (was Dart 1.98× this morning) |
+| fib | 6707 | 17564 | 8117 | Dart 1.21× (was 1.29×) |
+| **sieve** | 178 | 313 | **103** | **MACVM 1.73×** (was 1.05×) |
+| **dict** | 554 | 1142 | **232** | MACVM 2.39× |
+| alloc | 383 | 699 | 487 | Dart 1.27× |
+| richards | 569 | 2132 | 987 | Dart 1.73× (unchanged) |
+| **deltablue** | 255 | 264 | **122** | MACVM 2.09× |
+
+Four to three, MACVM's way, for the first time. What Dart still holds is
+what none of today's work touched: fib is call overhead, alloc is the
+collector, and richards is the guard chains and heap-oop slot traffic that
+Stage 4b (oops in registers across traps) is for.

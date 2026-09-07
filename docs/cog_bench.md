@@ -549,3 +549,25 @@ compute rows narrow: arith 2.0x → 1.4x, fib 1.3x → 1.2x. The 4–3 split by
 workload shape is unchanged, and it is the first time in a month the
 compute side of it moved.
 
+## 2026-09-07, evening — loop rotation lands (default on)
+
+Same harness and builds as the two boards above; MACVM only
+(`docs/reg_env_findings.md`, "Loop rotation"). MACDART's column drifts
+≤2.5% again across the three boards, the noise check.
+
+| bench | MACVM | Cog | MACDART | vs Cog | vs MACDART |
+|---|--:|--:|--:|---|---|
+| **arith** | **687** | 4868 | 698 | **MACVM 7.1x** | **MACVM 1.02x** |
+| fib | 8117 | 17564 | **6707** | **MACVM 2.2x** | Dart 1.2x |
+| **sieve** | **103** | 313 | 178 | **MACVM 3.0x** | **MACVM 1.7x** |
+| **dict** | **232** | 1142 | 554 | **MACVM 4.9x** | **MACVM 2.4x** |
+| alloc | 487 | 699 | **383** | **MACVM 1.4x** | Dart 1.3x |
+| richards | 987 | 2132 | **569** | **MACVM 2.2x** | Dart 1.7x |
+| **deltablue** | **122** | 264 | 255 | **MACVM 2.2x** | **MACVM 2.1x** |
+
+Against this morning's board: arith 1337 → 687 (−49%: 4a −25%, rotation
+−33% of the rest), sieve 161 → 103 (−36%, rotation), fib 8495 → 8117 (4a),
+the rest inside the session's noise. The 4–3 split by workload shape has
+flipped to MACVM's side; the three Dart rows are call overhead (fib), the
+collector (alloc) and heap-oop slot traffic behind guard chains (richards).
+

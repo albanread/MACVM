@@ -153,9 +153,12 @@ rotation. Each is 1–3 instructions of the 22; together with 4a the loop is
 ~13–14. **Target: arith 1.98× → ~1.3×.**
 *Tried 2026-09-07, same day — `docs/reg_env_findings.md` §4a′. The listing
 went 19 → 15 with zero stores; the A/B moved arith −0.2%. It does not
-compound: the loop is bound by two taken branches per iteration, not by
-its instruction count. Landed behind `MACVM_PEEP4`, default off. The rung
-that is left standing is loop rotation.*
+compound: the loop is bound by taken branches per iteration, not by its
+instruction count. Landed behind `MACVM_PEEP4`, default off. Loop rotation,
+tried the same day (`reg_env_findings.md`, "Loop rotation"): **arith −33%,
+sieve −38%**, nothing worse — arith at parity with MACDART (673 vs 691 µs).
+Default on (`MACVM_ROTATE`). With the branch floor gone the 4a′ rungs are
+still worth nothing.*
 
 **3. Frame-init by liveness + fib's small change.** `entry_early_defs` exists
 and "isn't firing" — find why; fib nil-fills four slots per call for two that
