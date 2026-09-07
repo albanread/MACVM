@@ -499,3 +499,75 @@ model), and a fourth — deopt environments — was **abandoned on measurement
 before being built**: after the earlier stages, frame traffic is only 13% of
 instructions in hot methods, while the change needs GC register maps that do
 not exist. See `regalloc_findings.md`.
+
+## 2026-09-07 — the three-way, rebuilt on the Studio (MACVM unchanged since 08-05)
+
+Same harness, 7 interleaved rounds, worst per-row MAD 1–5%; MACVM `7a9e4c3`,
+MACDART `dartui-workspace` `68b1689`, Cog 13. MACDART is unchanged software,
+so its column is the same-session noise check again (arith 698 → 675,
+fib 6872 → 6586: ≤4%).
+
+| bench | MACVM | Cog | MACDART | vs Cog | vs MACDART |
+|---|--:|--:|--:|---|---|
+| arith | 1337 | 4868 | **675** | **MACVM 3.6x** | Dart 2.0x |
+| fib | 8495 | 17558 | **6586** | **MACVM 2.1x** | Dart 1.3x |
+| **sieve** | **161** | 299 | 169 | **MACVM 1.9x** | MACVM 1.05x |
+| **dict** | **256** | 1140 | 556 | **MACVM 4.5x** | **MACVM 2.2x** |
+| alloc | 465 | 695 | **377** | **MACVM 1.5x** | Dart 1.2x |
+| richards | 1012 | 2075 | **545** | **MACVM 2.1x** | Dart 1.9x |
+| **deltablue** | **128** | 254 | 255 | **MACVM 2.0x** | **MACVM 2.0x** |
+
+Against the 2026-08-05 board, MACVM's own rows: alloc 591 → 465 (−21%, the
+only real move — `d8fe920`'s eden-proportional survivors landed the day after
+that board), everything else within the cross-session noise floor (Cog, also
+unchanged, drifted −16%…+23% between the two sessions). Warm JIT throughput is
+flat for the month; the 4–3 split by workload shape stands. What the compute
+rows are made of, instruction by instruction, and the plan to move them:
+`docs/perf_plan_2026-09.md`.
+
+## 2026-09-07, later — Stage 4a lands (register deopt environments)
+
+Same harness, same session, same MACDART/Cog builds as the board above; the
+only change is MACVM (`docs/reg_env_findings.md`). MACDART's column is again
+the noise check (arith 675 → 691, fib 6586 → 6535: ≤2.5%).
+
+| bench | MACVM | Cog | MACDART | vs Cog | vs MACDART |
+|---|--:|--:|--:|---|---|
+| arith | **998** | 4850 | **691** | **MACVM 4.9x** | Dart 1.4x |
+| fib | 8021 | 17648 | **6535** | **MACVM 2.2x** | Dart 1.2x |
+| **sieve** | **167** | 302 | 174 | **MACVM 1.8x** | MACVM 1.04x |
+| **dict** | **242** | 1146 | 543 | **MACVM 4.7x** | **MACVM 2.2x** |
+| alloc | 523 | 682 | **389** | **MACVM 1.3x** | Dart 1.3x |
+| richards | 985 | 2117 | **568** | **MACVM 2.1x** | Dart 1.7x |
+| **deltablue** | **130** | 251 | 252 | **MACVM 1.9x** | **MACVM 1.9x** |
+
+Against this morning's board: arith 1337 → 998 (−25%, the interleaved A/B's
+own number), fib 8495 → 8021 (−6%); everything else inside the session's
+noise, including alloc's 465 → 523, which both same-round A/Bs put at
+−2–4% and which drifted 465/499/522 across three runs of two binaries. The
+compute rows narrow: arith 2.0x → 1.4x, fib 1.3x → 1.2x. The 4–3 split by
+workload shape is unchanged, and it is the first time in a month the
+compute side of it moved.
+
+## 2026-09-07, evening — loop rotation lands (default on)
+
+Same harness and builds as the two boards above; MACVM only
+(`docs/reg_env_findings.md`, "Loop rotation"). MACDART's column drifts
+≤2.5% again across the three boards, the noise check.
+
+| bench | MACVM | Cog | MACDART | vs Cog | vs MACDART |
+|---|--:|--:|--:|---|---|
+| **arith** | **687** | 4868 | 698 | **MACVM 7.1x** | **MACVM 1.02x** |
+| fib | 8117 | 17564 | **6707** | **MACVM 2.2x** | Dart 1.2x |
+| **sieve** | **103** | 313 | 178 | **MACVM 3.0x** | **MACVM 1.7x** |
+| **dict** | **232** | 1142 | 554 | **MACVM 4.9x** | **MACVM 2.4x** |
+| alloc | 487 | 699 | **383** | **MACVM 1.4x** | Dart 1.3x |
+| richards | 987 | 2132 | **569** | **MACVM 2.2x** | Dart 1.7x |
+| **deltablue** | **122** | 264 | 255 | **MACVM 2.2x** | **MACVM 2.1x** |
+
+Against this morning's board: arith 1337 → 687 (−49%: 4a −25%, rotation
+−33% of the rest), sieve 161 → 103 (−36%, rotation), fib 8495 → 8117 (4a),
+the rest inside the session's noise. The 4–3 split by workload shape has
+flipped to MACVM's side; the three Dart rows are call overhead (fib), the
+collector (alloc) and heap-oop slot traffic behind guard chains (richards).
+

@@ -156,6 +156,13 @@ fn read_value(vm: &VmState, nm: &Nmethod, fv: &FrameView, loc: ValueLoc) -> Oop 
              copies, or an inlined frame's receiver copy, never ctx locations; \
              every such position boxes at its own call site, not here)"
         ),
+        // Stage 4a: a register-resident smi at a trap-only safepoint. The
+        // uncommon-trap trampoline spilled x0..x27 into the reg block before
+        // anything else ran, so this is the register's word at the `brk` —
+        // a tagged smi (regalloc only grants a register across a trap to a
+        // known-smi vreg), adopted as-is. Never valid at a call-site or poll
+        // deopt: `deoptimize_frame` refuses those before any read happens.
+        ValueLoc::Reg(n) => Oop::from_raw(vm.reg_block.trap_regs[n as usize]),
     }
 }
 
@@ -390,6 +397,34 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
             deopt.site.stack.clone(),
         )
     };
+    // Stage 4a: a register location is only meaningful at an uncommon trap
+    // (`ValueLoc::Reg`'s own doc) — anywhere else the trap register file is
+    // stale. Refuse loudly rather than materialize a wrong-but-valid oop; a
+    // deopt is cold, so scanning the scopes here costs nothing that matters.
+    if site_kind != crate::compiler::scopes::SafepointKind::UncommonTrap {
+        let is_reg = |loc: &ValueLoc| matches!(loc, ValueLoc::Reg(_));
+        let ctx_has_reg = |ctx: &CtxLoc| match ctx {
+            CtxLoc::None => false,
+            CtxLoc::Materialized(loc) => is_reg(loc),
+            CtxLoc::Elided { temps } => temps.iter().any(is_reg),
+        };
+        let stale = site_stack.iter().any(is_reg)
+            || virtual_frames.iter().any(|vf| {
+                is_reg(&vf.scope.receiver)
+                    || vf.scope.slots.iter().any(is_reg)
+                    || ctx_has_reg(&vf.scope.ctx)
+                    || vf
+                        .scope
+                        .sender
+                        .as_ref()
+                        .is_some_and(|(_, _, pending)| pending.iter().any(is_reg))
+            });
+        assert!(
+            !stale,
+            "deoptimize_frame: ValueLoc::Reg at a {site_kind:?} site (compiler bug — a \
+             register is only a value's home across an uncommon trap)"
+        );
+    }
     // Outermost first for the physical pushes.
     virtual_frames.reverse();
 
