@@ -499,3 +499,28 @@ model), and a fourth — deopt environments — was **abandoned on measurement
 before being built**: after the earlier stages, frame traffic is only 13% of
 instructions in hot methods, while the change needs GC register maps that do
 not exist. See `regalloc_findings.md`.
+
+## 2026-09-07 — the three-way, rebuilt on the Studio (MACVM unchanged since 08-05)
+
+Same harness, 7 interleaved rounds, worst per-row MAD 1–5%; MACVM `7a9e4c3`,
+MACDART `dartui-workspace` `68b1689`, Cog 13. MACDART is unchanged software,
+so its column is the same-session noise check again (arith 698 → 675,
+fib 6872 → 6586: ≤4%).
+
+| bench | MACVM | Cog | MACDART | vs Cog | vs MACDART |
+|---|--:|--:|--:|---|---|
+| arith | 1337 | 4868 | **675** | **MACVM 3.6x** | Dart 2.0x |
+| fib | 8495 | 17558 | **6586** | **MACVM 2.1x** | Dart 1.3x |
+| **sieve** | **161** | 299 | 169 | **MACVM 1.9x** | MACVM 1.05x |
+| **dict** | **256** | 1140 | 556 | **MACVM 4.5x** | **MACVM 2.2x** |
+| alloc | 465 | 695 | **377** | **MACVM 1.5x** | Dart 1.2x |
+| richards | 1012 | 2075 | **545** | **MACVM 2.1x** | Dart 1.9x |
+| **deltablue** | **128** | 254 | 255 | **MACVM 2.0x** | **MACVM 2.0x** |
+
+Against the 2026-08-05 board, MACVM's own rows: alloc 591 → 465 (−21%, the
+only real move — `d8fe920`'s eden-proportional survivors landed the day after
+that board), everything else within the cross-session noise floor (Cog, also
+unchanged, drifted −16%…+23% between the two sessions). Warm JIT throughput is
+flat for the month; the 4–3 split by workload shape stands. What the compute
+rows are made of, instruction by instruction, and the plan to move them:
+`docs/perf_plan_2026-09.md`.
